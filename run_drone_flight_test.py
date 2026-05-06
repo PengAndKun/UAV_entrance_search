@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import plistlib
 import select
@@ -41,6 +42,11 @@ DEFAULT_ENV_ROOT = "UnrealEnv"
 DEFAULT_WIN_ENV_BIN = "UE4_ExampleScene_Win/UE4_ExampleScene/Binaries/Win64/UE4_ExampleScene.exe"
 DEFAULT_MAC_ENV_BIN = "UE4_ExampleScene_Mac/UE4_ExampleScene.app"
 DEFAULT_INITIAL_POS = [0.0, 0.0, 100.0, 0.0]
+DEFAULT_ORBIT_CENTER = [995.3, -203.73]
+DEFAULT_ORBIT_RADIUS = 550.0
+DEFAULT_ORBIT_ALTITUDE = 180.0
+DEFAULT_ORBIT_STEPS = 96
+DEFAULT_ORBIT_START_ANGLE = 180.0
 DEFAULT_ACTION_PLAN = [
     ("hover", [0.0, 0.0, 0.0, 0.0]),
     ("up", [0.0, 0.0, 0.5, 0.0]),
@@ -390,8 +396,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--launch_sleep", type=int, default=int(os.getenv("UNREALCV_LAUNCH_SLEEP", "5")),
                         help="Seconds to wait for the UnrealCV server to start")
     parser.add_argument("--time_dilation", type=int, default=10, help="Time dilation reference fps; use 0 to disable")
-    parser.add_argument("--mode", choices=["keyboard", "scripted"], default="keyboard",
-                        help="keyboard keeps the drone view alive for manual control; scripted runs the smoke test plan")
+    parser.add_argument("--mode", choices=["keyboard", "scripted", "orbit"], default="keyboard",
+                        help="keyboard keeps the drone view alive for manual control; scripted runs the smoke test plan; "
+                             "orbit flies one deterministic loop around a house center")
     parser.add_argument("--keyboard_backend", choices=["global", "terminal"], default="global",
                         help="global captures keys while the Unreal window is focused; terminal reads keys from stdin")
     parser.add_argument("--control_dt", type=float, default=0.1, help="Keyboard control step interval, in seconds")
@@ -415,6 +422,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--initial_pos", nargs="+", type=float, default=DEFAULT_INITIAL_POS,
                         metavar="POSE",
                         help="Initial drone pose after reset: X Y Z YAW or X Y Z ROLL YAW PITCH")
+    parser.add_argument("--orbit_center", nargs=2, type=float, default=DEFAULT_ORBIT_CENTER,
+                        metavar=("X", "Y"),
+                        help="House center for --mode orbit, in Unreal world X/Y coordinates")
+    parser.add_argument("--orbit_radius", type=float, default=DEFAULT_ORBIT_RADIUS,
+                        help="Radius for --mode orbit")
+    parser.add_argument("--orbit_altitude", type=float, default=DEFAULT_ORBIT_ALTITUDE,
+                        help="Drone altitude for --mode orbit")
+    parser.add_argument("--orbit_steps", type=int, default=DEFAULT_ORBIT_STEPS,
+                        help="Number of segments in the full 360-degree orbit")
+    parser.add_argument("--orbit_start_angle", type=float, default=DEFAULT_ORBIT_START_ANGLE,
+                        help="Starting angle around --orbit_center, in degrees")
+    parser.add_argument("--orbit_clockwise", action="store_true",
+                        help="Fly the orbit clockwise instead of counter-clockwise")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--log_level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return parser.parse_args()
@@ -478,13 +498,17 @@ def set_drone_camera(env: Any, drone_name: str) -> None:
     env.unwrapped.unrealcv.set_cam(drone_name, rel_loc, rel_rot)
 
 
-def reset_drone_pose(env: Any, drone_name: str, pose: List[float]) -> None:
+def set_drone_world_pose(env: Any, drone_name: str, pose: List[float]) -> None:
     env.unwrapped.unrealcv.set_obj_location(drone_name, pose[:3])
     env.unwrapped.unrealcv.set_rotation(drone_name, pose[4] - 180)
     env.unwrapped.unrealcv.set_phy(drone_name, 0)
     env.unwrapped.unrealcv.set_move_bp(drone_name, [0.0, 0.0, 0.0, 0.0])
     set_drone_camera(env, drone_name)
     env.unwrapped.unrealcv.set_viewport(drone_name)
+
+
+def reset_drone_pose(env: Any, drone_name: str, pose: List[float]) -> None:
+    set_drone_world_pose(env, drone_name, pose)
     time.sleep(1.0)
 
 
@@ -732,6 +756,66 @@ def append_step_log(log: List[Dict[str, Any]], step: int, phase: str, action: Li
     })
 
 
+def yaw_toward_point(x: float, y: float, target_x: float, target_y: float) -> float:
+    return math.degrees(math.atan2(target_y - y, target_x - x))
+
+
+def run_orbit_house_plan(args: argparse.Namespace, env: Any, drone_name: str, observation: Any,
+                         run_dir: Path, log: List[Dict[str, Any]]) -> int:
+    if args.orbit_radius <= 0:
+        raise ValueError("--orbit_radius must be greater than 0")
+    if args.orbit_steps <= 0:
+        raise ValueError("--orbit_steps must be greater than 0")
+
+    total_step = 0
+    center_x, center_y = args.orbit_center
+    direction = -1.0 if args.orbit_clockwise else 1.0
+    phase = "orbit_house"
+    save_color_observation(observation, run_dir / "step_0000_reset.png")
+    LOGGER.info(
+        "Orbit center=(%.3f, %.3f) radius=%.3f altitude=%.3f steps=%s clockwise=%s",
+        center_x,
+        center_y,
+        args.orbit_radius,
+        args.orbit_altitude,
+        args.orbit_steps,
+        args.orbit_clockwise,
+    )
+
+    for index in range(args.orbit_steps + 1):
+        angle_deg = args.orbit_start_angle + direction * 360.0 * index / args.orbit_steps
+        angle_rad = math.radians(angle_deg)
+        x = center_x + args.orbit_radius * math.cos(angle_rad)
+        y = center_y + args.orbit_radius * math.sin(angle_rad)
+        yaw = yaw_toward_point(x, y, center_x, center_y)
+        pose = [x, y, args.orbit_altitude, 0.0, yaw, 0.0]
+
+        set_drone_world_pose(env, drone_name, pose)
+        time.sleep(args.step_delay)
+        total_step += 1
+        actual_pose = read_drone_pose(env, drone_name)
+        log.append({
+            "step": total_step,
+            "phase": phase,
+            "action": [x, y, args.orbit_altitude, yaw],
+            "pose": actual_pose,
+            "reward": None,
+            "done": False,
+        })
+
+        should_save = (
+            index == 0
+            or index == args.orbit_steps
+            or (args.save_every > 0 and total_step % args.save_every == 0)
+        )
+        if should_save:
+            image = read_drone_observation(env, drone_name)
+            if image is not None:
+                save_color_observation(image, run_dir / f"step_{total_step:04d}_{phase}.png")
+
+    return total_step
+
+
 def run_scripted_plan(args: argparse.Namespace, env: Any, drone_name: str, observation: Any,
                       run_dir: Path, log: List[Dict[str, Any]]) -> int:
     total_step = 0
@@ -834,6 +918,8 @@ def run_flight_test(args: argparse.Namespace) -> Path:
         env, drone_name, observation = prepare_drone_env(args)
         if args.mode == "scripted":
             total_step = run_scripted_plan(args, env, drone_name, observation, run_dir, log)
+        elif args.mode == "orbit":
+            total_step = run_orbit_house_plan(args, env, drone_name, observation, run_dir, log)
         else:
             total_step = run_keyboard_control(args, env, drone_name, observation, run_dir, log)
 
