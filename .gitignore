@@ -50,7 +50,7 @@ Thumbs.db
 .ultralytics_test
 test*
 
-UE4_ExampleScene_Mac
+UnrealEnv/UE4_ExampleScene_Mac
 results
 
 UnrealEnv
