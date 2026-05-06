@@ -74,3 +74,6 @@ runs
 door_or_window_dataset
 .ultralytics_test
 test*
+
+UE4_ExampleScene_Mac
+results
