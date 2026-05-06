@@ -1,0 +1,76 @@
+# Python bytecode and caches
+__pycache__/
+**/__pycache__/
+yolo26_dataset
+
+*.py[cod]
+**/*.py[cod]
+*$py.class
+
+# Python packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments and local env files
+.venv/
+venv/
+env/
+.env
+.env.*
+.python-version
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+
+# Local runtime outputs
+UAV-Flow-Eval/captures_manual/
+UAV-Flow-Eval/captures_remote/
+UAV-Flow-Eval/debug.jpg
+UAV-Flow-Eval/results/
+UAV-Flow-Eval/gym_unrealcv/
+UAV-Flow-Eval/__pycache__
+
+# Local Unreal environment binaries and saved data
+UnrealEnv/
+captures_remote
+phase1_yolo26_training
+phase2_modality2_depth_analysis/results
+phase2_multimodal_fusion_analysis/exports
+phase2_multimodal_fusion_analysis/results
+phase2_door_or_window_yolo26_training
+phase2_5_representation_distillation/evals
+phase2_5_representation_distillation/runs
+phase2_5_representation_distillation/embeddings
+phase2_5_representation_distillation/ablations
+phase3_dataset_export
+phase3_online_eval
+phase4_search_logs
+phase4_takeover_logs
+phase6_prompt_logs
+runs
+door_or_window_dataset
+.ultralytics_test
+test*
