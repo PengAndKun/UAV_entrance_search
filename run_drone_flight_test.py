@@ -2,6 +2,7 @@ import argparse
 import json
 import logging
 import os
+import plistlib
 import select
 import signal
 import subprocess
@@ -88,6 +89,44 @@ def path_for_unrealcv_setting(path: Path, env_root: Path) -> str:
         return str(path.resolve())
 
 
+def path_from_unrealcv_setting(path_value: str, env_root: Path) -> Path:
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = env_root / path
+    return path.resolve()
+
+
+def find_macos_app_executable(app_bundle: Path) -> Path:
+    contents_dir = app_bundle / "Contents"
+    macos_dir = contents_dir / "MacOS"
+    info_plist = contents_dir / "Info.plist"
+    executable_name = None
+    if info_plist.exists():
+        try:
+            with info_plist.open("rb") as f:
+                executable_name = plistlib.load(f).get("CFBundleExecutable")
+        except (OSError, plistlib.InvalidFileException, ValueError):
+            executable_name = None
+    if executable_name:
+        executable = macos_dir / executable_name
+        if executable.exists():
+            return executable
+    executables = sorted(
+        path for path in macos_dir.iterdir()
+        if path.is_file() and os.access(path, os.X_OK)
+    ) if macos_dir.exists() else []
+    return executables[0] if executables else macos_dir / app_bundle.stem
+
+
+def find_macos_unrealcv_ini(app_bundle: Path) -> Path:
+    contents_dir = app_bundle / "Contents"
+    for engine_dir_name in ("UE4", "UE"):
+        matches = sorted((contents_dir / engine_dir_name).glob("*/Binaries/Mac/unrealcv.ini"))
+        if matches:
+            return matches[0]
+    return contents_dir / "UE4" / app_bundle.stem / "Binaries" / "Mac" / "unrealcv.ini"
+
+
 def find_windows_env_binary(env_root: Path) -> Optional[Path]:
     if not env_root.exists():
         return None
@@ -141,9 +180,15 @@ def resolve_env_binary(args: argparse.Namespace, platform_name: str, env_root: P
 def configure_local_unreal_env(args: argparse.Namespace) -> None:
     repo_root = Path(__file__).resolve().parent
     local_env_root = repo_root / DEFAULT_ENV_ROOT
-    env_root_default = local_env_root if local_env_root.exists() else Path(os.getenv("UnrealEnv", local_env_root))
+    unreal_env_var = os.getenv("UnrealEnv")
+    env_root_default = Path(unreal_env_var) if unreal_env_var else local_env_root
     env_root = resolve_path(args.env_root, env_root_default, repo_root)
     platform_name = host_platform() if args.env_platform == "auto" else args.env_platform
+    if platform_name != host_platform() and not args.dry_run:
+        raise ValueError(
+            f"Cannot launch a '{platform_name}' Unreal package on host platform '{host_platform()}'. "
+            "Use --dry_run only for cross-platform config checks."
+        )
     env_bin = resolve_env_binary(args, platform_name, env_root)
 
     os.environ["UnrealEnv"] = str(env_root)
@@ -156,14 +201,19 @@ def validate_unreal_env_config(args: argparse.Namespace) -> None:
     env_bin = getattr(args, "resolved_env_bin", None)
     if not env_bin:
         return
-    env_bin_path = Path(env_bin)
-    if not env_bin_path.is_absolute():
-        env_bin_path = Path(args.resolved_env_root) / env_bin_path
+    env_bin_path = path_from_unrealcv_setting(env_bin, Path(args.resolved_env_root))
     if not env_bin_path.exists():
         raise FileNotFoundError(
             f"Unreal binary for platform '{args.resolved_env_platform}' was not found: {env_bin_path}. "
             "Use --env_root or --env_bin to point at the packaged Unreal environment."
         )
+    if args.resolved_env_platform == "mac" and env_bin_path.suffix == ".app":
+        executable = find_macos_app_executable(env_bin_path)
+        unrealcv_ini = find_macos_unrealcv_ini(env_bin_path)
+        if not executable.exists():
+            raise FileNotFoundError(f"macOS Unreal .app is missing its executable: {executable}")
+        if not unrealcv_ini.exists():
+            raise FileNotFoundError(f"macOS Unreal .app is missing unrealcv.ini: {unrealcv_ini}")
     if args.resolved_env_platform == "win":
         unrealcv_ini = env_bin_path.parent / "unrealcv.ini"
         if not unrealcv_ini.exists():
@@ -228,8 +278,25 @@ def patch_macos_launchservices_launcher() -> None:
     if getattr(RunUnreal, "_launchservices_patch", False):
         return
 
+    original_init = RunUnreal.__init__
     original_start = RunUnreal.start
     original_close = RunUnreal.close
+
+    def init_with_app_support(self, ENV_BIN, ENV_MAP=None):
+        env_bin_text = str(ENV_BIN)
+        env_root = Path(os.getenv("UnrealEnv", ".")).expanduser().resolve()
+        app_bundle = path_from_unrealcv_setting(env_bin_text, env_root)
+        if app_bundle.suffix == ".app" and app_bundle.exists():
+            self.path2env = str(env_root)
+            self.env_bin = path_for_unrealcv_setting(app_bundle, env_root)
+            self.env_map = ENV_MAP
+            self.path2unrealcv = str(find_macos_unrealcv_ini(app_bundle))
+            self.path2binary = str(find_macos_app_executable(app_bundle))
+            assert os.path.exists(self.path2binary), \
+                "Please load env binary in UnrealEnv and Check the env_bin in setting file!"
+            self.ue_pid = None
+            return
+        original_init(self, ENV_BIN, ENV_MAP)
 
     def find_unreal_pids(binary_path: str) -> List[int]:
         process_name = Path(binary_path).name
@@ -267,7 +334,7 @@ def patch_macos_launchservices_launcher() -> None:
 
         cmd_exe = [os.path.abspath(self.path2binary)]
         self.set_ue_options(cmd_exe, opengl, offscreen, nullrhi, gpu_id)
-        subprocess.run(["open", str(app_bundle), "--args", *cmd_exe[1:]], check=True)
+        subprocess.run(["open", "-n", str(app_bundle), "--args", *cmd_exe[1:]], check=True)
         time.sleep(sleep_time)
 
         pids = find_unreal_pids(self.path2binary)
@@ -283,12 +350,16 @@ def patch_macos_launchservices_launcher() -> None:
             return original_close(self)
         ue_pid = getattr(self, "ue_pid", None)
         if ue_pid is None:
+            pids = find_unreal_pids(getattr(self, "path2binary", ""))
+            ue_pid = pids[-1] if pids else None
+        if ue_pid is None:
             return
         try:
             os.kill(ue_pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
 
+    RunUnreal.__init__ = init_with_app_support
     RunUnreal.start = start_with_launchservices
     RunUnreal.close = close_with_launchservices
     RunUnreal._launchservices_patch = True
