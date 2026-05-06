@@ -6,19 +6,27 @@ import select
 import signal
 import subprocess
 import sys
-import termios
 import time
-import tty
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None
+    tty = None
 
 import gym
 import gym_unrealcv
 import numpy as np
 from PIL import Image
 
-os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/uav-flow-mpl")
+if sys.platform == "darwin":
+    os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/uav-flow-mpl")
+else:
+    os.environ.setdefault("MPLCONFIGDIR", str(Path(os.getenv("TEMP", ".")) / "uav-flow-mpl"))
 
 from gym_unrealcv.envs.wrappers import augmentation, configUE, time_dilation
 
@@ -28,6 +36,9 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_ENV_ID = "UnrealTrack-SuburbNeighborhood_Day-ContinuousColor-v0"
 DEFAULT_OUTPUT_DIR = "results/drone_flight_test"
+DEFAULT_ENV_ROOT = "UnrealEnv"
+DEFAULT_WIN_ENV_BIN = "UE4_ExampleScene_Win/UE4_ExampleScene/Binaries/Win64/UE4_ExampleScene.exe"
+DEFAULT_MAC_ENV_BIN = "UE4_ExampleScene_Mac/UE4_ExampleScene.app"
 DEFAULT_INITIAL_POS = [0.0, 0.0, 100.0, 0.0]
 DEFAULT_ACTION_PLAN = [
     ("hover", [0.0, 0.0, 0.0, 0.0]),
@@ -51,9 +62,146 @@ Keyboard control is active. Keep this process running, then click the Unreal win
 """
 
 
-def configure_local_unreal_env() -> None:
+def host_platform() -> str:
+    if sys.platform.startswith("win"):
+        return "win"
+    if sys.platform == "darwin":
+        return "mac"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return sys.platform
+
+
+def resolve_path(path_value: Optional[str], default_path: Path, repo_root: Path) -> Path:
+    if path_value:
+        path = Path(path_value).expanduser()
+        if not path.is_absolute():
+            path = repo_root / path
+        return path.resolve()
+    return default_path.resolve()
+
+
+def path_for_unrealcv_setting(path: Path, env_root: Path) -> str:
+    try:
+        return path.resolve().relative_to(env_root.resolve()).as_posix()
+    except ValueError:
+        return str(path.resolve())
+
+
+def find_windows_env_binary(env_root: Path) -> Optional[Path]:
+    if not env_root.exists():
+        return None
+    candidates = []
+    for candidate in env_root.rglob("*.exe"):
+        name = candidate.name.lower()
+        if "prereq" in name or "setup" in name:
+            continue
+        parts = {part.lower() for part in candidate.parts}
+        score = 0
+        if (candidate.parent / "unrealcv.ini").exists():
+            score += 10
+        if "binaries" in parts and "win64" in parts:
+            score += 5
+        if candidate.stem.lower() in {"ue4_examplescene", "collection"}:
+            score += 2
+        candidates.append((score, len(candidate.parts), candidate))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], item[1], str(item[2]).lower()))
+    return candidates[0][2]
+
+
+def find_macos_env_bundle(env_root: Path) -> Optional[Path]:
+    if not env_root.exists():
+        return None
+    bundles = sorted(env_root.rglob("*.app"), key=lambda path: (len(path.parts), str(path).lower()))
+    return bundles[0] if bundles else None
+
+
+def resolve_env_binary(args: argparse.Namespace, platform_name: str, env_root: Path) -> Optional[str]:
+    if args.env_bin:
+        env_bin_path = Path(args.env_bin).expanduser()
+        if not env_bin_path.is_absolute():
+            env_bin_path = env_root / env_bin_path
+        return path_for_unrealcv_setting(env_bin_path, env_root)
+
+    if platform_name == "win":
+        default_path = env_root / DEFAULT_WIN_ENV_BIN
+        env_bin_path = default_path if default_path.exists() else find_windows_env_binary(env_root)
+        return path_for_unrealcv_setting(env_bin_path, env_root) if env_bin_path else DEFAULT_WIN_ENV_BIN
+
+    if platform_name == "mac":
+        default_path = env_root / DEFAULT_MAC_ENV_BIN
+        env_bin_path = default_path if default_path.exists() else find_macos_env_bundle(env_root)
+        return path_for_unrealcv_setting(env_bin_path, env_root) if env_bin_path else DEFAULT_MAC_ENV_BIN
+
+    return None
+
+
+def configure_local_unreal_env(args: argparse.Namespace) -> None:
     repo_root = Path(__file__).resolve().parent
-    os.environ.setdefault("UnrealEnv", str(repo_root))
+    local_env_root = repo_root / DEFAULT_ENV_ROOT
+    env_root_default = local_env_root if local_env_root.exists() else Path(os.getenv("UnrealEnv", local_env_root))
+    env_root = resolve_path(args.env_root, env_root_default, repo_root)
+    platform_name = host_platform() if args.env_platform == "auto" else args.env_platform
+    env_bin = resolve_env_binary(args, platform_name, env_root)
+
+    os.environ["UnrealEnv"] = str(env_root)
+    args.resolved_env_root = env_root
+    args.resolved_env_platform = platform_name
+    args.resolved_env_bin = env_bin
+
+
+def validate_unreal_env_config(args: argparse.Namespace) -> None:
+    env_bin = getattr(args, "resolved_env_bin", None)
+    if not env_bin:
+        return
+    env_bin_path = Path(env_bin)
+    if not env_bin_path.is_absolute():
+        env_bin_path = Path(args.resolved_env_root) / env_bin_path
+    if not env_bin_path.exists():
+        raise FileNotFoundError(
+            f"Unreal binary for platform '{args.resolved_env_platform}' was not found: {env_bin_path}. "
+            "Use --env_root or --env_bin to point at the packaged Unreal environment."
+        )
+    if args.resolved_env_platform == "win":
+        unrealcv_ini = env_bin_path.parent / "unrealcv.ini"
+        if not unrealcv_ini.exists():
+            raise FileNotFoundError(
+                f"Windows Unreal binary was found, but unrealcv.ini is missing next to it: {unrealcv_ini}. "
+                "Point --env_bin at the executable under Binaries/Win64, not the top-level launcher."
+            )
+
+
+def patch_env_setting_loader(args: argparse.Namespace) -> None:
+    env_bin = getattr(args, "resolved_env_bin", None)
+    if not env_bin:
+        return
+
+    from gym_unrealcv.envs.utils import misc
+
+    original_loader = getattr(misc.load_env_setting, "_original_loader", misc.load_env_setting)
+    platform_key = {
+        "linux": "env_bin",
+        "mac": "env_bin_mac",
+        "win": "env_bin_win",
+    }.get(args.resolved_env_platform)
+
+    def load_env_setting_with_launch_config(filename: str) -> Dict[str, Any]:
+        setting = original_loader(filename)
+        if platform_key:
+            setting[platform_key] = env_bin
+        return setting
+
+    load_env_setting_with_launch_config._original_loader = original_loader  # type: ignore[attr-defined]
+    misc.load_env_setting = load_env_setting_with_launch_config
+
+
+def print_launch_config(args: argparse.Namespace) -> None:
+    print("Unreal launch config:")
+    print(f"  platform: {args.resolved_env_platform}")
+    print(f"  env_root: {args.resolved_env_root}")
+    print(f"  env_bin:  {args.resolved_env_bin or '(from setting file)'}")
 
 
 def ensure_legacy_gym_entrypoint_loader() -> None:
@@ -147,9 +295,25 @@ def patch_macos_launchservices_launcher() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Launch UnrealCV and run a simple drone flight smoke test.")
+    parser = argparse.ArgumentParser(
+        description="Launch UnrealCV and run a simple drone flight smoke test.",
+        epilog=(
+            "Examples:\n"
+            "  Windows: python run_drone_flight_test.py --env_platform win --mode keyboard\n"
+            "  macOS:   python run_drone_flight_test.py --env_platform mac --env_root /path/to/UnrealEnv --mode keyboard"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--env_id", default=DEFAULT_ENV_ID, help="Gym UnrealCV environment id")
     parser.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR, help="Directory for images and trajectory logs")
+    parser.add_argument("--env_platform", "--platform", choices=["auto", "win", "mac", "linux"], default="auto",
+                        help="Packaged Unreal environment platform to launch; auto uses the current OS")
+    parser.add_argument("--env_root", default=None,
+                        help=f"Directory containing packaged Unreal environments; default is ./{DEFAULT_ENV_ROOT}")
+    parser.add_argument("--env_bin", default=None,
+                        help="Packaged Unreal binary or .app bundle, relative to --env_root or absolute")
+    parser.add_argument("--dry_run", action="store_true",
+                        help="Print the resolved Unreal launch config and exit without starting Unreal")
     parser.add_argument("--width", type=int, default=256, help="Observation width")
     parser.add_argument("--height", type=int, default=256, help="Observation height")
     parser.add_argument("--launch_sleep", type=int, default=int(os.getenv("UNREALCV_LAUNCH_SLEEP", "5")),
@@ -374,6 +538,8 @@ class TerminalKeyboardReader:
         self._exit_requested = False
 
     def __enter__(self) -> "TerminalKeyboardReader":
+        if termios is None or tty is None:
+            raise RuntimeError("terminal keyboard backend is only available on Unix-like terminals")
         if not sys.stdin.isatty():
             raise RuntimeError("terminal keyboard backend needs a TTY")
         self._old_settings = termios.tcgetattr(sys.stdin)
@@ -579,7 +745,12 @@ def run_keyboard_control(args: argparse.Namespace, env: Any, drone_name: str, ob
 
 
 def run_flight_test(args: argparse.Namespace) -> Path:
-    configure_local_unreal_env()
+    configure_local_unreal_env(args)
+    validate_unreal_env_config(args)
+    patch_env_setting_loader(args)
+    LOGGER.info("UnrealEnv root: %s", args.resolved_env_root)
+    LOGGER.info("Unreal platform: %s", args.resolved_env_platform)
+    LOGGER.info("Unreal binary: %s", args.resolved_env_bin or "from setting file")
     ensure_legacy_gym_entrypoint_loader()
     patch_macos_launchservices_launcher()
     np.random.seed(args.seed)
@@ -613,5 +784,10 @@ if __name__ == "__main__":
         level=getattr(logging, args.log_level),
         format="[%(levelname)s] %(asctime)s - %(message)s",
     )
+    if args.dry_run:
+        configure_local_unreal_env(args)
+        validate_unreal_env_config(args)
+        print_launch_config(args)
+        sys.exit(0)
     output = run_flight_test(args)
     print(f"Drone flight test output: {output}")
