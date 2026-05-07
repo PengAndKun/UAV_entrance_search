@@ -16,6 +16,11 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.keyboard_request_inflight = False
         self.state_refresh_inflight = False
         self.preview_refresh_inflight = False
+        self.temp_capture_inflight = False
+        self.stream_capture_thread: Optional[threading.Thread] = None
+        self.stream_capture_stop_event = threading.Event()
+        self.stream_capture_dir: Optional[Path] = None
+        self.stream_capture_trajectory: List[Dict[str, Any]] = []
         self.sequence_thread: Optional[threading.Thread] = None
         self.sequence_stop_event = threading.Event()
         self.route_thread: Optional[threading.Thread] = None
@@ -77,6 +82,13 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.rgb_source_order_var = tk.StringVar(
             value=str(getattr(args, "rgb_source_order", flight.DEFAULT_RGB_SOURCE_ORDER) or flight.DEFAULT_RGB_SOURCE_ORDER)
         )
+        self.stream_task_title_var = tk.StringVar(value="stream_task")
+        self.stream_interval_s_var = tk.StringVar(
+            value=str(getattr(args, "stream_interval_s", flight.DEFAULT_STREAM_CAPTURE_INTERVAL_S))
+        )
+        self.stream_status_var = tk.StringVar(value="Stream Capture: idle")
+        self.stream_player_status_var = tk.StringVar(value="Stream Player: idle")
+        self.stream_player_image_mode_var = tk.StringVar(value="rgb")
         self.show_houses_var = tk.BooleanVar(value=True)
         self.show_trajectory_var = tk.BooleanVar(value=True)
 
@@ -96,6 +108,15 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.preview_window: Optional[tk.Toplevel] = None
         self.preview_label: Optional[tk.Label] = None
         self.preview_photo: Optional[ImageTk.PhotoImage] = None
+        self.stream_player_window: Optional[tk.Toplevel] = None
+        self.stream_player_label: Optional[tk.Label] = None
+        self.stream_player_photo: Optional[ImageTk.PhotoImage] = None
+        self.stream_player_frames: List[Path] = []
+        self.stream_player_index = 0
+        self.stream_player_after_id: Optional[str] = None
+        self.stream_player_playing = False
+        self.stream_player_dir: Optional[Path] = None
+        self.stream_player_interval_ms = int(float(getattr(args, "stream_interval_s", flight.DEFAULT_STREAM_CAPTURE_INTERVAL_S)) * 1000)
         self.map_window: Optional[tk.Toplevel] = None
         self.map_widget: Optional[OverheadMapWidget] = None
         self.map_refresh_inflight = False
@@ -154,6 +175,23 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
             return
         direction = -1 if int(getattr(event, "num", 0)) == 4 else 1
         self.main_canvas.yview_scroll(direction, "units")
+
+    def _on_pose_text_mousewheel(self, event: tk.Event):
+        if not hasattr(self, "pose_text"):
+            return None
+        delta = -1 if int(getattr(event, "delta", 0)) > 0 else 1
+        if int(getattr(event, "state", 0)) & 0x0001:
+            self.pose_text.xview_scroll(delta, "units")
+        else:
+            self.pose_text.yview_scroll(delta, "units")
+        return "break"
+
+    def _on_pose_text_mousewheel_linux(self, event: tk.Event):
+        if not hasattr(self, "pose_text"):
+            return None
+        direction = -1 if int(getattr(event, "num", 0)) == 4 else 1
+        self.pose_text.yview_scroll(direction, "units")
+        return "break"
 
     def _build_ui(self) -> None:
         self.main_canvas = tk.Canvas(self.root, highlightthickness=0)
@@ -269,9 +307,18 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
 
         pose = tk.LabelFrame(outer, text="Pose")
         pose.grid(row=4, column=0, sticky="ew", padx=8, pady=4)
-        pose.grid_columnconfigure(0, weight=1)
-        self.pose_text = tk.Text(pose, height=3, wrap="word")
-        self.pose_text.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+        pose_text_frame = tk.Frame(pose)
+        pose_text_frame.grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        self.pose_text = tk.Text(pose_text_frame, height=4, width=42, wrap="none")
+        pose_y_scroll = tk.Scrollbar(pose_text_frame, orient="vertical", command=self.pose_text.yview)
+        pose_x_scroll = tk.Scrollbar(pose_text_frame, orient="horizontal", command=self.pose_text.xview)
+        self.pose_text.configure(yscrollcommand=pose_y_scroll.set, xscrollcommand=pose_x_scroll.set)
+        self.pose_text.grid(row=0, column=0, sticky="nsew")
+        pose_y_scroll.grid(row=0, column=1, sticky="ns")
+        pose_x_scroll.grid(row=1, column=0, sticky="ew")
+        self.pose_text.bind("<MouseWheel>", self._on_pose_text_mousewheel, add="+")
+        self.pose_text.bind("<Button-4>", self._on_pose_text_mousewheel_linux, add="+")
+        self.pose_text.bind("<Button-5>", self._on_pose_text_mousewheel_linux, add="+")
         self.pose_text.insert("1.0", json.dumps({"x": 0, "y": 0, "z": 100, "yaw": 0}, indent=2))
         tk.Button(pose, text="Set Pose", command=self.on_set_pose).grid(row=0, column=1, padx=6, pady=6, sticky="ns")
 
@@ -280,6 +327,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Button(preview, text="Toggle RGB", command=self.toggle_preview_window).pack(side="left", padx=6, pady=6)
         tk.Button(preview, text="Refresh RGB", command=self.refresh_preview_window).pack(side="left", padx=6, pady=6)
         tk.Button(preview, text="Save Frame", command=self.on_save_frame).pack(side="left", padx=6, pady=6)
+        tk.Button(preview, text="Temp Capture", command=self.on_temp_capture).pack(side="left", padx=6, pady=6)
         tk.Checkbutton(preview, text="Auto RGB", variable=self.auto_rgb_var).pack(side="left", padx=6, pady=6)
         tk.Checkbutton(preview, text="Enhance RGB", variable=self.enhance_rgb_var).pack(side="left", padx=6, pady=6)
         tk.Label(preview, text="RGB Source").pack(side="left", padx=(12, 2), pady=6)
@@ -292,8 +340,23 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         ).pack(side="left", padx=(0, 6), pady=6)
         tk.Button(preview, text="Refresh State", command=self.refresh_state_once).pack(side="left", padx=6, pady=6)
 
+        stream = tk.LabelFrame(outer, text="Stream Capture")
+        stream.grid(row=6, column=0, sticky="ew", padx=8, pady=4)
+        stream.grid_columnconfigure(1, weight=1)
+        stream.grid_columnconfigure(7, weight=1)
+        tk.Label(stream, text="Task").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        tk.Entry(stream, textvariable=self.stream_task_title_var).grid(row=0, column=1, sticky="ew", padx=6, pady=6)
+        tk.Label(stream, text="Interval s").grid(row=0, column=2, sticky="w", padx=(12, 2), pady=6)
+        tk.Entry(stream, textvariable=self.stream_interval_s_var, width=7).grid(row=0, column=3, sticky="w", padx=(0, 8), pady=6)
+        tk.Button(stream, text="Start Timed Capture", command=self.on_start_stream_capture).grid(row=0, column=4, padx=6, pady=6)
+        tk.Button(stream, text="Stop Timed Capture", command=self.on_stop_stream_capture).grid(row=0, column=5, padx=6, pady=6)
+        tk.Label(stream, textvariable=self.stream_status_var, anchor="w").grid(row=0, column=6, columnspan=2, sticky="ew", padx=6, pady=6)
+        tk.Button(stream, text="Open Player", command=self.open_stream_player_window).grid(row=1, column=0, padx=6, pady=(0, 6))
+        tk.Button(stream, text="Play Latest", command=self.play_latest_stream_capture).grid(row=1, column=1, sticky="w", padx=6, pady=(0, 6))
+        tk.Label(stream, textvariable=self.stream_player_status_var, anchor="w").grid(row=1, column=2, columnspan=6, sticky="ew", padx=6, pady=(0, 6))
+
         map_frame = tk.LabelFrame(outer, text="Map")
-        map_frame.grid(row=6, column=0, sticky="ew", padx=8, pady=4)
+        map_frame.grid(row=7, column=0, sticky="ew", padx=8, pady=4)
         map_frame.grid_columnconfigure(10, weight=1)
         tk.Button(map_frame, text="Open Map", command=self.toggle_map_window).grid(row=0, column=0, padx=6, pady=6)
         tk.Button(map_frame, text="Refresh Map", command=lambda: self.refresh_map_once(force_reload=True)).grid(row=0, column=1, padx=6, pady=6)
@@ -322,7 +385,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Label(map_frame, textvariable=self.map_calibration_var, anchor="w").grid(row=3, column=4, columnspan=7, sticky="ew", padx=6, pady=(0, 6))
 
         route = tk.LabelFrame(outer, text="LLM House Entrance Route")
-        route.grid(row=7, column=0, sticky="ew", padx=8, pady=4)
+        route.grid(row=8, column=0, sticky="ew", padx=8, pady=4)
         for col in (1, 3, 5):
             route.grid_columnconfigure(col, weight=1)
         tk.Label(route, text="Target House").grid(row=0, column=0, sticky="w", padx=6, pady=6)
@@ -376,7 +439,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.llm_route_preview_text.configure(state="disabled")
 
         orbit = tk.LabelFrame(outer, text="Orbit Plan")
-        orbit.grid(row=8, column=0, sticky="ew", padx=8, pady=(4, 8))
+        orbit.grid(row=9, column=0, sticky="ew", padx=8, pady=(4, 8))
         for label, var, width in (
             ("Center X", self.orbit_center_x_var, 10),
             ("Center Y", self.orbit_center_y_var, 10),
@@ -511,6 +574,11 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
             rgb_enhance_gamma=float(self.args.rgb_enhance_gamma),
             rgb_enhance_gain=float(self.args.rgb_enhance_gain),
             rgb_source_order=self.rgb_source_order_var.get().strip() or flight.DEFAULT_RGB_SOURCE_ORDER,
+            temp_capture_dir=str(getattr(self.args, "temp_capture_dir", flight.DEFAULT_TEMP_CAPTURE_DIR)),
+            stream_capture_dir=str(getattr(self.args, "stream_capture_dir", flight.DEFAULT_STREAM_CAPTURE_DIR)),
+            stream_interval_s=self.parse_stream_interval_s(),
+            depth_min_cm=float(getattr(self.args, "depth_min_cm", flight.DEFAULT_DEPTH_MIN_CM)),
+            depth_max_cm=float(getattr(self.args, "depth_max_cm", flight.DEFAULT_DEPTH_MAX_CM)),
             force_kill_unreal_on_stop=bool(self.args.force_kill_unreal_on_stop),
             log_level=self.args.log_level,
         )
@@ -625,6 +693,8 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
 
     def on_close(self) -> None:
         self.stop_keyboard_control(send_hold=False)
+        self.stop_stream_player()
+        self.stream_capture_stop_event.set()
         self.sequence_stop_event.set()
         self.route_stop_event.set()
         session = self.session

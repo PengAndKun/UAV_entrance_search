@@ -31,6 +31,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rgb_enhance_gamma", type=float, default=flight.DEFAULT_RGB_ENHANCE_GAMMA)
     parser.add_argument("--rgb_enhance_gain", type=float, default=flight.DEFAULT_RGB_ENHANCE_GAIN)
     parser.add_argument("--rgb_source_order", choices=["rgb", "bgr"], default=flight.DEFAULT_RGB_SOURCE_ORDER)
+    parser.add_argument("--temp_capture_dir", default=flight.DEFAULT_TEMP_CAPTURE_DIR)
+    parser.add_argument("--stream_capture_dir", default=flight.DEFAULT_STREAM_CAPTURE_DIR)
+    parser.add_argument("--stream_interval_s", type=float, default=flight.DEFAULT_STREAM_CAPTURE_INTERVAL_S)
+    parser.add_argument("--depth_min_cm", type=float, default=flight.DEFAULT_DEPTH_MIN_CM)
+    parser.add_argument("--depth_max_cm", type=float, default=flight.DEFAULT_DEPTH_MAX_CM)
     parser.add_argument("--force_kill_unreal_on_stop", dest="force_kill_unreal_on_stop", action="store_true",
                         default=flight.DEFAULT_FORCE_KILL_UNREAL_ON_STOP)
     parser.add_argument("--no_force_kill_unreal_on_stop", dest="force_kill_unreal_on_stop", action="store_false")

@@ -24,6 +24,7 @@ except ImportError:
 
 import gym
 import gym_unrealcv
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -60,6 +61,11 @@ DEFAULT_RGB_ENHANCE_ENABLED = True
 DEFAULT_RGB_ENHANCE_GAMMA = 0.72
 DEFAULT_RGB_ENHANCE_GAIN = 1.12
 DEFAULT_RGB_SOURCE_ORDER = "bgr"
+DEFAULT_TEMP_CAPTURE_DIR = "temp_capture"
+DEFAULT_STREAM_CAPTURE_DIR = "stream_capture"
+DEFAULT_STREAM_CAPTURE_INTERVAL_S = 0.5
+DEFAULT_DEPTH_MIN_CM = 20.0
+DEFAULT_DEPTH_MAX_CM = 1200.0
 DEFAULT_FORCE_KILL_UNREAL_ON_STOP = True
 DEFAULT_ACTION_PLAN = [
     ("hover", [0.0, 0.0, 0.0, 0.0]),
@@ -595,6 +601,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Gain used for RGB output enhancement")
     parser.add_argument("--rgb_source_order", choices=["rgb", "bgr"], default=DEFAULT_RGB_SOURCE_ORDER,
                         help="Color channel order returned by UnrealCV before display/save")
+    parser.add_argument("--temp_capture_dir", default=DEFAULT_TEMP_CAPTURE_DIR,
+                        help="Directory for controller Temp Capture bundles")
+    parser.add_argument("--stream_capture_dir", default=DEFAULT_STREAM_CAPTURE_DIR,
+                        help="Directory for timed stream capture task folders")
+    parser.add_argument("--stream_interval_s", type=float, default=DEFAULT_STREAM_CAPTURE_INTERVAL_S,
+                        help="Default interval in seconds for controller stream capture")
+    parser.add_argument("--depth_min_cm", type=float, default=DEFAULT_DEPTH_MIN_CM,
+                        help="Minimum depth in cm for temp depth preview scaling")
+    parser.add_argument("--depth_max_cm", type=float, default=DEFAULT_DEPTH_MAX_CM,
+                        help="Maximum depth in cm for temp depth preview scaling")
     parser.add_argument("--force_kill_unreal_on_stop", dest="force_kill_unreal_on_stop", action="store_true",
                         default=DEFAULT_FORCE_KILL_UNREAL_ON_STOP,
                         help="Force-kill packaged Unreal processes when stopping a session")
@@ -648,6 +664,44 @@ def make_output_dir(base_dir: str) -> Path:
     return run_dir
 
 
+def resolve_project_output_path(value: Any, default_value: str) -> Path:
+    raw = str(value or default_value).strip() or default_value
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    return path
+
+
+def sanitize_capture_task_title(title: Any, default_value: str = "stream_task") -> str:
+    text = str(title or "").strip()
+    invalid_chars = set('<>:"/\\|?*')
+    pieces: List[str] = []
+    last_separator = False
+    for char in text:
+        if char in invalid_chars or ord(char) < 32 or char.isspace():
+            if not last_separator:
+                pieces.append("_")
+                last_separator = True
+            continue
+        pieces.append(char)
+        last_separator = False
+    cleaned = "".join(pieces).strip(" ._")
+    return (cleaned[:80] or default_value)
+
+
+def make_unique_child_dir(root_path: Path, dirname: str) -> Path:
+    root_path.mkdir(parents=True, exist_ok=True)
+    base = root_path / dirname
+    for index in range(1000):
+        candidate = base if index == 0 else root_path / f"{dirname}-{index:02d}"
+        try:
+            candidate.mkdir(parents=False, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            continue
+    raise FileExistsError(f"Could not create unique directory under {root_path}")
+
+
 def prepare_observation_rgb(
     observation: Any,
     *,
@@ -690,8 +744,9 @@ def save_color_observation(
     enhance: bool = DEFAULT_RGB_ENHANCE_ENABLED,
     gamma: float = DEFAULT_RGB_ENHANCE_GAMMA,
     gain: float = DEFAULT_RGB_ENHANCE_GAIN,
+    source_order: str = DEFAULT_RGB_SOURCE_ORDER,
 ) -> None:
-    image = prepare_observation_rgb(observation, enhance=enhance, gamma=gamma, gain=gain)
+    image = prepare_observation_rgb(observation, enhance=enhance, gamma=gamma, gain=gain, source_order=source_order)
     if image is None:
         return
     Image.fromarray(image).save(path)
@@ -699,6 +754,107 @@ def save_color_observation(
 
 def save_color_observation_for_args(args: argparse.Namespace, observation: Any, path: Path) -> None:
     save_color_observation(observation, path, **rgb_enhance_options(args))
+
+
+def coerce_depth_planar_image(depth_image: Any) -> np.ndarray:
+    depth = np.asarray(depth_image)
+    if depth.ndim == 4:
+        depth = depth[0]
+    if depth.ndim == 3:
+        if depth.shape[-1] == 1:
+            depth = depth[:, :, 0]
+        elif depth.shape[0] == 1:
+            depth = depth[0]
+        else:
+            depth = depth[:, :, 0]
+    if depth.ndim != 2:
+        depth = np.squeeze(depth)
+    if depth.ndim != 2:
+        raise ValueError(f"Depth image must be 2D after coercion, got shape {depth.shape}")
+    return depth.astype(np.float32, copy=False)
+
+
+def summarize_depth_image(
+    depth_image: Any,
+    *,
+    min_depth_cm: float = DEFAULT_DEPTH_MIN_CM,
+    max_depth_cm: float = DEFAULT_DEPTH_MAX_CM,
+) -> Dict[str, Any]:
+    depth = coerce_depth_planar_image(depth_image)
+    finite_depth = depth[np.isfinite(depth)]
+    valid_depth = finite_depth[
+        (finite_depth >= float(min_depth_cm))
+        & (finite_depth <= float(max_depth_cm))
+    ]
+    h, w = depth.shape[:2]
+    patch = depth[int(h * 0.55):int(h * 0.9), int(w * 0.4):int(w * 0.6)]
+    patch_valid = patch[np.isfinite(patch)]
+    return {
+        "available": bool(finite_depth.size),
+        "min_depth": float(np.min(valid_depth)) if valid_depth.size else float(min_depth_cm),
+        "max_depth": float(np.max(valid_depth)) if valid_depth.size else float(max_depth_cm),
+        "front_min_depth": float(np.min(patch_valid)) if patch_valid.size else 0.0,
+        "front_mean_depth": float(np.mean(patch_valid)) if patch_valid.size else 0.0,
+        "finite_count": int(finite_depth.size),
+        "valid_count": int(valid_depth.size),
+        "image_width": int(w),
+        "image_height": int(h),
+        "source_mode": "unrealcv_depth_npy",
+    }
+
+
+def render_depth_preview(
+    depth_image: Any,
+    *,
+    min_depth_cm: float = DEFAULT_DEPTH_MIN_CM,
+    max_depth_cm: float = DEFAULT_DEPTH_MAX_CM,
+    source_mode: str = "unrealcv_depth_npy",
+) -> np.ndarray:
+    depth = coerce_depth_planar_image(depth_image)
+    canvas = np.zeros((depth.shape[0], depth.shape[1], 3), dtype=np.uint8)
+    canvas[:] = (12, 12, 18)
+    finite = depth[np.isfinite(depth)]
+    if finite.size:
+        preview_min = float(np.min(finite)) if min_depth_cm <= 0 else float(min_depth_cm)
+        preview_max = float(np.max(finite)) if max_depth_cm <= preview_min else float(max_depth_cm)
+        if preview_max <= preview_min:
+            preview_max = preview_min + 1.0
+        valid_mask = np.isfinite(depth) & (depth >= preview_min) & (depth <= preview_max)
+        clipped = np.clip(depth, preview_min, preview_max)
+        normalized = 1.0 - ((clipped - preview_min) / (preview_max - preview_min))
+        preview_u8 = np.clip(np.nan_to_num(normalized) * 255.0, 0.0, 255.0).astype(np.uint8)
+        canvas = cv2.applyColorMap(preview_u8, cv2.COLORMAP_TURBO)
+        canvas[~valid_mask] = (16, 16, 20)
+    cv2.putText(
+        canvas,
+        f"Depth mode: {source_mode}",
+        (12, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (235, 235, 235),
+        1,
+        cv2.LINE_AA,
+    )
+    return cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+
+
+def save_depth_capture_outputs(
+    depth_image: Any,
+    *,
+    depth_cm_path: Path,
+    depth_preview_path: Path,
+    depth_npy_path: Path,
+    min_depth_cm: float = DEFAULT_DEPTH_MIN_CM,
+    max_depth_cm: float = DEFAULT_DEPTH_MAX_CM,
+) -> Dict[str, Any]:
+    depth = coerce_depth_planar_image(depth_image)
+    depth_u16 = np.clip(np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 65535.0).astype(np.uint16)
+    Image.fromarray(depth_u16).save(depth_cm_path)
+    Image.fromarray(
+        render_depth_preview(depth, min_depth_cm=min_depth_cm, max_depth_cm=max_depth_cm)
+    ).save(depth_preview_path)
+    np.save(depth_npy_path, depth.astype(np.float32, copy=False))
+    return summarize_depth_image(depth, min_depth_cm=min_depth_cm, max_depth_cm=max_depth_cm)
 
 
 def make_env(args: argparse.Namespace):
@@ -794,11 +950,33 @@ def read_drone_pose(env: Any, drone_name: str) -> List[float]:
     return list(loc) + list(rot)
 
 
+def pose_values_to_dict(pose_values: List[float]) -> Dict[str, Any]:
+    if len(pose_values) < 6:
+        return {"raw": list(pose_values)}
+    return {
+        "x": float(pose_values[0]),
+        "y": float(pose_values[1]),
+        "z": float(pose_values[2]),
+        "roll": float(pose_values[3]),
+        "yaw": float(pose_values[4]),
+        "task_yaw": float(pose_values[4]),
+        "pitch": float(pose_values[5]),
+        "raw": [float(value) for value in pose_values[:6]],
+    }
+
+
 def read_drone_observation(env: Any, drone_name: str) -> Optional[np.ndarray]:
     cam_id = env.unwrapped.agents.get(drone_name, {}).get("cam_id")
     if cam_id is None or cam_id < 0:
         return None
     return env.unwrapped.unrealcv.read_image(cam_id, "lit", "direct")
+
+
+def read_drone_depth(env: Any, drone_name: str) -> Optional[np.ndarray]:
+    cam_id = env.unwrapped.agents.get(drone_name, {}).get("cam_id")
+    if cam_id is None or cam_id < 0:
+        return None
+    return env.unwrapped.unrealcv.get_depth(cam_id, show=False)
 
 
 def stabilize_drone_at_current_pose(env: Any, drone_name: str) -> None:
@@ -1766,6 +1944,121 @@ class DroneFlightSession:
         if save and image is not None and self.run_dir is not None:
             save_color_observation_for_args(self.args, image, self.run_dir / f"step_{self.total_step:04d}_{label}.png")
         return image
+
+    def _capture_bundle_to_dir(
+        self,
+        env: Any,
+        drone_name: str,
+        capture_dir: Path,
+        *,
+        extra_result: Optional[Dict[str, Any]] = None,
+        extra_pose: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        rgb = read_drone_observation(env, drone_name)
+        depth = read_drone_depth(env, drone_name)
+        pose_values = [float(value) for value in read_drone_pose(env, drone_name)]
+        pose = pose_values_to_dict(pose_values)
+        if rgb is None:
+            raise RuntimeError("RGB observation is unavailable for current drone camera")
+        if depth is None:
+            raise RuntimeError("Depth observation is unavailable for current drone camera")
+
+        rgb_path = capture_dir / "rgb.png"
+        depth_cm_path = capture_dir / "depth_cm.png"
+        depth_preview_path = capture_dir / "depth_preview.png"
+        depth_npy_path = capture_dir / "depth.npy"
+        pose_json_path = capture_dir / "pose.json"
+        capture_json_path = capture_dir / "capture.json"
+
+        save_color_observation_for_args(self.args, rgb, rgb_path)
+        depth_summary = save_depth_capture_outputs(
+            depth,
+            depth_cm_path=depth_cm_path,
+            depth_preview_path=depth_preview_path,
+            depth_npy_path=depth_npy_path,
+            min_depth_cm=float(getattr(self.args, "depth_min_cm", DEFAULT_DEPTH_MIN_CM)),
+            max_depth_cm=float(getattr(self.args, "depth_max_cm", DEFAULT_DEPTH_MAX_CM)),
+        )
+        self.last_observation = rgb
+        self.last_actual_pose = pose_values
+
+        capture_time = datetime.now().isoformat(timespec="milliseconds")
+        pose_payload = {
+            "capture_time": capture_time,
+            "drone_name": drone_name,
+            "pose": pose,
+            "movement_mode": self.movement_mode,
+            "movement_enabled": bool(self.movement_enabled),
+            "last_action": self.last_action,
+            "step_count": int(self.total_step),
+        }
+        if extra_pose:
+            pose_payload.update(extra_pose)
+        pose_json_path.write_text(json.dumps(pose_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        result = {
+            "status": "ok",
+            "message": f"Capture saved: {capture_dir}",
+            "capture_time": capture_time,
+            "drone_name": drone_name,
+            "capture_dir": str(capture_dir),
+            "rgb_path": str(rgb_path),
+            "depth_cm_path": str(depth_cm_path),
+            "depth_preview_path": str(depth_preview_path),
+            "depth_npy_path": str(depth_npy_path),
+            "pose_json_path": str(pose_json_path),
+            "capture_json_path": str(capture_json_path),
+            "rgb_source_order": str(getattr(self.args, "rgb_source_order", DEFAULT_RGB_SOURCE_ORDER) or DEFAULT_RGB_SOURCE_ORDER),
+            "enhance_rgb": bool(getattr(self.args, "enhance_rgb", DEFAULT_RGB_ENHANCE_ENABLED)),
+            "depth_min_cm": float(getattr(self.args, "depth_min_cm", DEFAULT_DEPTH_MIN_CM)),
+            "depth_max_cm": float(getattr(self.args, "depth_max_cm", DEFAULT_DEPTH_MAX_CM)),
+            "pose": pose,
+            "depth_summary": depth_summary,
+        }
+        if extra_result:
+            result.update(extra_result)
+        capture_json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        return result
+
+    @serialized_unrealcv_method
+    def capture_temp_bundle(self, output_root: Optional[Any] = None) -> Dict[str, Any]:
+        env, drone_name = self.require_started()
+        root_value = output_root or getattr(self.args, "temp_capture_dir", DEFAULT_TEMP_CAPTURE_DIR)
+        root_path = resolve_project_output_path(root_value, DEFAULT_TEMP_CAPTURE_DIR)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        capture_dir = make_unique_child_dir(root_path, timestamp)
+        return self._capture_bundle_to_dir(
+            env,
+            drone_name,
+            capture_dir,
+            extra_result={
+                "capture_kind": "temp_capture",
+                "message": f"Temp capture saved: {capture_dir}",
+            },
+        )
+
+    @serialized_unrealcv_method
+    def capture_stream_frame(self, stream_dir: Any, frame_index: int) -> Dict[str, Any]:
+        env, drone_name = self.require_started()
+        stream_path = resolve_project_output_path(stream_dir, DEFAULT_STREAM_CAPTURE_DIR)
+        frames_dir = stream_path / "frames"
+        frame_number = max(0, int(frame_index))
+        frame_name = f"frame_{frame_number:06d}"
+        capture_dir = make_unique_child_dir(frames_dir, frame_name)
+        return self._capture_bundle_to_dir(
+            env,
+            drone_name,
+            capture_dir,
+            extra_pose={"frame_index": frame_number, "stream_dir": str(stream_path)},
+            extra_result={
+                "capture_kind": "stream_capture",
+                "frame_index": frame_number,
+                "stream_dir": str(stream_path),
+                "frames_dir": str(frames_dir),
+                "message": f"Stream frame {frame_number} saved: {capture_dir}",
+            },
+        )
 
     @serialized_unrealcv_method
     def set_pose(self, payload: Dict[str, Any]) -> Dict[str, Any]:

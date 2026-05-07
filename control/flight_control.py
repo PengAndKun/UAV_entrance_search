@@ -18,6 +18,7 @@ class FlightControlMixin:
 
     def on_stop_session(self) -> None:
         self.stop_keyboard_control(send_hold=False)
+        self.stream_capture_stop_event.set()
         self.route_stop_event.set()
         session = self.session
         if session is None:
@@ -333,15 +334,460 @@ class FlightControlMixin:
             return
         self.call_async("Setting pose", lambda: session.set_pose(payload))
 
-    def on_save_frame(self) -> None:
-        session = self.active_session()
-        if session is None:
-            return
+    def sync_capture_options_to_session(self, session: flight.DroneFlightSession) -> None:
         session.args.enhance_rgb = bool(self.enhance_rgb_var.get())
         session.args.rgb_enhance_gamma = float(self.args.rgb_enhance_gamma)
         session.args.rgb_enhance_gain = float(self.args.rgb_enhance_gain)
         session.args.rgb_source_order = self.rgb_source_order_var.get().strip() or flight.DEFAULT_RGB_SOURCE_ORDER
+        session.args.temp_capture_dir = str(getattr(self.args, "temp_capture_dir", flight.DEFAULT_TEMP_CAPTURE_DIR))
+        session.args.stream_capture_dir = str(getattr(self.args, "stream_capture_dir", flight.DEFAULT_STREAM_CAPTURE_DIR))
+        session.args.depth_min_cm = float(getattr(self.args, "depth_min_cm", flight.DEFAULT_DEPTH_MIN_CM))
+        session.args.depth_max_cm = float(getattr(self.args, "depth_max_cm", flight.DEFAULT_DEPTH_MAX_CM))
+
+    def on_save_frame(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        self.sync_capture_options_to_session(session)
         self.call_async("Saving RGB frame", lambda: (session.capture_observation(save=True, label="manual"), session.get_state())[1])
+
+    def on_temp_capture(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        if self.temp_capture_inflight:
+            self.status_var.set("Temp Capture is already running.")
+            return
+
+        self.sync_capture_options_to_session(session)
+
+        def worker() -> None:
+            self.temp_capture_inflight = True
+            self.root.after(0, lambda: self.status_var.set("Temp Capture..."))
+            try:
+                result = self.safe(
+                    "Temp Capture",
+                    lambda: session.capture_temp_bundle(output_root=session.args.temp_capture_dir),
+                )
+                if isinstance(result, dict):
+                    self.root.after(0, lambda r=result: self.apply_temp_capture_result(r))
+            finally:
+                self.temp_capture_inflight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_temp_capture_result(self, result: Dict[str, Any]) -> None:
+        message = str(result.get("message", "") or result.get("status", "Temp Capture finished"))
+        self.status_var.set(message)
+        self.latest_state.setdefault("last_temp_capture", result)
+        self.latest_state["last_temp_capture"] = result
+        pose = result.get("pose") if isinstance(result.get("pose"), dict) else {}
+        if pose:
+            self.latest_state["pose"] = pose
+            self.pose_var.set(
+                "Pose "
+                f"x={float(pose.get('x', 0.0)):.1f} "
+                f"y={float(pose.get('y', 0.0)):.1f} "
+                f"z={float(pose.get('z', 0.0)):.1f} "
+                f"yaw={float(pose.get('task_yaw', pose.get('yaw', 0.0))):.1f} "
+                "action=temp_capture"
+            )
+        self.refresh_map_once()
+
+    def parse_stream_interval_s(self) -> float:
+        try:
+            interval_s = float(self.stream_interval_s_var.get().strip())
+        except Exception:
+            interval_s = flight.DEFAULT_STREAM_CAPTURE_INTERVAL_S
+        interval_s = max(0.1, min(3600.0, interval_s))
+        normalized = f"{interval_s:g}"
+        if self.stream_interval_s_var.get().strip() != normalized:
+            self.root.after(0, lambda value=normalized: self.stream_interval_s_var.set(value))
+        return interval_s
+
+    def make_stream_capture_dir(self, task_title: str) -> Path:
+        root_value = str(getattr(self.args, "stream_capture_dir", flight.DEFAULT_STREAM_CAPTURE_DIR) or flight.DEFAULT_STREAM_CAPTURE_DIR)
+        root_path = flight.resolve_project_output_path(root_value, flight.DEFAULT_STREAM_CAPTURE_DIR)
+        safe_task = flight.sanitize_capture_task_title(task_title)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        return flight.make_unique_child_dir(root_path, f"{safe_task}_{timestamp}")
+
+    def write_stream_capture_summary(
+        self,
+        stream_dir: Path,
+        *,
+        task_title: str,
+        interval_s: float,
+        started_at: str,
+        stopped_at: str = "",
+        running: bool = True,
+    ) -> None:
+        summary = {
+            "task_title": task_title,
+            "safe_task_title": flight.sanitize_capture_task_title(task_title),
+            "interval_s": float(interval_s),
+            "stream_dir": str(stream_dir),
+            "frames_dir": str(stream_dir / "frames"),
+            "started_at": started_at,
+            "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+            "stopped_at": stopped_at,
+            "running": bool(running),
+            "frame_count": len(self.stream_capture_trajectory),
+        }
+        (stream_dir / "stream_capture.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        trajectory_payload = dict(summary)
+        trajectory_payload["trajectory"] = self.stream_capture_trajectory
+        (stream_dir / "trajectory.json").write_text(json.dumps(trajectory_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def on_start_stream_capture(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        if self.stream_capture_thread is not None and self.stream_capture_thread.is_alive():
+            self.stream_status_var.set("Stream Capture: already running")
+            return
+
+        self.sync_capture_options_to_session(session)
+        task_title = self.stream_task_title_var.get().strip() or "stream_task"
+        interval_s = self.parse_stream_interval_s()
+        stream_dir = self.make_stream_capture_dir(task_title)
+        (stream_dir / "frames").mkdir(parents=True, exist_ok=True)
+        self.stream_capture_dir = stream_dir
+        self.stream_capture_trajectory = []
+        self.stream_capture_stop_event.clear()
+        started_at = datetime.now().isoformat(timespec="milliseconds")
+        self.write_stream_capture_summary(stream_dir, task_title=task_title, interval_s=interval_s, started_at=started_at)
+        self.stream_status_var.set(f"Stream Capture: 0 frames -> {stream_dir}")
+        self.status_var.set(f"Stream Capture started: {stream_dir}")
+
+        def worker() -> None:
+            frame_index = 0
+            try:
+                while not self.stream_capture_stop_event.is_set():
+                    frame_index += 1
+                    frame_started = time.monotonic()
+                    result = self.safe(
+                        "Stream Capture",
+                        lambda idx=frame_index: session.capture_stream_frame(stream_dir, idx),
+                    )
+                    if not isinstance(result, dict):
+                        break
+                    entry = {
+                        "frame_index": int(result.get("frame_index", frame_index)),
+                        "capture_time": result.get("capture_time", ""),
+                        "pose": result.get("pose", {}),
+                        "capture_dir": result.get("capture_dir", ""),
+                        "rgb_path": result.get("rgb_path", ""),
+                        "depth_cm_path": result.get("depth_cm_path", ""),
+                        "depth_preview_path": result.get("depth_preview_path", ""),
+                        "depth_npy_path": result.get("depth_npy_path", ""),
+                    }
+                    self.stream_capture_trajectory.append(entry)
+                    self.write_stream_capture_summary(
+                        stream_dir,
+                        task_title=task_title,
+                        interval_s=interval_s,
+                        started_at=started_at,
+                    )
+                    self.root.after(
+                        0,
+                        lambda r=result, count=len(self.stream_capture_trajectory), d=stream_dir: self.apply_stream_capture_result(r, count, d),
+                    )
+                    elapsed_s = time.monotonic() - frame_started
+                    if self.stream_capture_stop_event.wait(max(0.0, interval_s - elapsed_s)):
+                        break
+            finally:
+                stopped_at = datetime.now().isoformat(timespec="milliseconds")
+                try:
+                    self.write_stream_capture_summary(
+                        stream_dir,
+                        task_title=task_title,
+                        interval_s=interval_s,
+                        started_at=started_at,
+                        stopped_at=stopped_at,
+                        running=False,
+                    )
+                except Exception as exc:
+                    LOGGER.warning("Failed to write stream capture summary: %s", exc)
+                self.root.after(
+                    0,
+                    lambda count=len(self.stream_capture_trajectory), d=stream_dir: self.stream_status_var.set(
+                        f"Stream Capture: stopped, {count} frames -> {d}"
+                    ),
+                )
+
+        self.stream_capture_thread = threading.Thread(target=worker, daemon=True)
+        self.stream_capture_thread.start()
+
+    def on_stop_stream_capture(self) -> None:
+        self.stream_capture_stop_event.set()
+        if self.stream_capture_thread is not None and self.stream_capture_thread.is_alive():
+            self.stream_status_var.set("Stream Capture: stopping...")
+            self.status_var.set("Stopping Stream Capture...")
+        else:
+            self.stream_status_var.set("Stream Capture: idle")
+
+    def apply_stream_capture_result(self, result: Dict[str, Any], frame_count: int, stream_dir: Path) -> None:
+        self.latest_state.setdefault("last_stream_capture", result)
+        self.latest_state["last_stream_capture"] = result
+        pose = result.get("pose") if isinstance(result.get("pose"), dict) else {}
+        if pose:
+            self.latest_state["pose"] = pose
+            self.pose_var.set(
+                "Pose "
+                f"x={float(pose.get('x', 0.0)):.1f} "
+                f"y={float(pose.get('y', 0.0)):.1f} "
+                f"z={float(pose.get('z', 0.0)):.1f} "
+                f"yaw={float(pose.get('task_yaw', pose.get('yaw', 0.0))):.1f} "
+                f"action=stream_{frame_count}"
+            )
+        self.stream_status_var.set(f"Stream Capture: {frame_count} frames -> {stream_dir}")
+        self.status_var.set(f"Stream Capture frame {frame_count} saved")
+        self.refresh_map_once()
+
+    def stream_capture_root_path(self) -> Path:
+        root_value = str(getattr(self.args, "stream_capture_dir", flight.DEFAULT_STREAM_CAPTURE_DIR) or flight.DEFAULT_STREAM_CAPTURE_DIR)
+        return flight.resolve_project_output_path(root_value, flight.DEFAULT_STREAM_CAPTURE_DIR)
+
+    def stream_player_path_key(self) -> Tuple[str, str]:
+        mode = str(self.stream_player_image_mode_var.get() or "rgb").strip().lower()
+        if mode == "depth_preview":
+            return "depth_preview_path", "depth_preview.png"
+        return "rgb_path", "rgb.png"
+
+    def collect_stream_player_frames(self, stream_dir: Path) -> Tuple[List[Path], float]:
+        stream_path = Path(stream_dir)
+        path_key, fallback_name = self.stream_player_path_key()
+        interval_s = self.parse_stream_interval_s()
+        frames: List[Path] = []
+        seen: set[str] = set()
+
+        trajectory_path = stream_path / "trajectory.json"
+        if trajectory_path.exists():
+            try:
+                payload = json.loads(trajectory_path.read_text(encoding="utf-8"))
+                interval_s = float(payload.get("interval_s", interval_s) or interval_s)
+                trajectory = payload.get("trajectory", [])
+                if isinstance(trajectory, list):
+                    for entry in trajectory:
+                        if not isinstance(entry, dict):
+                            continue
+                        raw_path = entry.get(path_key)
+                        if not raw_path and entry.get("capture_dir"):
+                            raw_path = str(Path(str(entry.get("capture_dir"))) / fallback_name)
+                        if not raw_path:
+                            continue
+                        frame_path = Path(str(raw_path))
+                        if not frame_path.is_absolute():
+                            frame_path = stream_path / frame_path
+                        frame_key = str(frame_path.resolve())
+                        if frame_path.exists() and frame_key not in seen:
+                            frames.append(frame_path)
+                            seen.add(frame_key)
+            except Exception as exc:
+                LOGGER.warning("Failed to read stream trajectory %s: %s", trajectory_path, exc)
+
+        for frame_path in sorted((stream_path / "frames").glob(f"frame_*/*{fallback_name}")):
+            frame_key = str(frame_path.resolve())
+            if frame_key not in seen and frame_path.exists():
+                frames.append(frame_path)
+                seen.add(frame_key)
+        return frames, max(0.05, interval_s)
+
+    def refresh_stream_player_frames(self) -> None:
+        if self.stream_player_dir is None:
+            return
+        current_path = None
+        if self.stream_player_frames:
+            self.stream_player_index = max(0, min(self.stream_player_index, len(self.stream_player_frames) - 1))
+            current_path = self.stream_player_frames[self.stream_player_index]
+        frames, interval_s = self.collect_stream_player_frames(self.stream_player_dir)
+        self.stream_player_frames = frames
+        self.stream_player_interval_ms = int(max(50.0, interval_s * 1000.0))
+        if not frames:
+            self.stream_player_index = 0
+            return
+        if current_path in frames:
+            self.stream_player_index = frames.index(current_path)
+        else:
+            self.stream_player_index = max(0, min(self.stream_player_index, len(frames) - 1))
+
+    def load_stream_player_dir(self, stream_dir: Path, *, autoplay: bool = False) -> None:
+        self.stop_stream_player()
+        self.stream_player_dir = Path(stream_dir)
+        self.stream_player_index = 0
+        self.refresh_stream_player_frames()
+        if not self.stream_player_frames:
+            self.stream_player_status_var.set(f"Stream Player: no frames in {self.stream_player_dir}")
+            return
+        self.display_stream_player_frame()
+        if autoplay:
+            self.start_stream_player()
+
+    def find_latest_stream_capture_dir(self) -> Optional[Path]:
+        root = self.stream_capture_root_path()
+        if not root.exists():
+            return None
+        candidates = [path for path in root.iterdir() if path.is_dir()]
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        for candidate in candidates:
+            frames, _interval_s = self.collect_stream_player_frames(candidate)
+            if frames:
+                return candidate
+        return None
+
+    def open_stream_player_window(self) -> None:
+        if self.stream_player_window is not None and self.stream_player_window.winfo_exists():
+            self.stream_player_window.lift()
+            return
+        self.stream_player_window = tk.Toplevel(self.root)
+        self.stream_player_window.title("Stream Capture Player")
+        self.stream_player_window.geometry("760x560")
+        self.stream_player_window.protocol("WM_DELETE_WINDOW", self.close_stream_player_window)
+
+        toolbar = tk.Frame(self.stream_player_window)
+        toolbar.pack(fill="x", padx=6, pady=6)
+        tk.Button(toolbar, text="Load Folder", command=self.select_stream_player_folder).pack(side="left", padx=(0, 6))
+        tk.Button(toolbar, text="Latest", command=lambda: self.load_latest_stream_player(autoplay=False)).pack(side="left", padx=6)
+        tk.Button(toolbar, text="Prev", command=self.show_stream_player_prev).pack(side="left", padx=6)
+        tk.Button(toolbar, text="Play/Pause", command=self.toggle_stream_player_playback).pack(side="left", padx=6)
+        tk.Button(toolbar, text="Stop", command=self.stop_stream_player).pack(side="left", padx=6)
+        tk.Button(toolbar, text="Next", command=self.show_stream_player_next).pack(side="left", padx=6)
+        tk.Label(toolbar, text="Image").pack(side="left", padx=(12, 2))
+        mode_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.stream_player_image_mode_var,
+            values=("rgb", "depth_preview"),
+            state="readonly",
+            width=13,
+        )
+        mode_combo.pack(side="left", padx=(0, 6))
+        mode_combo.bind("<<ComboboxSelected>>", lambda _event: self.reload_stream_player_mode())
+
+        self.stream_player_label = tk.Label(self.stream_player_window, text="Load a stream_capture task folder.", anchor="center")
+        self.stream_player_label.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        tk.Label(self.stream_player_window, textvariable=self.stream_player_status_var, anchor="w").pack(fill="x", padx=6, pady=(0, 6))
+
+        if self.stream_player_dir is not None:
+            self.load_stream_player_dir(self.stream_player_dir, autoplay=False)
+        elif self.stream_capture_dir is not None:
+            self.load_stream_player_dir(self.stream_capture_dir, autoplay=False)
+
+    def close_stream_player_window(self) -> None:
+        self.stop_stream_player()
+        if self.stream_player_window is not None and self.stream_player_window.winfo_exists():
+            self.stream_player_window.destroy()
+        self.stream_player_window = None
+        self.stream_player_label = None
+        self.stream_player_photo = None
+
+    def select_stream_player_folder(self) -> None:
+        self.open_stream_player_window()
+        initial_dir = self.stream_capture_root_path()
+        selected = filedialog.askdirectory(title="Select stream_capture task folder", initialdir=str(initial_dir))
+        if selected:
+            self.load_stream_player_dir(Path(selected), autoplay=False)
+
+    def load_latest_stream_player(self, *, autoplay: bool = False) -> None:
+        self.open_stream_player_window()
+        latest_dir = self.find_latest_stream_capture_dir()
+        if latest_dir is None:
+            self.stream_player_status_var.set(f"Stream Player: no stream folders under {self.stream_capture_root_path()}")
+            return
+        self.load_stream_player_dir(latest_dir, autoplay=autoplay)
+
+    def play_latest_stream_capture(self) -> None:
+        self.load_latest_stream_player(autoplay=True)
+
+    def reload_stream_player_mode(self) -> None:
+        if self.stream_player_dir is None:
+            return
+        autoplay = bool(self.stream_player_playing)
+        self.load_stream_player_dir(self.stream_player_dir, autoplay=autoplay)
+
+    def display_stream_player_frame(self) -> None:
+        if self.stream_player_label is None:
+            return
+        if not self.stream_player_frames:
+            self.stream_player_label.configure(image="", text="No stream frames loaded.")
+            self.stream_player_status_var.set("Stream Player: no frames loaded")
+            return
+        self.stream_player_index = max(0, min(self.stream_player_index, len(self.stream_player_frames) - 1))
+        frame_path = self.stream_player_frames[self.stream_player_index]
+        try:
+            image = Image.open(frame_path).convert("RGB")
+            image.thumbnail((940, 700), Image.Resampling.LANCZOS)
+            self.stream_player_photo = ImageTk.PhotoImage(image)
+            self.stream_player_label.configure(image=self.stream_player_photo, text="")
+            self.stream_player_status_var.set(
+                f"Stream Player: {self.stream_player_index + 1}/{len(self.stream_player_frames)} "
+                f"{self.stream_player_image_mode_var.get()} {frame_path.parent.name}"
+            )
+        except Exception as exc:
+            self.stream_player_label.configure(image="", text=f"Failed to load {frame_path}")
+            self.stream_player_status_var.set(f"Stream Player failed: {exc}")
+
+    def show_stream_player_next(self) -> None:
+        self.refresh_stream_player_frames()
+        if not self.stream_player_frames:
+            self.display_stream_player_frame()
+            return
+        self.stream_player_index = (self.stream_player_index + 1) % len(self.stream_player_frames)
+        self.display_stream_player_frame()
+
+    def show_stream_player_prev(self) -> None:
+        self.refresh_stream_player_frames()
+        if not self.stream_player_frames:
+            self.display_stream_player_frame()
+            return
+        self.stream_player_index = (self.stream_player_index - 1) % len(self.stream_player_frames)
+        self.display_stream_player_frame()
+
+    def start_stream_player(self) -> None:
+        if not self.stream_player_frames:
+            self.refresh_stream_player_frames()
+        if not self.stream_player_frames:
+            self.display_stream_player_frame()
+            return
+        self.stream_player_playing = True
+        self.cancel_stream_player_after()
+        self.stream_player_after_id = self.root.after(self.stream_player_interval_ms, self.stream_player_tick)
+        self.display_stream_player_frame()
+
+    def toggle_stream_player_playback(self) -> None:
+        if self.stream_player_playing:
+            self.stop_stream_player()
+        else:
+            self.start_stream_player()
+
+    def stream_player_tick(self) -> None:
+        self.stream_player_after_id = None
+        if not self.stream_player_playing:
+            return
+        if self.stream_player_window is None or not self.stream_player_window.winfo_exists():
+            self.stop_stream_player()
+            return
+        self.show_stream_player_next()
+        self.stream_player_after_id = self.root.after(self.stream_player_interval_ms, self.stream_player_tick)
+
+    def cancel_stream_player_after(self) -> None:
+        after_id = self.stream_player_after_id
+        self.stream_player_after_id = None
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+
+    def stop_stream_player(self) -> None:
+        self.stream_player_playing = False
+        self.cancel_stream_player_after()
+        if self.stream_player_frames:
+            self.stream_player_status_var.set(
+                f"Stream Player: paused {self.stream_player_index + 1}/{len(self.stream_player_frames)}"
+            )
+        else:
+            self.stream_player_status_var.set("Stream Player: idle")
 
     def image_to_photo(self, image: np.ndarray, max_width: int = 900, max_height: int = 620) -> ImageTk.PhotoImage:
         array = flight.prepare_observation_rgb(
