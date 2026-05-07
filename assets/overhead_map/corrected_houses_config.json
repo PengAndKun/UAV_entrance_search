@@ -1,0 +1,549 @@
+{
+  "world_bounds": {
+    "min_x": 1000,
+    "min_y": -500,
+    "max_x": 5000,
+    "max_y": 3000
+  },
+  "overhead_map": {
+    "center_x": 3000.0,
+    "center_y": 1250.0,
+    "height_z": 5400.0,
+    "yaw_deg": 0.0,
+    "image_path": "qq.png",
+    "calibration": {
+      "anchors": [
+        {
+          "index": 1,
+          "label": "P1",
+          "world_x": 1945.662,
+          "world_y": 74.308,
+          "image_x": 574.0736842105263,
+          "image_y": 706.4357142857143,
+          "source_world_x": 1945.662,
+          "source_world_y": 74.308
+        },
+        {
+          "index": 2,
+          "label": "P2",
+          "world_x": 34.923,
+          "world_y": 37.049,
+          "image_x": 916.7605263157894,
+          "image_y": 704.3142857142857,
+          "source_world_x": 34.923,
+          "source_world_y": 37.049
+        },
+        {
+          "index": 3,
+          "label": "P3",
+          "world_x": -27.113,
+          "world_y": 949.185,
+          "image_x": 916.7605263157894,
+          "image_y": 579.15,
+          "source_world_x": -27.113,
+          "source_world_y": 949.185
+        },
+        {
+          "index": 4,
+          "label": "P4",
+          "world_x": -2042.535,
+          "world_y": 807.746,
+          "image_x": 1241.8736842105263,
+          "image_y": 594.0,
+          "source_world_x": -2042.535,
+          "source_world_y": 807.746
+        },
+        {
+          "index": 5,
+          "label": "P5",
+          "world_x": -4963.752,
+          "world_y": -214.19,
+          "image_x": 1701.7184210526316,
+          "image_y": 738.2571428571429,
+          "source_world_x": -4963.752,
+          "source_world_y": -214.19
+        }
+      ],
+      "affine_world_to_image": [
+        [
+          -0.16237215924362275,
+          0.010211958538393772,
+          902.7717560204519
+        ],
+        [
+          0.0012423023924154819,
+          -0.14216599924597825,
+          712.7181524081709
+        ]
+      ],
+      "image_width": 2226,
+      "image_height": 1188,
+      "rmse_px": 10.936267645665268,
+      "updated_at": 1778128649.410988,
+      "touch_calibration_status": "complete"
+    }
+  },
+  "current_target_id": "002",
+  "houses": [
+    {
+      "id": "001",
+      "name": "House_1",
+      "center_x": 3397.678524780894,
+      "center_y": -105.18521062704252,
+      "center_z": 200.0,
+      "approach_z": 600.0,
+      "radius_cm": 1855.0273622617508,
+      "entry_yaw_hint": 0.0,
+      "map_bbox_image": {
+        "x1": 219.67105263157896,
+        "y1": 468.8357142857143,
+        "x2": 480.34736842105264,
+        "y2": 994.95
+      },
+      "status": "IN_PROGRESS",
+      "search_start_time": 1776228023.4387681,
+      "search_end_time": null,
+      "person_location": null,
+      "notes": ""
+    },
+    {
+      "id": "002",
+      "name": "House_2",
+      "center_x": 823.2877955810445,
+      "center_y": 1983.8091527959475,
+      "center_z": 200.0,
+      "approach_z": 600.0,
+      "radius_cm": 1073.9208944713557,
+      "entry_yaw_hint": 0.0,
+      "map_bbox_image": {
+        "x1": 615.078947368421,
+        "y1": 369.12857142857143,
+        "x2": 963.6236842105263,
+        "y2": 494.29285714285714
+      },
+      "status": "IN_PROGRESS",
+      "search_start_time": 1776242918.7116144,
+      "search_end_time": null,
+      "person_location": null,
+      "notes": ""
+    },
+    {
+      "id": "003",
+      "name": "House_3",
+      "center_x": -1779.9075659149996,
+      "center_y": 1893.9115368770583,
+      "center_z": 200.0,
+      "approach_z": 600.0,
+      "radius_cm": 1146.1172571248933,
+      "entry_yaw_hint": 0.0,
+      "map_bbox_image": {
+        "x1": 1025.1315789473683,
+        "y1": 333.0642857142857,
+        "x2": 1397.1078947368421,
+        "y2": 549.45
+      },
+      "status": "IN_PROGRESS",
+      "search_start_time": 1777359220.5974565,
+      "search_end_time": null,
+      "person_location": null,
+      "notes": ""
+    },
+    {
+      "id": "004",
+      "name": "House_4",
+      "center_x": 438.82565503905954,
+      "center_y": -2264.914522429122,
+      "center_z": 200.0,
+      "approach_z": 600.0,
+      "radius_cm": 1028.7981678128956,
+      "entry_yaw_hint": 0.0,
+      "map_bbox_image": {
+        "x1": 641.4394736842105,
+        "y1": 944.0357142857143,
+        "x2": 975.3394736842105,
+        "y2": 1126.4785714285715
+      },
+      "status": "UNSEARCHED",
+      "search_start_time": null,
+      "search_end_time": null,
+      "person_location": null,
+      "notes": ""
+    },
+    {
+      "id": "005",
+      "name": "House_5",
+      "center_x": -2601.8605098042135,
+      "center_y": -2284.024136724129,
+      "center_z": 200.0,
+      "approach_z": 600.0,
+      "radius_cm": 1326.608163758734,
+      "entry_yaw_hint": 0.0,
+      "map_bbox_image": {
+        "x1": 1086.6394736842105,
+        "y1": 954.6428571428571,
+        "x2": 1517.1947368421052,
+        "y2": 1113.75
+      },
+      "status": "UNSEARCHED",
+      "search_start_time": null,
+      "search_end_time": null,
+      "person_location": null,
+      "notes": ""
+    },
+    {
+      "id": "006",
+      "name": "House_6",
+      "center_x": -7231.952287971876,
+      "center_y": -2048.4231163960917,
+      "center_z": 200.0,
+      "approach_z": 600.0,
+      "radius_cm": 1166.8720504549722,
+      "entry_yaw_hint": 0.0,
+      "map_bbox_image": {
+        "x1": 1944.821052631579,
+        "y1": 829.4785714285714,
+        "x2": 2167.4210526315787,
+        "y2": 1160.4214285714286
+      },
+      "status": "UNSEARCHED",
+      "search_start_time": null,
+      "search_end_time": null,
+      "person_location": null,
+      "notes": ""
+    },
+    {
+      "id": "007",
+      "name": "House_7",
+      "center_x": -7147.69757319748,
+      "center_y": 295.0975377342055,
+      "center_z": 200.0,
+      "approach_z": 600.0,
+      "radius_cm": 1092.0725600411922,
+      "entry_yaw_hint": 0.0,
+      "map_bbox_image": {
+        "x1": 1941.8921052631579,
+        "y1": 507.02142857142854,
+        "x2": 2190.8526315789472,
+        "y2": 816.75
+      },
+      "status": "UNSEARCHED",
+      "search_start_time": null,
+      "search_end_time": null,
+      "person_location": null,
+      "notes": ""
+    },
+    {
+      "id": "008",
+      "name": "House_8",
+      "center_x": -6810.868869126462,
+      "center_y": 2782.5861223703296,
+      "center_z": 200.0,
+      "approach_z": 600.0,
+      "radius_cm": 979.8733244205213,
+      "entry_yaw_hint": 0.0,
+      "map_bbox_image": {
+        "x1": 1918.4605263157894,
+        "y1": 169.71428571428572,
+        "x2": 2155.705263157895,
+        "y2": 447.62142857142857
+      },
+      "status": "UNSEARCHED",
+      "search_start_time": null,
+      "search_end_time": null,
+      "person_location": null,
+      "notes": ""
+    },
+    {
+      "id": "009",
+      "name": "House_9",
+      "center_x": -4826.270124934769,
+      "center_y": 3792.254204254928,
+      "center_z": 200.0,
+      "approach_z": 600.0,
+      "radius_cm": 1046.847258476279,
+      "entry_yaw_hint": 0.0,
+      "map_bbox_image": {
+        "x1": 1555.2710526315789,
+        "y1": 65.76428571428572,
+        "x2": 1895.028947368421,
+        "y2": 269.4214285714286
+      },
+      "status": "UNSEARCHED",
+      "search_start_time": null,
+      "search_end_time": null,
+      "person_location": null,
+      "notes": ""
+    },
+    {
+      "id": "house_10",
+      "name": "house_10",
+      "center_x": -963.442680476501,
+      "center_y": 3833.470205918692,
+      "center_z": 200.0,
+      "approach_z": 600.0,
+      "radius_cm": 902.4545331692054,
+      "entry_yaw_hint": 0.0,
+      "map_bbox_image": {
+        "x1": 951.9078947368421,
+        "y1": 70.00714285714285,
+        "x2": 1244.8026315789473,
+        "y2": 263.0571428571429
+      },
+      "status": "UNSEARCHED",
+      "search_start_time": null,
+      "search_end_time": null,
+      "person_location": null,
+      "notes": ""
+    },
+    {
+      "id": "house_11",
+      "name": "house_11",
+      "center_x": 998.6685539066065,
+      "center_y": 3768.5438401831884,
+      "center_z": 200.0,
+      "approach_z": 600.0,
+      "radius_cm": 884.4054425058221,
+      "entry_yaw_hint": 0.0,
+      "map_bbox_image": {
+        "x1": 635.5815789473684,
+        "y1": 84.85714285714286,
+        "x2": 922.6184210526316,
+        "y2": 271.54285714285714
+      },
+      "status": "UNSEARCHED",
+      "search_start_time": null,
+      "search_end_time": null,
+      "person_location": null,
+      "notes": ""
+    },
+    {
+      "id": "house_12",
+      "name": "house_12",
+      "center_x": 3022.071179593051,
+      "center_y": 3674.308675417636,
+      "center_z": 200.0,
+      "approach_z": 600.0,
+      "radius_cm": 1055.8718038079717,
+      "entry_yaw_hint": 0.0,
+      "map_bbox_image": {
+        "x1": 278.25,
+        "y1": 106.07142857142857,
+        "x2": 620.9368421052632,
+        "y2": 282.15
+      },
+      "status": "UNSEARCHED",
+      "search_start_time": null,
+      "search_end_time": null,
+      "person_location": null,
+      "notes": ""
+    },
+    {
+      "id": "house_13",
+      "name": "house_13",
+      "center_x": 4630.982366669426,
+      "center_y": 2725.8864833647904,
+      "center_z": 200.0,
+      "approach_z": 600.0,
+      "radius_cm": 1017.2730696274117,
+      "entry_yaw_hint": 0.0,
+      "status": "UNSEARCHED",
+      "search_start_time": null,
+      "search_end_time": null,
+      "person_location": null,
+      "notes": "",
+      "map_bbox_image": {
+        "x1": 67.36578947368422,
+        "y1": 186.68571428571428,
+        "x2": 289.9657894736842,
+        "y2": 475.2
+      }
+    }
+  ],
+  "map_touch_calibration": {
+    "completed_at": 1778128642.956921,
+    "completed_count": 5,
+    "marker_z": 193.351,
+    "points": [
+      {
+        "index": 1,
+        "order": 1,
+        "label": "P1",
+        "image_x": 574.0736842105263,
+        "image_y": 706.4357142857143,
+        "target_world_x": 2000.0,
+        "target_world_y": 85.3,
+        "target_world_z": 193.351,
+        "marker_name": "UAVCalib_28328447_P1",
+        "legacy_marker_name": "UAVCalib_P1",
+        "marker_class": "BP_drone01_C",
+        "marker_scale": [
+          0.1,
+          0.1,
+          0.1
+        ],
+        "marker_spawned": true,
+        "status": "done",
+        "distance_xy_cm": 55.43863551711925,
+        "distance_z_cm": 52.009000000000015,
+        "contact_pose": [
+          1945.662,
+          74.308,
+          245.36,
+          -0.003,
+          14.742,
+          0.0
+        ],
+        "contact_time": 1778128457.1640315,
+        "contact_world_x": 1945.662,
+        "contact_world_y": 74.308,
+        "contact_world_z": 245.36,
+        "xy_tolerance_cm": 60.0,
+        "z_tolerance_cm": 80.0
+      },
+      {
+        "index": 2,
+        "order": 2,
+        "label": "P2",
+        "image_x": 916.7605263157894,
+        "image_y": 704.3142857142857,
+        "target_world_x": 0.0,
+        "target_world_y": 85.3,
+        "target_world_z": 193.351,
+        "marker_name": "UAVCalib_28328447_P2",
+        "legacy_marker_name": "UAVCalib_P2",
+        "marker_class": "BP_drone01_C",
+        "marker_scale": [
+          0.1,
+          0.1,
+          0.1
+        ],
+        "marker_spawned": true,
+        "status": "done",
+        "distance_xy_cm": 59.563201139629825,
+        "distance_z_cm": 47.357,
+        "contact_pose": [
+          34.923,
+          37.049,
+          240.708,
+          0.597,
+          150.122,
+          0.0
+        ],
+        "contact_time": 1778128509.8104477,
+        "contact_world_x": 34.923,
+        "contact_world_y": 37.049,
+        "contact_world_z": 240.708,
+        "xy_tolerance_cm": 60.0,
+        "z_tolerance_cm": 80.0
+      },
+      {
+        "index": 3,
+        "order": 3,
+        "label": "P3",
+        "image_x": 916.7605263157894,
+        "image_y": 579.15,
+        "target_world_x": 0.0,
+        "target_world_y": 1000.0,
+        "target_world_z": 193.351,
+        "marker_name": "UAVCalib_28328447_P3",
+        "legacy_marker_name": "UAVCalib_P3",
+        "marker_class": "BP_drone01_C",
+        "marker_scale": [
+          0.1,
+          0.1,
+          0.1
+        ],
+        "marker_spawned": true,
+        "status": "done",
+        "distance_xy_cm": 57.59582444934707,
+        "distance_z_cm": 49.34800000000001,
+        "contact_pose": [
+          -27.113,
+          949.185,
+          242.699,
+          -0.003,
+          114.063,
+          -0.0
+        ],
+        "contact_time": 1778128535.4643614,
+        "contact_world_x": -27.113,
+        "contact_world_y": 949.185,
+        "contact_world_z": 242.699,
+        "xy_tolerance_cm": 60.0,
+        "z_tolerance_cm": 80.0
+      },
+      {
+        "index": 4,
+        "order": 4,
+        "label": "P4",
+        "image_x": 1241.8736842105263,
+        "image_y": 594.0,
+        "target_world_x": -2100.0,
+        "target_world_y": 802.5,
+        "target_world_z": 193.351,
+        "marker_name": "UAVCalib_28328447_P4",
+        "legacy_marker_name": "UAVCalib_P4",
+        "marker_class": "BP_drone01_C",
+        "marker_scale": [
+          0.1,
+          0.1,
+          0.1
+        ],
+        "marker_spawned": true,
+        "status": "done",
+        "distance_xy_cm": 57.703957758545386,
+        "distance_z_cm": 39.84,
+        "contact_pose": [
+          -2042.535,
+          807.746,
+          233.191,
+          -0.071,
+          176.914,
+          -0.0
+        ],
+        "contact_time": 1778128587.9517343,
+        "contact_world_x": -2042.535,
+        "contact_world_y": 807.746,
+        "contact_world_z": 233.191,
+        "xy_tolerance_cm": 60.0,
+        "z_tolerance_cm": 80.0
+      },
+      {
+        "index": 5,
+        "order": 5,
+        "label": "P5",
+        "image_x": 1701.7184210526316,
+        "image_y": 738.2571428571429,
+        "target_world_x": -5000.0,
+        "target_world_y": -200.0,
+        "target_world_z": 193.351,
+        "marker_name": "UAVCalib_28328447_P5",
+        "legacy_marker_name": "UAVCalib_P5",
+        "marker_class": "BP_drone01_C",
+        "marker_scale": [
+          0.1,
+          0.1,
+          0.1
+        ],
+        "marker_spawned": true,
+        "status": "done",
+        "distance_xy_cm": 38.926515436139034,
+        "distance_z_cm": 39.84,
+        "contact_pose": [
+          -4963.752,
+          -214.19,
+          233.191,
+          -0.003,
+          -177.411,
+          0.0
+        ],
+        "contact_time": 1778128642.956921,
+        "contact_world_x": -4963.752,
+        "contact_world_y": -214.19,
+        "contact_world_z": 233.191,
+        "xy_tolerance_cm": 60.0,
+        "z_tolerance_cm": 80.0
+      }
+    ]
+  }
+}
