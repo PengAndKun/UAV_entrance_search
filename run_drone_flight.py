@@ -59,6 +59,7 @@ DEFAULT_CALIBRATION_MARKER_SCALE = [0.1, 0.1, 0.1]
 DEFAULT_RGB_ENHANCE_ENABLED = True
 DEFAULT_RGB_ENHANCE_GAMMA = 0.72
 DEFAULT_RGB_ENHANCE_GAIN = 1.12
+DEFAULT_RGB_SOURCE_ORDER = "bgr"
 DEFAULT_FORCE_KILL_UNREAL_ON_STOP = True
 DEFAULT_ACTION_PLAN = [
     ("hover", [0.0, 0.0, 0.0, 0.0]),
@@ -592,6 +593,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Gamma used for RGB output enhancement; lower values brighten shadows")
     parser.add_argument("--rgb_enhance_gain", type=float, default=DEFAULT_RGB_ENHANCE_GAIN,
                         help="Gain used for RGB output enhancement")
+    parser.add_argument("--rgb_source_order", choices=["rgb", "bgr"], default=DEFAULT_RGB_SOURCE_ORDER,
+                        help="Color channel order returned by UnrealCV before display/save")
     parser.add_argument("--force_kill_unreal_on_stop", dest="force_kill_unreal_on_stop", action="store_true",
                         default=DEFAULT_FORCE_KILL_UNREAL_ON_STOP,
                         help="Force-kill packaged Unreal processes when stopping a session")
@@ -651,6 +654,7 @@ def prepare_observation_rgb(
     enhance: bool = DEFAULT_RGB_ENHANCE_ENABLED,
     gamma: float = DEFAULT_RGB_ENHANCE_GAMMA,
     gain: float = DEFAULT_RGB_ENHANCE_GAIN,
+    source_order: str = DEFAULT_RGB_SOURCE_ORDER,
 ) -> Optional[np.ndarray]:
     image = np.asarray(observation)
     if image.ndim == 4:
@@ -659,6 +663,8 @@ def prepare_observation_rgb(
         return None
     image = image[:, :, :3]
     image = np.clip(image, 0, 255).astype(np.uint8)
+    if str(source_order or DEFAULT_RGB_SOURCE_ORDER).strip().lower() == "bgr":
+        image = image[:, :, ::-1]
     if not enhance:
         return image
     gamma_value = max(0.2, min(2.5, float(gamma)))
@@ -673,6 +679,7 @@ def rgb_enhance_options(args: argparse.Namespace) -> Dict[str, Any]:
         "enhance": bool(getattr(args, "enhance_rgb", DEFAULT_RGB_ENHANCE_ENABLED)),
         "gamma": float(getattr(args, "rgb_enhance_gamma", DEFAULT_RGB_ENHANCE_GAMMA)),
         "gain": float(getattr(args, "rgb_enhance_gain", DEFAULT_RGB_ENHANCE_GAIN)),
+        "source_order": str(getattr(args, "rgb_source_order", DEFAULT_RGB_SOURCE_ORDER) or DEFAULT_RGB_SOURCE_ORDER),
     }
 
 
