@@ -47,6 +47,7 @@ Thumbs.db
 
 
 # Local Unreal environment binaries and saved data
+.ultralytics/
 .ultralytics_test
 test*
 

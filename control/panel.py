@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from .common import *
+from .analysis_control import AnalysisControlMixin
 from .flight_control import FlightControlMixin
 from .map_control import MapControlMixin
 from .route_control import RouteControlMixin
 
 
-class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin):
+class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin, AnalysisControlMixin):
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.session: Optional[flight.DroneFlightSession] = None
@@ -89,6 +90,15 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.stream_status_var = tk.StringVar(value="Stream Capture: idle")
         self.stream_player_status_var = tk.StringVar(value="Stream Player: idle")
         self.stream_player_image_mode_var = tk.StringVar(value="rgb")
+        self.stream_analysis_status_var = tk.StringVar(value="Analysis: idle")
+        self.stream_analysis_stream_dir_var = tk.StringVar(value="")
+        self.stream_analysis_weights_var = tk.StringVar(value="")
+        self.stream_analysis_device_var = tk.StringVar(value="0")
+        self.stream_analysis_conf_var = tk.StringVar(value="0.25")
+        self.stream_analysis_imgsz_var = tk.StringVar(value="640")
+        self.stream_analysis_stride_var = tk.StringVar(value="1")
+        self.stream_analysis_max_frames_var = tk.StringVar(value="0")
+        self.stream_analysis_progress_var = tk.DoubleVar(value=0.0)
         self.show_houses_var = tk.BooleanVar(value=True)
         self.show_trajectory_var = tk.BooleanVar(value=True)
 
@@ -117,6 +127,17 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.stream_player_playing = False
         self.stream_player_dir: Optional[Path] = None
         self.stream_player_interval_ms = int(float(getattr(args, "stream_interval_s", flight.DEFAULT_STREAM_CAPTURE_INTERVAL_S)) * 1000)
+        self.stream_analysis_window: Optional[tk.Toplevel] = None
+        self.stream_analysis_thread: Optional[threading.Thread] = None
+        self.stream_analysis_stop_event = threading.Event()
+        self.stream_analysis_rows: List[Dict[str, Any]] = []
+        self.stream_analysis_result: Dict[str, Any] = {}
+        self.stream_analysis_listbox: Optional[tk.Listbox] = None
+        self.stream_analysis_preview_label: Optional[tk.Label] = None
+        self.stream_analysis_preview_photo: Optional[ImageTk.PhotoImage] = None
+        self.stream_analysis_summary_text: Optional[tk.Text] = None
+        self.stream_analysis_json_text: Optional[tk.Text] = None
+        self.stream_analysis_progressbar: Optional[ttk.Progressbar] = None
         self.map_window: Optional[tk.Toplevel] = None
         self.map_widget: Optional[OverheadMapWidget] = None
         self.map_refresh_inflight = False
@@ -353,7 +374,8 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Label(stream, textvariable=self.stream_status_var, anchor="w").grid(row=0, column=6, columnspan=2, sticky="ew", padx=6, pady=6)
         tk.Button(stream, text="Open Player", command=self.open_stream_player_window).grid(row=1, column=0, padx=6, pady=(0, 6))
         tk.Button(stream, text="Play Latest", command=self.play_latest_stream_capture).grid(row=1, column=1, sticky="w", padx=6, pady=(0, 6))
-        tk.Label(stream, textvariable=self.stream_player_status_var, anchor="w").grid(row=1, column=2, columnspan=6, sticky="ew", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Analyze Stream", command=self.open_stream_analysis_window).grid(row=1, column=2, sticky="w", padx=6, pady=(0, 6))
+        tk.Label(stream, textvariable=self.stream_player_status_var, anchor="w").grid(row=1, column=3, columnspan=5, sticky="ew", padx=6, pady=(0, 6))
 
         map_frame = tk.LabelFrame(outer, text="Map")
         map_frame.grid(row=7, column=0, sticky="ew", padx=8, pady=4)
@@ -694,6 +716,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
     def on_close(self) -> None:
         self.stop_keyboard_control(send_hold=False)
         self.stop_stream_player()
+        self.stop_stream_analysis()
         self.stream_capture_stop_event.set()
         self.sequence_stop_event.set()
         self.route_stop_event.set()
