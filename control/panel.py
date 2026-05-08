@@ -99,6 +99,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.stream_analysis_stride_var = tk.StringVar(value="1")
         self.stream_analysis_max_frames_var = tk.StringVar(value="0")
         self.stream_analysis_progress_var = tk.DoubleVar(value=0.0)
+        self.stream_analysis_map_pose_var = tk.StringVar(value="Map pose: n/a")
         self.show_houses_var = tk.BooleanVar(value=True)
         self.show_trajectory_var = tk.BooleanVar(value=True)
 
@@ -138,6 +139,8 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.stream_analysis_summary_text: Optional[tk.Text] = None
         self.stream_analysis_json_text: Optional[tk.Text] = None
         self.stream_analysis_progressbar: Optional[ttk.Progressbar] = None
+        self.stream_analysis_map_widget: Optional[OverheadMapWidget] = None
+        self.stream_analysis_pose_cache: Dict[str, Dict[str, Any]] = {}
         self.map_window: Optional[tk.Toplevel] = None
         self.map_widget: Optional[OverheadMapWidget] = None
         self.map_refresh_inflight = False

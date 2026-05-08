@@ -42,7 +42,7 @@ class AnalysisControlMixin:
 
         self.stream_analysis_window = tk.Toplevel(self.root)
         self.stream_analysis_window.title("Stream Capture Analysis")
-        self.stream_analysis_window.geometry("1180x820")
+        self.stream_analysis_window.geometry("1320x860")
         self.stream_analysis_window.protocol("WM_DELETE_WINDOW", self.close_stream_analysis_window)
         self.stream_analysis_window.grid_columnconfigure(0, weight=1)
         self.stream_analysis_window.grid_rowconfigure(2, weight=1)
@@ -108,8 +108,36 @@ class AnalysisControlMixin:
         right.grid_rowconfigure(0, weight=1)
         right.grid_rowconfigure(1, weight=0)
         right.grid_rowconfigure(2, weight=1)
-        self.stream_analysis_preview_label = tk.Label(right, text="Run analysis or load existing results.", anchor="center")
-        self.stream_analysis_preview_label.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=(0, 8))
+
+        top_view = tk.PanedWindow(right, orient="horizontal", sashrelief="raised")
+        top_view.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=(0, 8))
+        preview_frame = tk.Frame(top_view)
+        preview_frame.grid_rowconfigure(0, weight=1)
+        preview_frame.grid_columnconfigure(0, weight=1)
+        self.stream_analysis_preview_label = tk.Label(preview_frame, text="Run analysis or load existing results.", anchor="center")
+        self.stream_analysis_preview_label.grid(row=0, column=0, sticky="nsew")
+        top_view.add(preview_frame, minsize=560)
+
+        map_frame = tk.LabelFrame(top_view, text="Map Pose")
+        map_frame.grid_columnconfigure(0, weight=1)
+        map_frame.grid_rowconfigure(1, weight=1)
+        tk.Label(map_frame, textvariable=self.stream_analysis_map_pose_var, anchor="w", justify="left").grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=6,
+            pady=(4, 2),
+        )
+        self.load_map_resources(force=not bool(getattr(self, "map_config", None)))
+        self.stream_analysis_map_widget = OverheadMapWidget(
+            map_frame,
+            world_bounds=self.map_world_bounds,
+            canvas_w=360,
+            canvas_h=260,
+        )
+        self.stream_analysis_map_widget.canvas.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        top_view.add(map_frame, minsize=380)
+
         self.stream_analysis_summary_text = tk.Text(right, height=7, wrap="word")
         self.stream_analysis_summary_text.grid(row=1, column=0, sticky="ew", padx=(8, 0), pady=(0, 8))
         json_frame = tk.Frame(right)
@@ -143,6 +171,7 @@ class AnalysisControlMixin:
         self.stream_analysis_summary_text = None
         self.stream_analysis_json_text = None
         self.stream_analysis_progressbar = None
+        self.stream_analysis_map_widget = None
 
     def select_stream_analysis_folder(self) -> None:
         initial_dir = self.stream_capture_root_path()
@@ -322,8 +351,95 @@ class AnalysisControlMixin:
 
     def show_stream_analysis_row(self, row: Dict[str, Any]) -> None:
         self.show_stream_analysis_preview(row)
+        self.update_stream_analysis_map(row)
         self.show_stream_analysis_summary(row)
         self.show_stream_analysis_json(row)
+
+    def stream_analysis_row_key(self, row: Dict[str, Any]) -> str:
+        return str(row.get("capture_dir") or row.get("frame_name") or row.get("frame_index") or "")
+
+    def stream_analysis_pose_for_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        pose = row.get("pose") if isinstance(row.get("pose"), dict) else {}
+        if pose:
+            return pose
+        key = self.stream_analysis_row_key(row)
+        if key and key in self.stream_analysis_pose_cache:
+            return self.stream_analysis_pose_cache[key]
+        capture_dir = Path(str(row.get("capture_dir") or ""))
+        pose_path = capture_dir / "pose.json"
+        parsed_pose: Dict[str, Any] = {}
+        try:
+            if pose_path.exists():
+                payload = json.loads(pose_path.read_text(encoding="utf-8"))
+                raw_pose = payload.get("pose") if isinstance(payload, dict) else {}
+                if isinstance(raw_pose, dict):
+                    parsed_pose = raw_pose
+        except Exception:
+            parsed_pose = {}
+        if key:
+            self.stream_analysis_pose_cache[key] = parsed_pose
+        return parsed_pose
+
+    def stream_analysis_selected_index(self, row: Dict[str, Any]) -> int:
+        row_key = self.stream_analysis_row_key(row)
+        for index, candidate in enumerate(self.stream_analysis_rows):
+            if candidate is row:
+                return index
+            if row_key and self.stream_analysis_row_key(candidate) == row_key:
+                return index
+        return max(0, len(self.stream_analysis_rows) - 1)
+
+    def stream_analysis_trajectory_until(self, row: Dict[str, Any]) -> List[Dict[str, float]]:
+        selected_index = self.stream_analysis_selected_index(row)
+        points: List[Dict[str, float]] = []
+        for candidate in self.stream_analysis_rows[: selected_index + 1]:
+            pose = self.stream_analysis_pose_for_row(candidate)
+            try:
+                points.append({"x": float(pose["x"]), "y": float(pose["y"])})
+            except Exception:
+                continue
+        return points
+
+    def update_stream_analysis_map(self, row: Dict[str, Any]) -> None:
+        if self.stream_analysis_map_widget is None:
+            return
+        if not self.map_config or self.map_image is None:
+            self.load_map_resources(force=True)
+        pose = self.stream_analysis_pose_for_row(row)
+        if not pose:
+            self.stream_analysis_map_pose_var.set(f"Map pose: {row.get('frame_name', '')} no pose.json")
+            return
+        try:
+            pose_x = float(pose.get("x", 0.0))
+            pose_y = float(pose.get("y", 0.0))
+            pose_z = float(pose.get("z", 0.0))
+            pose_yaw = float(pose.get("task_yaw", pose.get("yaw", 0.0)))
+        except Exception:
+            self.stream_analysis_map_pose_var.set(f"Map pose: {row.get('frame_name', '')} invalid pose")
+            return
+        trajectory = self.stream_analysis_trajectory_until(row)
+        image_xy = self.world_to_image_point(pose_x, pose_y)
+        if image_xy is None:
+            image_text = "image=(n/a)"
+        else:
+            image_text = f"image=({image_xy[0]:.1f}, {image_xy[1]:.1f})"
+        self.stream_analysis_map_pose_var.set(
+            f"{row.get('frame_name', '')} world=({pose_x:.1f}, {pose_y:.1f}, {pose_z:.1f}) "
+            f"yaw={pose_yaw:.1f} {image_text} traj={len(trajectory)}"
+        )
+        houses, boxes = self.build_map_display(pose)
+        calibration = self.map_calibration if isinstance(self.map_calibration, dict) else {}
+        anchors = calibration.get("anchors", []) if isinstance(calibration.get("anchors", []), list) else []
+        self.stream_analysis_map_widget.set_background_image(self.map_image)
+        self.stream_analysis_map_widget.set_calibration(
+            calibration.get("affine_world_to_image"),
+            self.map_image_size(),
+            anchors,
+        )
+        self.stream_analysis_map_widget.set_house_boxes(boxes)
+        self.stream_analysis_map_widget.update_houses([])
+        self.stream_analysis_map_widget.set_trajectory(trajectory)
+        self.stream_analysis_map_widget.update_uav(pose_x, pose_y, pose_yaw)
 
     def show_stream_analysis_preview(self, row: Dict[str, Any]) -> None:
         if self.stream_analysis_preview_label is None:
@@ -345,7 +461,7 @@ class AnalysisControlMixin:
             return
         try:
             image = Image.open(image_path).convert("RGB")
-            image.thumbnail((820, 520), Image.Resampling.LANCZOS)
+            image.thumbnail((700, 460), Image.Resampling.LANCZOS)
             self.stream_analysis_preview_photo = ImageTk.PhotoImage(image)
             self.stream_analysis_preview_label.configure(image=self.stream_analysis_preview_photo, text="")
         except Exception as exc:
@@ -355,8 +471,22 @@ class AnalysisControlMixin:
     def show_stream_analysis_summary(self, row: Dict[str, Any]) -> None:
         if self.stream_analysis_summary_text is None:
             return
+        pose = self.stream_analysis_pose_for_row(row)
+        if pose:
+            try:
+                pose_line = (
+                    f"Pose: x={float(pose.get('x', 0.0)):.1f} "
+                    f"y={float(pose.get('y', 0.0)):.1f} "
+                    f"z={float(pose.get('z', 0.0)):.1f} "
+                    f"yaw={float(pose.get('task_yaw', pose.get('yaw', 0.0))):.1f}"
+                )
+            except Exception:
+                pose_line = f"Pose: {pose}"
+        else:
+            pose_line = "Pose: n/a"
         lines = [
             f"Frame: {row.get('frame_name')} ({row.get('status')})",
+            pose_line,
             f"YOLO: detections={row.get('num_detections')} top={row.get('top_class')} conf={row.get('top_confidence')}",
             (
                 "Fusion: "
@@ -425,4 +555,3 @@ class AnalysisControlMixin:
                 self.show_stream_analysis_row(self.stream_analysis_rows[0])
         except Exception as exc:
             self.stream_analysis_status_var.set(f"Analysis: failed to load results: {exc}")
-

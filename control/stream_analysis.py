@@ -277,10 +277,14 @@ def summarize_phase2_result(frame: StreamFrame, run_dir: Path, result: Dict[str,
     detections = yolo.get("detections", []) if isinstance(yolo.get("detections"), list) else []
     top_detection = detections[0] if detections else {}
     panel_summary = result.get("panel_summary")
+    pose_payload = load_json(frame.pose_path, {})
+    pose = pose_payload.get("pose") if isinstance(pose_payload, dict) else {}
     row = {
         "frame_index": frame.frame_index,
         "frame_name": frame.frame_name,
         "status": result.get("status", "ok"),
+        "capture_time": pose_payload.get("capture_time", frame.trajectory_entry.get("capture_time", "")) if isinstance(pose_payload, dict) else "",
+        "pose": pose if isinstance(pose, dict) else {},
         "capture_dir": str(frame.capture_dir),
         "rgb_path": str(frame.rgb_path),
         "depth_cm_path": str(frame.depth_cm_path),
@@ -313,11 +317,15 @@ def summarize_phase2_result(frame: StreamFrame, run_dir: Path, result: Dict[str,
 
 
 def summarize_error_frame(frame: StreamFrame, run_dir: Path, exc: BaseException) -> Dict[str, Any]:
+    pose_payload = load_json(frame.pose_path, {})
+    pose = pose_payload.get("pose") if isinstance(pose_payload, dict) else {}
     return {
         "frame_index": frame.frame_index,
         "frame_name": frame.frame_name,
         "status": "error",
         "error": str(exc),
+        "capture_time": pose_payload.get("capture_time", frame.trajectory_entry.get("capture_time", "")) if isinstance(pose_payload, dict) else "",
+        "pose": pose if isinstance(pose, dict) else {},
         "capture_dir": str(frame.capture_dir),
         "rgb_path": str(frame.rgb_path),
         "depth_cm_path": str(frame.depth_cm_path),
