@@ -138,6 +138,7 @@ class OverheadMapWidget:
         self._trajectory_points: List[Tuple[float, float]] = []
         self._image_size: Optional[Tuple[int, int]] = None
         self._image_canvas_rect: Optional[Tuple[float, float, float, float]] = None
+        self._image_layer_offset_px: Tuple[float, float] = (0.0, 0.0)
         self._affine_world_to_image: Optional[np.ndarray] = None
         self._calibration_anchors: List[dict] = []
         self._house_boxes: List[dict] = []
@@ -207,6 +208,17 @@ class OverheadMapWidget:
         configured world bounds and is scaled to the canvas size.
         """
         self._background_bgr = None if image_bgr is None else image_bgr.copy()
+        self._redraw()
+
+    def set_image_layer_offset(self, dx_px: float, dy_px: float) -> None:
+        """
+        Shift only image-space layers in source-image pixels.
+
+        The background image, saved house boxes, and calibration anchors move
+        by this offset. World-space objects such as the UAV marker, trajectory,
+        route plan, and world house circles do not move.
+        """
+        self._image_layer_offset_px = (float(dx_px), float(dy_px))
         self._redraw()
 
     def set_route_target(self, world_xy: Optional[Tuple[float, float]]) -> None:
@@ -341,7 +353,7 @@ class OverheadMapWidget:
                 + float(self._affine_world_to_image[1, 1]) * float(wy)
                 + float(self._affine_world_to_image[1, 2])
             )
-            return self.image_to_canvas(image_x, image_y)
+            return self.image_to_canvas(image_x, image_y, apply_layer_offset=False)
 
         margin_x = self._canvas_w * 0.05
         margin_y = self._canvas_h * 0.05
@@ -360,8 +372,17 @@ class OverheadMapWidget:
 
         return cx, cy
 
-    def image_to_canvas(self, image_x: float, image_y: float) -> Tuple[float, float]:
+    def image_to_canvas(
+        self,
+        image_x: float,
+        image_y: float,
+        *,
+        apply_layer_offset: bool = True,
+    ) -> Tuple[float, float]:
         """Convert background-image pixel coordinates to canvas coordinates."""
+        if apply_layer_offset:
+            image_x = float(image_x) + float(self._image_layer_offset_px[0])
+            image_y = float(image_y) + float(self._image_layer_offset_px[1])
         if self._image_size is None:
             return float(image_x), float(image_y)
         if self._image_canvas_rect is not None:
@@ -379,24 +400,39 @@ class OverheadMapWidget:
             float(image_y) * self._canvas_h / float(image_h),
         )
 
-    def canvas_to_image(self, canvas_x: float, canvas_y: float) -> Tuple[float, float]:
+    def canvas_to_image(
+        self,
+        canvas_x: float,
+        canvas_y: float,
+        *,
+        apply_layer_offset: bool = True,
+    ) -> Tuple[float, float]:
         """Convert canvas coordinates to background-image pixel coordinates."""
         if self._image_size is None:
-            return float(canvas_x), float(canvas_y)
+            image_x, image_y = float(canvas_x), float(canvas_y)
+            if apply_layer_offset:
+                image_x -= float(self._image_layer_offset_px[0])
+                image_y -= float(self._image_layer_offset_px[1])
+            return image_x, image_y
         if self._image_canvas_rect is not None:
             offset_x, offset_y, draw_w, draw_h = self._image_canvas_rect
             image_w = max(1, int(self._image_size[0]))
             image_h = max(1, int(self._image_size[1]))
-            return (
+            image_x, image_y = (
                 (float(canvas_x) - offset_x) * float(image_w) / max(1.0, draw_w),
                 (float(canvas_y) - offset_y) * float(image_h) / max(1.0, draw_h),
             )
-        image_w = max(1, int(self._image_size[0]))
-        image_h = max(1, int(self._image_size[1]))
-        return (
-            float(canvas_x) * float(image_w) / self._canvas_w,
-            float(canvas_y) * float(image_h) / self._canvas_h,
-        )
+        else:
+            image_w = max(1, int(self._image_size[0]))
+            image_h = max(1, int(self._image_size[1]))
+            image_x, image_y = (
+                float(canvas_x) * float(image_w) / self._canvas_w,
+                float(canvas_y) * float(image_h) / self._canvas_h,
+            )
+        if apply_layer_offset:
+            image_x -= float(self._image_layer_offset_px[0])
+            image_y -= float(self._image_layer_offset_px[1])
+        return image_x, image_y
 
     # ------------------------------------------------------------------
     # Private drawing helpers
@@ -451,14 +487,14 @@ class OverheadMapWidget:
         if self._trajectory_points:
             self._draw_trajectory()
 
-        for anchor in self._calibration_anchors:
-            self._draw_calibration_anchor(anchor)
-
         for house_box in self._house_boxes:
             self._draw_house_box(house_box)
 
         if self._rect_preview_canvas is not None:
             self._draw_rect_preview(*self._rect_preview_canvas)
+
+        for anchor in self._calibration_anchors:
+            self._draw_calibration_anchor(anchor)
 
         # Draw UAV marker
         cx, cy = self.world_to_canvas(self._uav_x, self._uav_y)
@@ -484,7 +520,15 @@ class OverheadMapWidget:
         )
         preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
         self._background_photo = ImageTk.PhotoImage(Image.fromarray(preview_rgb))
-        self.canvas.create_image(offset_x, offset_y, image=self._background_photo, anchor="nw", tags="background")
+        layer_offset_x = float(self._image_layer_offset_px[0]) * float(draw_w) / float(max(1, image_w))
+        layer_offset_y = float(self._image_layer_offset_px[1]) * float(draw_h) / float(max(1, image_h))
+        self.canvas.create_image(
+            offset_x + layer_offset_x,
+            offset_y + layer_offset_y,
+            image=self._background_photo,
+            anchor="nw",
+            tags="background",
+        )
         self.canvas.tag_lower("background", "grid")
 
     def _draw_house(self, house: dict) -> None:
@@ -698,31 +742,43 @@ class OverheadMapWidget:
             fill = "#ffd166"
             outline = "#ff5c5c"
             text_fill = "#ffe08a"
-            r = 8
+            r = 9
             self.canvas.create_oval(
                 cx - r - 5, cy - r - 5, cx + r + 5, cy + r + 5,
-                outline="#ff5c5c", width=2, dash=(4, 3), tags="dynamic",
+                outline="#ff5c5c", width=3, dash=(4, 3), tags="dynamic",
             )
         elif status == "done":
             fill = "#22c55e"
             outline = "#ffffff"
             text_fill = "#86efac"
-            r = 6
+            r = 8
         else:
             fill = "#00d5ff"
             outline = "#ffffff"
             text_fill = "#00f0ff"
-            r = 5
+            r = 7
+        self.canvas.create_oval(
+            cx - r - 3, cy - r - 3, cx + r + 3, cy + r + 3,
+            fill="#101018", outline="#101018", width=1, tags="dynamic",
+        )
         self.canvas.create_oval(
             cx - r, cy - r, cx + r, cy + r,
-            fill=fill, outline=outline, width=2 if status == "active" else 1, tags="dynamic",
+            fill=fill, outline=outline, width=2, tags="dynamic",
         )
         if label:
+            self.canvas.create_text(
+                cx + 9, cy - 1,
+                text=label,
+                fill="#101018",
+                font=("Consolas", 9, "bold"),
+                anchor="w",
+                tags="dynamic",
+            )
             self.canvas.create_text(
                 cx + 8, cy - 2,
                 text=label,
                 fill=text_fill,
-                font=("Consolas", 8, "bold"),
+                font=("Consolas", 9, "bold"),
                 anchor="w",
                 tags="dynamic",
             )

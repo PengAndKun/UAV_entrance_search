@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-DEFAULT_MAP_CONFIG_PATH = "assets/overhead_map/houses_config.json"
+DEFAULT_BASE_MAP_CONFIG_PATH = "assets/overhead_map/houses_config.json"
+DEFAULT_MANUAL_SHIFT_MAP_CONFIG_NAME = "manual_shift_houses_config.json"
+DEFAULT_MAP_CONFIG_PATH = f"assets/overhead_map/{DEFAULT_MANUAL_SHIFT_MAP_CONFIG_NAME}"
 DEFAULT_MAP_BOUNDS = (1000.0, -500.0, 5000.0, 3000.0)
 DEFAULT_CORRECTED_MAP_CONFIG_NAME = "corrected_houses_config.json"
 LLM_API_STYLE_OPTIONS = ("openai_chat", "openai_responses", "anthropic_sdk")

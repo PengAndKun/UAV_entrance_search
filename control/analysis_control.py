@@ -136,6 +136,28 @@ class AnalysisControlMixin:
             canvas_h=260,
         )
         self.stream_analysis_map_widget.canvas.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        controls = tk.Frame(map_frame)
+        controls.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 4))
+        for col in range(6):
+            controls.grid_columnconfigure(col, weight=0)
+        controls.grid_columnconfigure(5, weight=1)
+        tk.Checkbutton(
+            controls,
+            text="Live Pose",
+            variable=self.stream_analysis_live_pose_var,
+            command=self.on_toggle_stream_analysis_live_pose,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 6), pady=2)
+        tk.Label(controls, text="Step px").grid(row=0, column=1, sticky="e", padx=(0, 2), pady=2)
+        tk.Entry(controls, textvariable=self.stream_analysis_map_shift_step_var, width=6).grid(row=0, column=2, sticky="w", padx=(0, 6), pady=2)
+        tk.Button(controls, text="Reset Shift", command=self.reset_stream_analysis_map_shift).grid(row=0, column=3, padx=3, pady=2)
+        tk.Button(controls, text="Save Shifted Config", command=self.save_stream_analysis_shifted_config).grid(row=0, column=4, padx=3, pady=2)
+
+        arrows = tk.Frame(map_frame)
+        arrows.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 6))
+        tk.Button(arrows, text="Map Left", command=lambda: self.shift_stream_analysis_map(-1.0, 0.0)).pack(side="left", padx=3)
+        tk.Button(arrows, text="Map Right", command=lambda: self.shift_stream_analysis_map(1.0, 0.0)).pack(side="left", padx=3)
+        tk.Button(arrows, text="Map Up", command=lambda: self.shift_stream_analysis_map(0.0, -1.0)).pack(side="left", padx=3)
+        tk.Button(arrows, text="Map Down", command=lambda: self.shift_stream_analysis_map(0.0, 1.0)).pack(side="left", padx=3)
         top_view.add(map_frame, minsize=380)
 
         self.stream_analysis_summary_text = tk.Text(right, height=7, wrap="word")
@@ -172,6 +194,12 @@ class AnalysisControlMixin:
         self.stream_analysis_json_text = None
         self.stream_analysis_progressbar = None
         self.stream_analysis_map_widget = None
+        if self.stream_analysis_live_after_id is not None:
+            try:
+                self.root.after_cancel(self.stream_analysis_live_after_id)
+            except Exception:
+                pass
+        self.stream_analysis_live_after_id = None
 
     def select_stream_analysis_folder(self) -> None:
         initial_dir = self.stream_capture_root_path()
@@ -350,10 +378,121 @@ class AnalysisControlMixin:
             self.show_stream_analysis_row(self.stream_analysis_rows[index])
 
     def show_stream_analysis_row(self, row: Dict[str, Any]) -> None:
+        self.stream_analysis_current_row = row
         self.show_stream_analysis_preview(row)
-        self.update_stream_analysis_map(row)
+        if self.stream_analysis_live_pose_var.get():
+            self.update_stream_analysis_live_map()
+        else:
+            self.update_stream_analysis_map(row)
         self.show_stream_analysis_summary(row)
         self.show_stream_analysis_json(row)
+
+    def parse_stream_analysis_shift_step(self) -> float:
+        try:
+            step = float(self.stream_analysis_map_shift_step_var.get().strip() or "5")
+        except Exception:
+            step = 5.0
+        step = max(0.1, min(1000.0, step))
+        self.stream_analysis_map_shift_step_var.set(f"{step:g}")
+        return step
+
+    def shift_stream_analysis_map(self, direction_x: float, direction_y: float) -> None:
+        step = self.parse_stream_analysis_shift_step()
+        dx, dy = self.map_display_offset_px
+        self.map_display_offset_px = (float(dx) + float(direction_x) * step, float(dy) + float(direction_y) * step)
+        self.refresh_stream_analysis_map_after_shift()
+
+    def reset_stream_analysis_map_shift(self) -> None:
+        self.map_display_offset_px = (0.0, 0.0)
+        self.refresh_stream_analysis_map_after_shift()
+
+    def refresh_stream_analysis_map_after_shift(self) -> None:
+        if self.stream_analysis_live_pose_var.get():
+            self.update_stream_analysis_live_map()
+        elif isinstance(self.stream_analysis_current_row, dict):
+            self.update_stream_analysis_map(self.stream_analysis_current_row)
+        else:
+            self.stream_analysis_map_pose_var.set(
+                f"Map pose: shift=({self.map_display_offset_px[0]:.1f}, {self.map_display_offset_px[1]:.1f})"
+            )
+        if self.map_widget is not None and self.map_window is not None and self.map_window.winfo_exists():
+            self.refresh_map_once()
+
+    def on_toggle_stream_analysis_live_pose(self) -> None:
+        if self.stream_analysis_live_pose_var.get():
+            self.schedule_stream_analysis_live_pose(immediate=True)
+        else:
+            if self.stream_analysis_live_after_id is not None:
+                try:
+                    self.root.after_cancel(self.stream_analysis_live_after_id)
+                except Exception:
+                    pass
+                self.stream_analysis_live_after_id = None
+            if isinstance(self.stream_analysis_current_row, dict):
+                self.show_stream_analysis_row(self.stream_analysis_current_row)
+
+    def schedule_stream_analysis_live_pose(self, *, immediate: bool = False) -> None:
+        if self.stream_analysis_live_after_id is not None:
+            try:
+                self.root.after_cancel(self.stream_analysis_live_after_id)
+            except Exception:
+                pass
+            self.stream_analysis_live_after_id = None
+        if not self.stream_analysis_live_pose_var.get():
+            return
+        delay_ms = 1 if immediate else max(100, int(getattr(self.args, "map_interval_ms", 1000)))
+        self.stream_analysis_live_after_id = self.root.after(delay_ms, self.update_stream_analysis_live_map)
+
+    def update_stream_analysis_live_map(self) -> None:
+        self.stream_analysis_live_after_id = None
+        if self.stream_analysis_map_widget is None or not self.stream_analysis_live_pose_var.get():
+            return
+        pose = self.latest_state.get("pose", {}) if isinstance(self.latest_state.get("pose"), dict) else {}
+        if not pose:
+            self.stream_analysis_map_pose_var.set(
+                f"Live pose: waiting for session state shift=({self.map_display_offset_px[0]:.1f}, {self.map_display_offset_px[1]:.1f})"
+            )
+            self.schedule_stream_analysis_live_pose()
+            return
+        live_row = {
+            "frame_name": "live",
+            "status": "live",
+            "pose": pose,
+            "capture_time": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.update_stream_analysis_map(live_row, live=True)
+        self.schedule_stream_analysis_live_pose()
+
+    def save_stream_analysis_shifted_config(self) -> None:
+        if not self.map_config:
+            self.load_map_resources(force=True)
+        if not self.map_config:
+            self.stream_analysis_status_var.set("Analysis: map config is not loaded")
+            return
+        try:
+            shifted = json.loads(json.dumps(self.map_config))
+            overhead = shifted.setdefault("overhead_map", {})
+            overhead["display_offset_px"] = {
+                "x": float(self.map_display_offset_px[0]),
+                "y": float(self.map_display_offset_px[1]),
+            }
+            base_dir = PROJECT_ROOT / "assets" / "overhead_map"
+            base_dir.mkdir(parents=True, exist_ok=True)
+            output_path = (base_dir / DEFAULT_MANUAL_SHIFT_MAP_CONFIG_NAME).resolve()
+            with open(output_path, "w", encoding="utf-8") as fh:
+                json.dump(shifted, fh, indent=2, ensure_ascii=False)
+            self.args.map_config = str(output_path)
+            self.map_config = {}
+            self.map_config_path = None
+            self.map_image_path = None
+            self.map_image = None
+            self.load_map_resources(force=True)
+            self.stream_analysis_status_var.set(f"Analysis: saved shifted map config -> {output_path}")
+            self.status_var.set(f"Saved shifted map config: {output_path.name}")
+            self.refresh_stream_analysis_map_after_shift()
+            self.refresh_map_once(force_reload=True)
+        except Exception as exc:
+            self.stream_analysis_status_var.set(f"Analysis: save shifted config failed: {exc}")
 
     def stream_analysis_row_key(self, row: Dict[str, Any]) -> str:
         return str(row.get("capture_dir") or row.get("frame_name") or row.get("frame_index") or "")
@@ -381,6 +520,8 @@ class AnalysisControlMixin:
         return parsed_pose
 
     def stream_analysis_selected_index(self, row: Dict[str, Any]) -> int:
+        if str(row.get("status", "")).lower() == "live":
+            return len(self.stream_analysis_rows) - 1
         row_key = self.stream_analysis_row_key(row)
         for index, candidate in enumerate(self.stream_analysis_rows):
             if candidate is row:
@@ -389,7 +530,19 @@ class AnalysisControlMixin:
                 return index
         return max(0, len(self.stream_analysis_rows) - 1)
 
-    def stream_analysis_trajectory_until(self, row: Dict[str, Any]) -> List[Dict[str, float]]:
+    def stream_analysis_trajectory_until(self, row: Dict[str, Any], *, live: bool = False) -> List[Dict[str, float]]:
+        if live:
+            session = self.session
+            if session is not None and session.started:
+                try:
+                    return session.get_trajectory_points(limit=max(1, int(getattr(self.args, "map_trajectory_limit", 500))))
+                except Exception:
+                    pass
+            pose = self.latest_state.get("pose", {}) if isinstance(self.latest_state.get("pose"), dict) else {}
+            try:
+                return [{"x": float(pose["x"]), "y": float(pose["y"])}]
+            except Exception:
+                return []
         selected_index = self.stream_analysis_selected_index(row)
         points: List[Dict[str, float]] = []
         for candidate in self.stream_analysis_rows[: selected_index + 1]:
@@ -400,7 +553,7 @@ class AnalysisControlMixin:
                 continue
         return points
 
-    def update_stream_analysis_map(self, row: Dict[str, Any]) -> None:
+    def update_stream_analysis_map(self, row: Dict[str, Any], *, live: bool = False) -> None:
         if self.stream_analysis_map_widget is None:
             return
         if not self.map_config or self.map_image is None:
@@ -417,7 +570,7 @@ class AnalysisControlMixin:
         except Exception:
             self.stream_analysis_map_pose_var.set(f"Map pose: {row.get('frame_name', '')} invalid pose")
             return
-        trajectory = self.stream_analysis_trajectory_until(row)
+        trajectory = self.stream_analysis_trajectory_until(row, live=live)
         image_xy = self.world_to_image_point(pose_x, pose_y)
         if image_xy is None:
             image_text = "image=(n/a)"
@@ -425,17 +578,22 @@ class AnalysisControlMixin:
             image_text = f"image=({image_xy[0]:.1f}, {image_xy[1]:.1f})"
         self.stream_analysis_map_pose_var.set(
             f"{row.get('frame_name', '')} world=({pose_x:.1f}, {pose_y:.1f}, {pose_z:.1f}) "
-            f"yaw={pose_yaw:.1f} {image_text} traj={len(trajectory)}"
+            f"yaw={pose_yaw:.1f} {image_text} "
+            f"shift=({self.map_display_offset_px[0]:.1f}, {self.map_display_offset_px[1]:.1f}) "
+            f"traj={len(trajectory)}"
         )
         houses, boxes = self.build_map_display(pose)
         calibration = self.map_calibration if isinstance(self.map_calibration, dict) else {}
         anchors = calibration.get("anchors", []) if isinstance(calibration.get("anchors", []), list) else []
+        if not self.show_calibration_points_var.get():
+            anchors = []
         self.stream_analysis_map_widget.set_background_image(self.map_image)
         self.stream_analysis_map_widget.set_calibration(
             calibration.get("affine_world_to_image"),
             self.map_image_size(),
             anchors,
         )
+        self.stream_analysis_map_widget.set_image_layer_offset(*self.map_display_offset_px)
         self.stream_analysis_map_widget.set_house_boxes(boxes)
         self.stream_analysis_map_widget.update_houses([])
         self.stream_analysis_map_widget.set_trajectory(trajectory)

@@ -51,6 +51,10 @@ class MapControlMixin:
 
     def load_map_resources(self, *, force: bool = False) -> bool:
         config_path = self.resolve_project_path(str(self.args.map_config or DEFAULT_MAP_CONFIG_PATH))
+        if not config_path.exists() and config_path.name == DEFAULT_MANUAL_SHIFT_MAP_CONFIG_NAME:
+            fallback_path = self.resolve_project_path(DEFAULT_BASE_MAP_CONFIG_PATH)
+            if fallback_path.exists():
+                config_path = fallback_path
         if not force and self.map_config and self.map_config_path == config_path and self.map_image is not None:
             return True
         try:
@@ -68,6 +72,14 @@ class MapControlMixin:
             float(world_bounds.get("max_y", DEFAULT_MAP_BOUNDS[3])),
         )
         overhead = config.get("overhead_map", {}) if isinstance(config.get("overhead_map"), dict) else {}
+        display_offset = overhead.get("display_offset_px", {}) if isinstance(overhead.get("display_offset_px"), dict) else {}
+        try:
+            self.map_display_offset_px = (
+                float(display_offset.get("x", 0.0)),
+                float(display_offset.get("y", 0.0)),
+            )
+        except Exception:
+            self.map_display_offset_px = (0.0, 0.0)
         image_value = str(self.args.map_image or "").strip() or str(overhead.get("image_path", "") or "qq.png")
         image_path = self.resolve_project_path(image_value, base_dir=config_path.parent)
         image = cv2.imread(str(image_path))
@@ -572,9 +584,10 @@ class MapControlMixin:
             calibration = self.map_calibration
             affine = calibration.get("affine_world_to_image")
             anchors = calibration.get("anchors", []) if isinstance(calibration.get("anchors", []), list) else []
-            anchors = self.anchors_with_touch_status(anchors)
+            anchors = self.anchors_with_touch_status(anchors) if self.show_calibration_points_var.get() else []
             self.map_widget.set_background_image(self.map_image)
             self.map_widget.set_calibration(affine, self.map_image_size(), anchors)
+            self.map_widget.set_image_layer_offset(*self.map_display_offset_px)
             self.map_widget.set_house_boxes(boxes if self.show_houses_var.get() else [])
             self.map_widget.update_houses([])
             self.map_widget.update_uav(pose_x, pose_y, pose_yaw)

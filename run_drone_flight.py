@@ -965,6 +965,20 @@ def pose_values_to_dict(pose_values: List[float]) -> Dict[str, Any]:
     }
 
 
+def make_json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [make_json_safe(item) for item in value]
+    return str(value)
+
+
 def read_drone_observation(env: Any, drone_name: str) -> Optional[np.ndarray]:
     cam_id = env.unwrapped.agents.get(drone_name, {}).get("cam_id")
     if cam_id is None or cam_id < 0:
@@ -1412,6 +1426,8 @@ class DroneFlightSession:
         self.map_touch_calibration: Dict[str, Any] = {}
         self.api_lock = threading.RLock()
         self.last_action = "idle"
+        self.last_move_command: Dict[str, Any] = {}
+        self.last_command_detail: Dict[str, Any] = {}
         self.last_observation: Any = None
 
     @property
@@ -1575,17 +1591,57 @@ class DroneFlightSession:
             list(self.commanded_pose) if self.commanded_pose is not None else []
         )
         self.total_step += 1
-        self.log.append({
+        safe_action = make_json_safe(action)
+        error = pose_error_summary(pose, commanded)
+        entry = {
             "step": self.total_step,
             "phase": phase,
-            "action": action,
+            "action": safe_action,
             "commanded_pose": commanded,
             "actual_pose": pose,
             "pose": pose,
-            "pose_error": pose_error_summary(pose, commanded),
+            "pose_error": error,
             "reward": None,
             "done": False,
+        }
+        self.last_move_command = safe_action if isinstance(safe_action, dict) else {"value": safe_action}
+        self.last_command_detail = make_json_safe({
+            "step": self.total_step,
+            "phase": phase,
+            "action": safe_action,
+            "commanded_pose": commanded,
+            "actual_pose": pose,
+            "pose_error": error,
+            "recorded_at": datetime.now().isoformat(timespec="milliseconds"),
         })
+        self.log.append(entry)
+
+    def build_action_detail_snapshot(
+        self,
+        actual_pose_values: Optional[List[float]] = None,
+        *,
+        controller_action: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        actual_pose = list(actual_pose_values) if actual_pose_values is not None else (
+            list(self.last_actual_pose) if self.last_actual_pose is not None else []
+        )
+        commanded_pose = list(self.commanded_pose) if self.commanded_pose is not None else []
+        detail: Dict[str, Any] = {
+            "schema_version": 1,
+            "source": "controller" if controller_action else "session",
+            "last_action": self.last_action,
+            "movement_mode": self.movement_mode,
+            "movement_enabled": bool(self.movement_enabled),
+            "step_count": int(self.total_step),
+            "last_move_command": self.last_move_command,
+            "last_recorded_command": self.last_command_detail,
+            "commanded_pose": pose_values_to_dict(commanded_pose) if commanded_pose else {},
+            "actual_pose": pose_values_to_dict(actual_pose) if actual_pose else {},
+            "pose_error": pose_error_summary(actual_pose, commanded_pose),
+        }
+        if controller_action:
+            detail["controller"] = make_json_safe(controller_action)
+        return make_json_safe(detail)
 
     def get_trajectory_points(self, limit: int = 500) -> List[Dict[str, float]]:
         points: List[Dict[str, float]] = []
@@ -1953,12 +2009,14 @@ class DroneFlightSession:
         *,
         extra_result: Optional[Dict[str, Any]] = None,
         extra_pose: Optional[Dict[str, Any]] = None,
+        controller_action: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         capture_dir.mkdir(parents=True, exist_ok=True)
         rgb = read_drone_observation(env, drone_name)
         depth = read_drone_depth(env, drone_name)
         pose_values = [float(value) for value in read_drone_pose(env, drone_name)]
         pose = pose_values_to_dict(pose_values)
+        action_detail = self.build_action_detail_snapshot(pose_values, controller_action=controller_action)
         if rgb is None:
             raise RuntimeError("RGB observation is unavailable for current drone camera")
         if depth is None:
@@ -1969,6 +2027,7 @@ class DroneFlightSession:
         depth_preview_path = capture_dir / "depth_preview.png"
         depth_npy_path = capture_dir / "depth.npy"
         pose_json_path = capture_dir / "pose.json"
+        action_json_path = capture_dir / "action.json"
         capture_json_path = capture_dir / "capture.json"
 
         save_color_observation_for_args(self.args, rgb, rgb_path)
@@ -1992,10 +2051,15 @@ class DroneFlightSession:
             "movement_enabled": bool(self.movement_enabled),
             "last_action": self.last_action,
             "step_count": int(self.total_step),
+            "commanded_pose": action_detail.get("commanded_pose", {}),
+            "actual_pose": action_detail.get("actual_pose", {}),
+            "pose_error": action_detail.get("pose_error", {}),
+            "action_detail": action_detail,
         }
         if extra_pose:
             pose_payload.update(extra_pose)
         pose_json_path.write_text(json.dumps(pose_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        action_json_path.write_text(json.dumps(action_detail, indent=2, ensure_ascii=False), encoding="utf-8")
 
         result = {
             "status": "ok",
@@ -2008,12 +2072,17 @@ class DroneFlightSession:
             "depth_preview_path": str(depth_preview_path),
             "depth_npy_path": str(depth_npy_path),
             "pose_json_path": str(pose_json_path),
+            "action_json_path": str(action_json_path),
             "capture_json_path": str(capture_json_path),
             "rgb_source_order": str(getattr(self.args, "rgb_source_order", DEFAULT_RGB_SOURCE_ORDER) or DEFAULT_RGB_SOURCE_ORDER),
             "enhance_rgb": bool(getattr(self.args, "enhance_rgb", DEFAULT_RGB_ENHANCE_ENABLED)),
             "depth_min_cm": float(getattr(self.args, "depth_min_cm", DEFAULT_DEPTH_MIN_CM)),
             "depth_max_cm": float(getattr(self.args, "depth_max_cm", DEFAULT_DEPTH_MAX_CM)),
             "pose": pose,
+            "commanded_pose": action_detail.get("commanded_pose", {}),
+            "actual_pose": action_detail.get("actual_pose", {}),
+            "pose_error": action_detail.get("pose_error", {}),
+            "action_detail": action_detail,
             "depth_summary": depth_summary,
         }
         if extra_result:
@@ -2039,7 +2108,12 @@ class DroneFlightSession:
         )
 
     @serialized_unrealcv_method
-    def capture_stream_frame(self, stream_dir: Any, frame_index: int) -> Dict[str, Any]:
+    def capture_stream_frame(
+        self,
+        stream_dir: Any,
+        frame_index: int,
+        action_detail: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         env, drone_name = self.require_started()
         stream_path = resolve_project_output_path(stream_dir, DEFAULT_STREAM_CAPTURE_DIR)
         frames_dir = stream_path / "frames"
@@ -2058,6 +2132,7 @@ class DroneFlightSession:
                 "frames_dir": str(frames_dir),
                 "message": f"Stream frame {frame_number} saved: {capture_dir}",
             },
+            controller_action=action_detail,
         )
 
     @serialized_unrealcv_method

@@ -142,6 +142,41 @@ class FlightControlMixin:
             "action_name": "keys_" + "_".join(labels) if labels else "hold",
         }
 
+    def ordered_keyboard_symbols(self) -> List[str]:
+        ordered = [symbol for symbol in KEYBOARD_SYMBOL_ORDER if symbol in self.keyboard_pressed_symbols]
+        extra = sorted(symbol for symbol in self.keyboard_pressed_symbols if symbol not in KEYBOARD_SYMBOL_ORDER)
+        return ordered + extra
+
+    def build_stream_action_detail(self) -> Dict[str, Any]:
+        pressed = self.ordered_keyboard_symbols()
+        if pressed:
+            source = "keyboard"
+            combined_payload = self.combined_move_payload_for_symbols(set(pressed))
+        elif self.sequence_thread is not None and self.sequence_thread.is_alive():
+            source = "sequence"
+            combined_payload = {}
+        elif self.route_thread is not None and self.route_thread.is_alive():
+            source = "route"
+            combined_payload = {}
+        else:
+            source = "session"
+            combined_payload = {}
+        return {
+            "source": source,
+            "pressed_keys": pressed,
+            "combined_move_payload": combined_payload,
+            "keyboard_enabled": bool(self.keyboard_enabled_var.get()),
+            "keyboard_interval_ms": self.keyboard_interval_ms(),
+            "movement_mode": self.movement_mode_state,
+            "movement_enabled": bool(self.movement_enabled_state),
+            "move_request_inflight": bool(self.move_request_inflight),
+            "keyboard_request_inflight": bool(self.keyboard_request_inflight),
+            "sequence_running": bool(self.sequence_thread is not None and self.sequence_thread.is_alive()),
+            "route_running": bool(self.route_thread is not None and self.route_thread.is_alive()),
+            "latest_state_action": str(self.latest_state.get("last_action", "")),
+            "latest_state_step": int(self.latest_state.get("step_count", 0) or 0),
+        }
+
     def keyboard_interval_ms(self) -> int:
         try:
             value = int(float(self.keyboard_interval_ms_var.get().strip()))
@@ -468,19 +503,33 @@ class FlightControlMixin:
                     frame_started = time.monotonic()
                     result = self.safe(
                         "Stream Capture",
-                        lambda idx=frame_index: session.capture_stream_frame(stream_dir, idx),
+                        lambda idx=frame_index, action=self.build_stream_action_detail(): session.capture_stream_frame(
+                            stream_dir,
+                            idx,
+                            action_detail=action,
+                        ),
                     )
                     if not isinstance(result, dict):
                         break
+                    action_detail = result.get("action_detail", {}) if isinstance(result.get("action_detail"), dict) else {}
                     entry = {
                         "frame_index": int(result.get("frame_index", frame_index)),
                         "capture_time": result.get("capture_time", ""),
                         "pose": result.get("pose", {}),
+                        "commanded_pose": result.get("commanded_pose", {}),
+                        "actual_pose": result.get("actual_pose", {}),
+                        "pose_error": result.get("pose_error", {}),
+                        "action_detail": action_detail,
+                        "last_action": action_detail.get("last_action", result.get("last_action", "")),
+                        "movement_mode": action_detail.get("movement_mode", result.get("movement_mode", "")),
+                        "movement_enabled": bool(action_detail.get("movement_enabled", False)),
                         "capture_dir": result.get("capture_dir", ""),
                         "rgb_path": result.get("rgb_path", ""),
                         "depth_cm_path": result.get("depth_cm_path", ""),
                         "depth_preview_path": result.get("depth_preview_path", ""),
                         "depth_npy_path": result.get("depth_npy_path", ""),
+                        "pose_json_path": result.get("pose_json_path", ""),
+                        "action_json_path": result.get("action_json_path", ""),
                     }
                     self.stream_capture_trajectory.append(entry)
                     self.write_stream_capture_summary(

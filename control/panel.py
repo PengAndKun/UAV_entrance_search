@@ -100,8 +100,11 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.stream_analysis_max_frames_var = tk.StringVar(value="0")
         self.stream_analysis_progress_var = tk.DoubleVar(value=0.0)
         self.stream_analysis_map_pose_var = tk.StringVar(value="Map pose: n/a")
+        self.stream_analysis_map_shift_step_var = tk.StringVar(value="5")
+        self.stream_analysis_live_pose_var = tk.BooleanVar(value=False)
         self.show_houses_var = tk.BooleanVar(value=True)
         self.show_trajectory_var = tk.BooleanVar(value=True)
+        self.show_calibration_points_var = tk.BooleanVar(value=False)
 
         self.orbit_center_x_var = tk.StringVar(value=str(args.orbit_center[0]))
         self.orbit_center_y_var = tk.StringVar(value=str(args.orbit_center[1]))
@@ -141,6 +144,8 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.stream_analysis_progressbar: Optional[ttk.Progressbar] = None
         self.stream_analysis_map_widget: Optional[OverheadMapWidget] = None
         self.stream_analysis_pose_cache: Dict[str, Dict[str, Any]] = {}
+        self.stream_analysis_live_after_id: Optional[str] = None
+        self.stream_analysis_current_row: Optional[Dict[str, Any]] = None
         self.map_window: Optional[tk.Toplevel] = None
         self.map_widget: Optional[OverheadMapWidget] = None
         self.map_refresh_inflight = False
@@ -149,6 +154,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.map_image_path: Optional[Path] = None
         self.map_image: Optional[np.ndarray] = None
         self.map_calibration: Dict[str, Any] = {}
+        self.map_display_offset_px: Tuple[float, float] = (0.0, 0.0)
         self.map_world_bounds: Tuple[float, float, float, float] = DEFAULT_MAP_BOUNDS
         self.map_touch_state: Dict[str, Any] = {}
         self.map_touch_poll_inflight = False
@@ -382,13 +388,14 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
 
         map_frame = tk.LabelFrame(outer, text="Map")
         map_frame.grid(row=7, column=0, sticky="ew", padx=8, pady=4)
-        map_frame.grid_columnconfigure(10, weight=1)
+        map_frame.grid_columnconfigure(11, weight=1)
         tk.Button(map_frame, text="Open Map", command=self.toggle_map_window).grid(row=0, column=0, padx=6, pady=6)
         tk.Button(map_frame, text="Refresh Map", command=lambda: self.refresh_map_once(force_reload=True)).grid(row=0, column=1, padx=6, pady=6)
         tk.Checkbutton(map_frame, text="Show Houses", variable=self.show_houses_var, command=self.refresh_map_once).grid(row=0, column=2, padx=6, pady=6)
         tk.Checkbutton(map_frame, text="Show Trajectory", variable=self.show_trajectory_var, command=self.refresh_map_once).grid(row=0, column=3, padx=6, pady=6)
-        tk.Label(map_frame, textvariable=self.map_status_var, anchor="w").grid(row=0, column=4, columnspan=7, sticky="ew", padx=6, pady=6)
-        tk.Label(map_frame, textvariable=self.map_pose_var, anchor="w").grid(row=1, column=0, columnspan=11, sticky="ew", padx=6, pady=(0, 4))
+        tk.Checkbutton(map_frame, text="Show P Points", variable=self.show_calibration_points_var, command=self.refresh_map_once).grid(row=0, column=4, padx=6, pady=6)
+        tk.Label(map_frame, textvariable=self.map_status_var, anchor="w").grid(row=0, column=5, columnspan=7, sticky="ew", padx=6, pady=6)
+        tk.Label(map_frame, textvariable=self.map_pose_var, anchor="w").grid(row=1, column=0, columnspan=12, sticky="ew", padx=6, pady=(0, 4))
         tk.Button(map_frame, text="Start P Calibration", command=self.on_start_map_touch_calibration).grid(row=2, column=0, padx=6, pady=6)
         tk.Button(map_frame, text="Stop/Clear", command=self.on_stop_map_touch_calibration).grid(row=2, column=1, padx=6, pady=6)
         tk.Button(map_frame, text="Reset Marker", command=self.on_reset_map_touch_markers).grid(row=2, column=2, padx=6, pady=6)
