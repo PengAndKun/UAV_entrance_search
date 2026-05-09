@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .common import *
+from . import lidar_yolo_analysis
 
 import concurrent.futures
 
@@ -65,6 +66,26 @@ class LidarAnalysisControlMixin:
             self.lidar_analysis_export_thread = None
         if not hasattr(self, "lidar_analysis_open3d_thread"):
             self.lidar_analysis_open3d_thread = None
+        if not hasattr(self, "lidar_yolo_analysis_thread"):
+            self.lidar_yolo_analysis_thread = None
+        if not hasattr(self, "lidar_yolo_stop_event"):
+            self.lidar_yolo_stop_event = threading.Event()
+        if not hasattr(self, "lidar_yolo_weights_var"):
+            self.lidar_yolo_weights_var = tk.StringVar(value=str(lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_WEIGHTS_PATH))
+        if not hasattr(self, "lidar_yolo_device_var"):
+            self.lidar_yolo_device_var = tk.StringVar(value=lidar_yolo_analysis.default_lidar_yolo_device())
+        if not hasattr(self, "lidar_yolo_conf_var"):
+            self.lidar_yolo_conf_var = tk.StringVar(value=f"{lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_CONF:g}")
+        if not hasattr(self, "lidar_yolo_imgsz_var"):
+            self.lidar_yolo_imgsz_var = tk.StringVar(value=str(lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_IMGSZ))
+        if not hasattr(self, "lidar_yolo_stride_var"):
+            self.lidar_yolo_stride_var = tk.StringVar(value="1")
+        if not hasattr(self, "lidar_yolo_max_frames_var"):
+            self.lidar_yolo_max_frames_var = tk.StringVar(value="0")
+        if not hasattr(self, "lidar_yolo_dedupe_radius_var"):
+            self.lidar_yolo_dedupe_radius_var = tk.StringVar(value=f"{lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_DEDUPE_RADIUS_M:g}")
+        if not hasattr(self, "lidar_yolo_max_points_var"):
+            self.lidar_yolo_max_points_var = tk.StringVar(value=str(lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_MAX_POINTS_PER_DETECTION))
 
     def open_lidar_analysis_window(self) -> None:
         self.ensure_lidar_analysis_state()
@@ -95,7 +116,7 @@ class LidarAnalysisControlMixin:
 
         controls = tk.Frame(self.lidar_analysis_window)
         controls.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
-        controls.grid_columnconfigure(18, weight=1)
+        controls.grid_columnconfigure(19, weight=1)
         tk.Label(controls, text="Mode").grid(row=0, column=0, padx=(0, 3), pady=3)
         mode_combo = ttk.Combobox(
             controls,
@@ -133,12 +154,13 @@ class LidarAnalysisControlMixin:
         tk.Button(controls, text="Reset View", command=self.reset_lidar_analysis_view).grid(row=0, column=10, padx=4, pady=3)
         tk.Button(controls, text="Export RViz", command=self.export_lidar_analysis_rviz).grid(row=0, column=11, padx=4, pady=3)
         tk.Button(controls, text="Export Open3D", command=self.export_lidar_analysis_open3d).grid(row=0, column=12, padx=4, pady=3)
-        tk.Button(controls, text="Open3D Viewer", command=self.open_lidar_analysis_open3d_viewer).grid(row=0, column=13, padx=4, pady=3)
-        tk.Button(controls, text="Rebuild", command=self.rebuild_lidar_analysis_window).grid(row=0, column=14, padx=4, pady=3)
-        tk.Button(controls, text="Prev", command=self.show_lidar_analysis_prev).grid(row=0, column=15, padx=4, pady=3)
-        tk.Button(controls, text="Play/Pause", command=self.toggle_lidar_analysis_playback).grid(row=0, column=16, padx=4, pady=3)
-        tk.Button(controls, text="Stop", command=self.stop_lidar_analysis_playback).grid(row=0, column=17, padx=4, pady=3)
-        tk.Button(controls, text="Next", command=self.show_lidar_analysis_next).grid(row=0, column=18, padx=4, pady=3)
+        tk.Button(controls, text="YOLO Labels", command=self.open_lidar_yolo_labels_dialog).grid(row=0, column=13, padx=4, pady=3)
+        tk.Button(controls, text="Open3D Viewer", command=self.open_lidar_analysis_open3d_viewer).grid(row=0, column=14, padx=4, pady=3)
+        tk.Button(controls, text="Rebuild", command=self.rebuild_lidar_analysis_window).grid(row=0, column=15, padx=4, pady=3)
+        tk.Button(controls, text="Prev", command=self.show_lidar_analysis_prev).grid(row=0, column=16, padx=4, pady=3)
+        tk.Button(controls, text="Play/Pause", command=self.toggle_lidar_analysis_playback).grid(row=0, column=17, padx=4, pady=3)
+        tk.Button(controls, text="Stop", command=self.stop_lidar_analysis_playback).grid(row=0, column=18, padx=4, pady=3)
+        tk.Button(controls, text="Next", command=self.show_lidar_analysis_next).grid(row=0, column=19, padx=4, pady=3)
 
         body = tk.PanedWindow(self.lidar_analysis_window, orient="horizontal", sashrelief="raised")
         body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
@@ -192,6 +214,8 @@ class LidarAnalysisControlMixin:
 
     def close_lidar_analysis_window(self) -> None:
         self.stop_lidar_analysis_playback()
+        if getattr(self, "lidar_yolo_stop_event", None) is not None:
+            self.lidar_yolo_stop_event.set()
         if getattr(self, "lidar_analysis_window", None) is not None and self.lidar_analysis_window.winfo_exists():
             self.lidar_analysis_window.destroy()
         self.lidar_analysis_window = None
@@ -844,6 +868,238 @@ class LidarAnalysisControlMixin:
                 np.savetxt(handle, payload, fmt=("%.6f", "%.6f", "%.6f", "%.8e"))
         return {"path": str(path), "point_count": int(payload.shape[0])}
 
+    def open_lidar_yolo_labels_dialog(self) -> None:
+        self.ensure_lidar_analysis_state()
+        if self.lidar_yolo_analysis_thread is not None and self.lidar_yolo_analysis_thread.is_alive():
+            self.lidar_stream_analysis_status_var.set("Lidar Analysis: YOLO label analysis already running")
+            return
+        stream_text = self.lidar_analysis_stream_dir_var.get().strip()
+        if not stream_text:
+            latest = self.lidar_stream_capture_dir or self.find_latest_lidar_stream_capture_dir()
+            if latest is not None:
+                self.lidar_analysis_stream_dir_var.set(str(latest))
+                stream_text = str(latest)
+        if not stream_text:
+            self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: no folders under {self.lidar_stream_capture_root_path()}")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Lidar YOLO Labels")
+        dialog.geometry("840x390")
+        dialog.resizable(True, False)
+        dialog.grid_columnconfigure(1, weight=1)
+        folder_var = tk.StringVar(value=str(Path(stream_text).resolve()))
+        weights_var = self.lidar_yolo_weights_var
+        device_var = self.lidar_yolo_device_var
+        conf_var = self.lidar_yolo_conf_var
+        imgsz_var = self.lidar_yolo_imgsz_var
+        stride_var = self.lidar_yolo_stride_var
+        max_frames_var = self.lidar_yolo_max_frames_var
+        dedupe_var = self.lidar_yolo_dedupe_radius_var
+        max_points_var = self.lidar_yolo_max_points_var
+        progress_var = tk.DoubleVar(value=0.0)
+        status_var = tk.StringVar(value="Choose parameters, then start YOLO semantic projection.")
+        eta_var = tk.StringVar(value="ETA: --")
+
+        def set_latest_folder() -> None:
+            latest = self.lidar_stream_capture_dir or self.find_latest_lidar_stream_capture_dir()
+            if latest is not None:
+                folder_var.set(str(Path(latest).resolve()))
+
+        def browse_folder() -> None:
+            selected = filedialog.askdirectory(
+                title="Select stream_capture_lidar task folder",
+                initialdir=str(self.lidar_stream_capture_root_path()),
+            )
+            if selected:
+                folder_var.set(str(Path(selected).resolve()))
+
+        def browse_weights() -> None:
+            selected = filedialog.askopenfilename(
+                title="Select YOLO weights",
+                initialdir=str(lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_WEIGHTS_PATH.parent),
+                filetypes=[("PyTorch weights", "*.pt"), ("All files", "*.*")],
+            )
+            if selected:
+                weights_var.set(str(Path(selected).resolve()))
+
+        def use_default_weights() -> None:
+            weights_var.set(str(lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_WEIGHTS_PATH))
+
+        tk.Label(dialog, text="Folder").grid(row=0, column=0, sticky="e", padx=8, pady=(10, 4))
+        tk.Entry(dialog, textvariable=folder_var).grid(row=0, column=1, columnspan=4, sticky="ew", padx=4, pady=(10, 4))
+        tk.Button(dialog, text="Browse", command=browse_folder).grid(row=0, column=5, padx=4, pady=(10, 4))
+        tk.Button(dialog, text="Latest", command=set_latest_folder).grid(row=0, column=6, padx=8, pady=(10, 4))
+
+        tk.Label(dialog, text="Weights").grid(row=1, column=0, sticky="e", padx=8, pady=4)
+        tk.Entry(dialog, textvariable=weights_var).grid(row=1, column=1, columnspan=4, sticky="ew", padx=4, pady=4)
+        tk.Button(dialog, text="Browse", command=browse_weights).grid(row=1, column=5, padx=4, pady=4)
+        tk.Button(dialog, text="Default", command=use_default_weights).grid(row=1, column=6, padx=8, pady=4)
+
+        options = tk.Frame(dialog)
+        options.grid(row=2, column=0, columnspan=7, sticky="ew", padx=8, pady=4)
+        tk.Label(options, text="Device").grid(row=0, column=0, padx=(0, 3), pady=3)
+        tk.Entry(options, textvariable=device_var, width=8).grid(row=0, column=1, padx=(0, 8), pady=3)
+        tk.Label(options, text="Conf").grid(row=0, column=2, padx=(0, 3), pady=3)
+        tk.Entry(options, textvariable=conf_var, width=7).grid(row=0, column=3, padx=(0, 8), pady=3)
+        tk.Label(options, text="Imgsz").grid(row=0, column=4, padx=(0, 3), pady=3)
+        tk.Entry(options, textvariable=imgsz_var, width=7).grid(row=0, column=5, padx=(0, 8), pady=3)
+        tk.Label(options, text="Stride").grid(row=0, column=6, padx=(0, 3), pady=3)
+        tk.Entry(options, textvariable=stride_var, width=7).grid(row=0, column=7, padx=(0, 8), pady=3)
+        tk.Label(options, text="Max frames").grid(row=0, column=8, padx=(0, 3), pady=3)
+        tk.Entry(options, textvariable=max_frames_var, width=8).grid(row=0, column=9, padx=(0, 8), pady=3)
+        tk.Label(options, text="Dedupe m").grid(row=0, column=10, padx=(0, 3), pady=3)
+        tk.Entry(options, textvariable=dedupe_var, width=8).grid(row=0, column=11, padx=(0, 8), pady=3)
+        tk.Label(options, text="Pts/det").grid(row=0, column=12, padx=(0, 3), pady=3)
+        tk.Entry(options, textvariable=max_points_var, width=8).grid(row=0, column=13, padx=(0, 8), pady=3)
+
+        progress = ttk.Progressbar(dialog, variable=progress_var, maximum=100.0)
+        progress.grid(row=3, column=0, columnspan=7, sticky="ew", padx=8, pady=(12, 4))
+        tk.Label(dialog, textvariable=status_var, anchor="w").grid(row=4, column=0, columnspan=7, sticky="ew", padx=8, pady=2)
+        tk.Label(dialog, textvariable=eta_var, anchor="w").grid(row=5, column=0, columnspan=7, sticky="ew", padx=8, pady=2)
+
+        buttons = tk.Frame(dialog)
+        buttons.grid(row=6, column=0, columnspan=7, sticky="e", padx=8, pady=(10, 8))
+        start_button = tk.Button(buttons, text="Start YOLO Labels")
+        start_button.pack(side="left", padx=4)
+        tk.Button(buttons, text="Stop", command=lambda: self.lidar_yolo_stop_event.set()).pack(side="left", padx=4)
+        tk.Button(buttons, text="Close", command=dialog.destroy).pack(side="left", padx=4)
+
+        def parse_float(var: tk.StringVar, default: float, *, minimum: float, maximum: float) -> float:
+            try:
+                value = float(var.get().strip())
+            except Exception:
+                value = default
+            value = max(minimum, min(maximum, value))
+            var.set(f"{value:g}")
+            return value
+
+        def parse_int(var: tk.StringVar, default: int, *, minimum: int, maximum: int) -> int:
+            try:
+                value = int(float(var.get().strip()))
+            except Exception:
+                value = default
+            value = max(minimum, min(maximum, value))
+            var.set(str(value))
+            return value
+
+        def apply_progress(payload: Dict[str, Any], started_at: float) -> None:
+            processed = int(payload.get("processed", 0) or 0)
+            total = max(1, int(payload.get("total", 1) or 1))
+            progress_var.set(min(100.0, processed * 100.0 / total))
+            elapsed = max(0.0, time.monotonic() - started_at)
+            if processed > 0 and total > processed:
+                eta_s = elapsed * (total - processed) / processed
+                eta_var.set(f"ETA: {eta_s:,.1f}s remaining | elapsed {elapsed:,.1f}s")
+            elif processed >= total:
+                eta_var.set(f"ETA: done | elapsed {elapsed:,.1f}s")
+            else:
+                eta_var.set(f"ETA: estimating... | elapsed {elapsed:,.1f}s")
+            status_var.set(str(payload.get("message", "YOLO semantic projection running")))
+
+        def start_analysis() -> None:
+            if self.lidar_yolo_analysis_thread is not None and self.lidar_yolo_analysis_thread.is_alive():
+                status_var.set("YOLO label analysis is already running.")
+                return
+            selected_dir = Path(folder_var.get().strip()).resolve()
+            selected_weights = Path(weights_var.get().strip()).resolve()
+            if not selected_dir.exists():
+                status_var.set(f"Folder does not exist: {selected_dir}")
+                return
+            if not selected_weights.exists():
+                status_var.set(f"YOLO weights do not exist: {selected_weights}")
+                return
+            self.lidar_analysis_stream_dir_var.set(str(selected_dir))
+            selected_device = device_var.get().strip() or "0"
+            selected_conf = parse_float(conf_var, lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_CONF, minimum=0.01, maximum=1.0)
+            selected_imgsz = parse_int(imgsz_var, lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_IMGSZ, minimum=64, maximum=4096)
+            selected_stride = parse_int(stride_var, 1, minimum=1, maximum=100000)
+            selected_max_frames = parse_int(max_frames_var, 0, minimum=0, maximum=1000000)
+            selected_radius = parse_float(
+                dedupe_var,
+                lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_DEDUPE_RADIUS_M,
+                minimum=0.01,
+                maximum=100.0,
+            )
+            selected_max_points = parse_int(
+                max_points_var,
+                lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_MAX_POINTS_PER_DETECTION,
+                minimum=1,
+                maximum=200000,
+            )
+            self.lidar_yolo_stop_event.clear()
+            progress_var.set(0.0)
+            eta_var.set("ETA: estimating...")
+            status_var.set(f"Starting YOLO labels -> {selected_dir / 'open3d_export' / 'semantic'}")
+            start_button.configure(state="disabled")
+            started_at = time.monotonic()
+
+            def progress_callback(payload: Dict[str, Any]) -> None:
+                self.root.after(0, lambda p=payload: apply_progress(p, started_at))
+
+            def worker() -> None:
+                try:
+                    result = lidar_yolo_analysis.run_lidar_yolo_analysis(
+                        stream_dir=selected_dir,
+                        weights_path=selected_weights,
+                        device=selected_device,
+                        conf=selected_conf,
+                        imgsz=selected_imgsz,
+                        stride=selected_stride,
+                        max_frames=selected_max_frames,
+                        dedupe_radius_m=selected_radius,
+                        max_points_per_detection=selected_max_points,
+                        stop_event=self.lidar_yolo_stop_event,
+                        progress_callback=progress_callback,
+                    )
+                except Exception as exc:
+                    self.root.after(
+                        0,
+                        lambda e=exc: (
+                            status_var.set(f"YOLO labels failed: {e}"),
+                            eta_var.set("ETA: failed"),
+                            start_button.configure(state="normal"),
+                            self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: YOLO labels failed: {e}"),
+                        ),
+                    )
+                    return
+                self.root.after(
+                    0,
+                    lambda r=result: (
+                        self.apply_lidar_yolo_analysis_result(r),
+                        status_var.set(
+                            f"Done: labels={r.get('semantic_label_count', 0)} "
+                            f"observations={r.get('semantic_observation_count', 0)} "
+                            f"points={r.get('semantic_point_count', 0)}"
+                        ),
+                        eta_var.set(f"ETA: done | total {time.monotonic() - started_at:,.1f}s"),
+                        progress_var.set(100.0),
+                        start_button.configure(state="normal"),
+                    ),
+                )
+
+            self.lidar_yolo_analysis_thread = threading.Thread(target=worker, daemon=True)
+            self.lidar_yolo_analysis_thread.start()
+
+        start_button.configure(command=start_analysis)
+
+    def apply_lidar_yolo_analysis_result(self, result: Dict[str, Any]) -> None:
+        semantic_export_dir = Path(str(result.get("semantic_export_dir", "")))
+        export_dir = semantic_export_dir.parent if semantic_export_dir.name == "semantic" else semantic_export_dir
+        try:
+            status = flight.open3d_status()
+            export_dir.mkdir(parents=True, exist_ok=True)
+            (export_dir / "README_open3d.md").write_text(self.build_lidar_analysis_open3d_readme(status), encoding="utf-8")
+            (export_dir / "open3d_viewer.py").write_text(self.build_lidar_analysis_open3d_viewer_script(), encoding="utf-8")
+        except Exception:
+            pass
+        self.lidar_stream_analysis_status_var.set(
+            f"Lidar Analysis: YOLO labels status={result.get('status', '')}, "
+            f"labels={result.get('semantic_label_count', 0)}, "
+            f"observations={result.get('semantic_observation_count', 0)} -> {semantic_export_dir}"
+        )
+        self.status_var.set(f"YOLO semantic Open3D labels saved: {semantic_export_dir}")
+
     def build_lidar_analysis_open3d_readme(self, status: Dict[str, Any]) -> str:
         install_hint = (
             "C:\\Users\\Administrator\\miniconda3\\envs\\unrealcv\\python.exe -m pip install \"open3d>=0.19.0\""
@@ -859,6 +1115,8 @@ Files:
 - frames/frame_000001_world_standard_m.ply and .pcd: per-frame standard Z-up world point clouds.
 - reconstruction_world_standard_m.ply and .pcd: accumulated standard Z-up world point cloud.
 - reconstruction_world_standard_m.npy: processed Nx6 point/color array.
+- semantic/semantic_points_standard_m.ply and .pcd: YOLO detection regions projected into the same Z-up world frame.
+- semantic/semantic_labels.json: deduplicated 3D semantic labels for Open3D overlay.
 - open3d_viewer.py: standalone Open3D viewer script.
 - open3d_export_summary.json: export metadata.
 
@@ -873,35 +1131,134 @@ If Open3D is missing, install it in the UnrealCV environment:
 
     def build_lidar_analysis_open3d_viewer_script(self) -> str:
         return r'''from pathlib import Path
+import json
 
+import numpy as np
 import open3d as o3d
 
 
 ROOT = Path(__file__).resolve().parent
 
 
+def load_json(path):
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def load_point_cloud(path):
+    if not path.exists():
+        return None
+    pcd = o3d.io.read_point_cloud(str(path))
+    return pcd if pcd.has_points() else None
+
+
 def load_clouds():
-    clouds = []
-    reconstruction = ROOT / "reconstruction_world_standard_m.ply"
-    if reconstruction.exists():
-        pcd = o3d.io.read_point_cloud(str(reconstruction))
-        if pcd.has_points():
-            clouds.append(pcd)
-    if not clouds:
+    named = []
+    reconstruction = load_point_cloud(ROOT / "reconstruction_world_standard_m.ply")
+    if reconstruction is not None:
+        named.append(("reconstruction_world_standard_m", reconstruction))
+    if not named:
         for path in sorted((ROOT / "frames").glob("*_world_standard_m.ply"))[:8]:
-            pcd = o3d.io.read_point_cloud(str(path))
-            if pcd.has_points():
-                clouds.append(pcd)
-    return clouds
+            pcd = load_point_cloud(path)
+            if pcd is not None:
+                named.append((path.stem, pcd))
+    semantic = load_point_cloud(ROOT / "semantic" / "semantic_points_standard_m.ply")
+    if semantic is not None:
+        named.append(("semantic_yolo_points", semantic))
+    return named
+
+
+def load_labels():
+    payload = load_json(ROOT / "semantic" / "semantic_labels.json")
+    labels = payload.get("labels", []) if isinstance(payload, dict) else []
+    return [label for label in labels if isinstance(label, dict)]
+
+
+def label_text(label):
+    return (
+        f"{label.get('class_name', 'object')} #{label.get('label_id', '')} "
+        f"{float(label.get('best_confidence') or 0.0):.2f} "
+        f"obs={label.get('observation_count', 0)}"
+    )
+
+
+def label_center(label):
+    center = label.get("center_world_m", [])
+    if not isinstance(center, list) or len(center) < 3:
+        return None
+    try:
+        arr = np.array([float(center[0]), float(center[1]), float(center[2])], dtype=float)
+    except Exception:
+        return None
+    if not np.isfinite(arr).all():
+        return None
+    return arr
+
+
+def label_color(label):
+    color = label.get("color_rgb", [255, 255, 255])
+    try:
+        return [max(0.0, min(1.0, float(color[i]) / 255.0)) for i in range(3)]
+    except Exception:
+        return [1.0, 1.0, 1.0]
+
+
+def label_markers(labels):
+    markers = []
+    for label in labels:
+        center = label_center(label)
+        if center is None:
+            continue
+        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.08)
+        sphere.translate(center)
+        sphere.paint_uniform_color(label_color(label))
+        markers.append((f"label_marker_{label.get('label_id', len(markers) + 1)}", sphere))
+    return markers
+
+
+def try_gui_view(named_geometries, labels):
+    try:
+        from open3d.visualization import gui
+        gui.Application.instance.initialize()
+        visualizer = o3d.visualization.O3DVisualizer("UAV Open3D Point Cloud + YOLO Labels", 1400, 900)
+        for name, geometry in named_geometries:
+            visualizer.add_geometry(name, geometry)
+        for label in labels:
+            center = label_center(label)
+            if center is not None:
+                visualizer.add_3d_label(center, label_text(label))
+        try:
+            visualizer.reset_camera_to_default()
+        except Exception:
+            pass
+        gui.Application.instance.add_window(visualizer)
+        gui.Application.instance.run()
+        return True
+    except Exception as exc:
+        print(f"O3DVisualizer labels unavailable, falling back to draw_geometries: {exc}")
+        return False
 
 
 def main():
-    geometries = load_clouds()
-    if not geometries:
-        raise SystemExit(f"No Open3D point clouds found under {ROOT}")
+    named_geometries = load_clouds()
+    labels = load_labels()
     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2.0, origin=[0.0, 0.0, 0.0])
+    named_geometries.append(("axis", axis))
+    if labels and try_gui_view(named_geometries, labels):
+        return
+    fallback = [geometry for _name, geometry in named_geometries]
+    fallback.extend(geometry for _name, geometry in label_markers(labels))
+    if not fallback:
+        raise SystemExit(f"No Open3D point clouds found under {ROOT}")
+    for label in labels:
+        center = label_center(label)
+        print(f"{label_text(label)} center={center.tolist() if center is not None else 'n/a'}")
     o3d.visualization.draw_geometries(
-        [*geometries, axis],
+        fallback,
         window_name="UAV Open3D Point Cloud",
         width=1400,
         height=900,
@@ -990,6 +1347,8 @@ if __name__ == "__main__":
         readme_path = export_dir / "README_open3d.md"
         viewer_path = export_dir / "open3d_viewer.py"
         summary_path = export_dir / "open3d_export_summary.json"
+        existing_export_summary = self.read_lidar_analysis_json(summary_path)
+        semantic_summary = self.read_lidar_analysis_json(export_dir / "semantic" / "semantic_projection_summary.json")
         readme_path.write_text(self.build_lidar_analysis_open3d_readme(status), encoding="utf-8")
         viewer_path.write_text(self.build_lidar_analysis_open3d_viewer_script(), encoding="utf-8")
 
@@ -1020,6 +1379,30 @@ if __name__ == "__main__":
             "reuse_existing": bool(reuse_existing),
             "updated_at": datetime.now().isoformat(timespec="milliseconds"),
         }
+        semantic_source = semantic_summary if semantic_summary else existing_export_summary
+        if semantic_source:
+            summary.update(
+                {
+                    "semantic_yolo_status": semantic_source.get("status", semantic_source.get("semantic_yolo_status", "")),
+                    "semantic_label_count": int(semantic_source.get("semantic_label_count", 0) or 0),
+                    "semantic_observation_count": int(semantic_source.get("semantic_observation_count", 0) or 0),
+                    "semantic_points_path": semantic_source.get("semantic_points_path", ""),
+                    "semantic_labels_path": semantic_source.get("semantic_labels_path", ""),
+                    "semantic_analysis_dir": semantic_source.get("analysis_dir", semantic_source.get("semantic_analysis_dir", "")),
+                    "semantic_projection_summary_path": semantic_source.get(
+                        "summary_path",
+                        semantic_source.get("stable_summary_path", semantic_source.get("semantic_projection_summary_path", "")),
+                    ),
+                    "semantic_selected_frame_count": int(semantic_source.get("selected_frame_count", semantic_source.get("semantic_selected_frame_count", 0)) or 0),
+                    "semantic_processed_frame_count": int(semantic_source.get("processed_frame_count", semantic_source.get("semantic_processed_frame_count", 0)) or 0),
+                    "semantic_config": semantic_source.get("config", semantic_source.get("semantic_config", {})),
+                    "dedupe_radius_m": float(
+                        semantic_source.get("dedupe_radius_m", lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_DEDUPE_RADIUS_M)
+                    ),
+                    "projection_coordinate_frame": "standard_zup",
+                    "projection_coordinate_units": "m",
+                }
+            )
         if not status.get("available"):
             summary["status"] = "open3d_unavailable"
             summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
