@@ -57,5 +57,7 @@ results
 UnrealEnv
 overleaf
 temp_capture
+temp_capture_lidar
 stream_capture
 assets/yolo_model
+stream_capture_lidar

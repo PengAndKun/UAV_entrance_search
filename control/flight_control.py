@@ -19,6 +19,7 @@ class FlightControlMixin:
     def on_stop_session(self) -> None:
         self.stop_keyboard_control(send_hold=False)
         self.stream_capture_stop_event.set()
+        self.lidar_stream_capture_stop_event.set()
         self.route_stop_event.set()
         session = self.session
         if session is None:
@@ -370,14 +371,49 @@ class FlightControlMixin:
         self.call_async("Setting pose", lambda: session.set_pose(payload))
 
     def sync_capture_options_to_session(self, session: flight.DroneFlightSession) -> None:
+        lidar_min_cm, lidar_max_cm = self.parse_lidar_depth_range()
         session.args.enhance_rgb = bool(self.enhance_rgb_var.get())
         session.args.rgb_enhance_gamma = float(self.args.rgb_enhance_gamma)
         session.args.rgb_enhance_gain = float(self.args.rgb_enhance_gain)
         session.args.rgb_source_order = self.rgb_source_order_var.get().strip() or flight.DEFAULT_RGB_SOURCE_ORDER
         session.args.temp_capture_dir = str(getattr(self.args, "temp_capture_dir", flight.DEFAULT_TEMP_CAPTURE_DIR))
+        session.args.temp_capture_lidar_dir = str(getattr(self.args, "temp_capture_lidar_dir", flight.DEFAULT_TEMP_CAPTURE_LIDAR_DIR))
         session.args.stream_capture_dir = str(getattr(self.args, "stream_capture_dir", flight.DEFAULT_STREAM_CAPTURE_DIR))
+        session.args.stream_capture_lidar_dir = str(getattr(self.args, "stream_capture_lidar_dir", flight.DEFAULT_STREAM_CAPTURE_LIDAR_DIR))
         session.args.depth_min_cm = float(getattr(self.args, "depth_min_cm", flight.DEFAULT_DEPTH_MIN_CM))
         session.args.depth_max_cm = float(getattr(self.args, "depth_max_cm", flight.DEFAULT_DEPTH_MAX_CM))
+        session.args.lidar_depth_min_cm = lidar_min_cm
+        session.args.lidar_depth_max_cm = lidar_max_cm
+        session.args.lidar_depth_projection = str(
+            getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)
+        )
+
+    def parse_lidar_depth_range(self) -> Tuple[float, float]:
+        try:
+            min_cm = float(self.lidar_depth_min_cm_var.get().strip())
+        except Exception:
+            min_cm = float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM))
+        try:
+            max_cm = float(self.lidar_depth_max_cm_var.get().strip())
+        except Exception:
+            max_cm = float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM))
+        if not math.isfinite(min_cm):
+            min_cm = flight.DEFAULT_LIDAR_DEPTH_MIN_CM
+        if not math.isfinite(max_cm):
+            max_cm = flight.DEFAULT_LIDAR_DEPTH_MAX_CM
+        min_cm = max(0.0, min(65535.0, min_cm))
+        max_cm = max(0.0, min(65535.0, max_cm))
+        if max_cm < min_cm:
+            min_cm, max_cm = max_cm, min_cm
+        if max_cm <= min_cm:
+            max_cm = min(65535.0, min_cm + 1.0)
+        min_text = f"{min_cm:g}"
+        max_text = f"{max_cm:g}"
+        if getattr(self, "lidar_depth_min_cm_var", None) is not None and self.lidar_depth_min_cm_var.get().strip() != min_text:
+            self.root.after(0, lambda value=min_text: self.lidar_depth_min_cm_var.set(value))
+        if getattr(self, "lidar_depth_max_cm_var", None) is not None and self.lidar_depth_max_cm_var.get().strip() != max_text:
+            self.root.after(0, lambda value=max_text: self.lidar_depth_max_cm_var.set(value))
+        return min_cm, max_cm
 
     def on_save_frame(self) -> None:
         session = self.active_session()
@@ -429,6 +465,56 @@ class FlightControlMixin:
             )
         self.refresh_map_once()
 
+    def on_temp_capture_lidar(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        if self.temp_capture_lidar_inflight:
+            self.status_var.set("Temp Capture Lidar is already running.")
+            return
+
+        self.sync_capture_options_to_session(session)
+
+        def worker() -> None:
+            self.temp_capture_lidar_inflight = True
+            self.root.after(0, lambda: self.status_var.set("Temp Capture Lidar..."))
+            try:
+                result = self.safe(
+                    "Temp Capture Lidar",
+                    lambda: session.capture_temp_lidar_bundle(output_root=session.args.temp_capture_lidar_dir),
+                )
+                if isinstance(result, dict):
+                    self.root.after(0, lambda r=result: self.apply_temp_capture_lidar_result(r))
+            finally:
+                self.temp_capture_lidar_inflight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_temp_capture_lidar_result(self, result: Dict[str, Any]) -> None:
+        message = str(result.get("message", "") or result.get("status", "Temp Capture Lidar finished"))
+        point_count = int(result.get("point_count", 0) or 0)
+        min_cm = result.get("min_depth_cm", result.get("lidar_depth_min_cm", ""))
+        max_cm = result.get("max_depth_cm", result.get("lidar_depth_max_cm", ""))
+        if point_count:
+            message = f"{message} | points={point_count}"
+        if min_cm != "" and max_cm != "":
+            message = f"{message} | lidar={self._fmt_float(min_cm)}-{self._fmt_float(max_cm)}cm"
+        self.status_var.set(message)
+        self.latest_state.setdefault("last_temp_capture_lidar", result)
+        self.latest_state["last_temp_capture_lidar"] = result
+        pose = result.get("pose") if isinstance(result.get("pose"), dict) else {}
+        if pose:
+            self.latest_state["pose"] = pose
+            self.pose_var.set(
+                "Pose "
+                f"x={float(pose.get('x', 0.0)):.1f} "
+                f"y={float(pose.get('y', 0.0)):.1f} "
+                f"z={float(pose.get('z', 0.0)):.1f} "
+                f"yaw={float(pose.get('task_yaw', pose.get('yaw', 0.0))):.1f} "
+                "action=temp_capture_lidar"
+            )
+        self.refresh_map_once()
+
     def parse_stream_interval_s(self) -> float:
         try:
             interval_s = float(self.stream_interval_s_var.get().strip())
@@ -439,6 +525,15 @@ class FlightControlMixin:
         if self.stream_interval_s_var.get().strip() != normalized:
             self.root.after(0, lambda value=normalized: self.stream_interval_s_var.set(value))
         return interval_s
+
+    def set_stream_task_entry_locked(self, locked: bool) -> None:
+        entry = getattr(self, "stream_task_entry", None)
+        if entry is None:
+            return
+        try:
+            entry.configure(state="readonly" if locked else "normal")
+        except tk.TclError:
+            pass
 
     def make_stream_capture_dir(self, task_title: str) -> Path:
         root_value = str(getattr(self.args, "stream_capture_dir", flight.DEFAULT_STREAM_CAPTURE_DIR) or flight.DEFAULT_STREAM_CAPTURE_DIR)
@@ -474,12 +569,132 @@ class FlightControlMixin:
         trajectory_payload["trajectory"] = self.stream_capture_trajectory
         (stream_dir / "trajectory.json").write_text(json.dumps(trajectory_payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    def make_lidar_stream_capture_dir(self, task_title: str) -> Path:
+        root_value = str(
+            getattr(self.args, "stream_capture_lidar_dir", flight.DEFAULT_STREAM_CAPTURE_LIDAR_DIR)
+            or flight.DEFAULT_STREAM_CAPTURE_LIDAR_DIR
+        )
+        root_path = flight.resolve_project_output_path(root_value, flight.DEFAULT_STREAM_CAPTURE_LIDAR_DIR)
+        safe_task = flight.sanitize_capture_task_title(task_title)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        return flight.make_unique_child_dir(root_path, f"{safe_task}_{timestamp}")
+
+    def lidar_stream_capture_root_path(self) -> Path:
+        root_value = str(
+            getattr(self.args, "stream_capture_lidar_dir", flight.DEFAULT_STREAM_CAPTURE_LIDAR_DIR)
+            or flight.DEFAULT_STREAM_CAPTURE_LIDAR_DIR
+        )
+        return flight.resolve_project_output_path(root_value, flight.DEFAULT_STREAM_CAPTURE_LIDAR_DIR)
+
+    def write_lidar_stream_capture_summary(
+        self,
+        stream_dir: Path,
+        *,
+        task_title: str,
+        interval_s: float,
+        started_at: str,
+        stopped_at: str = "",
+        running: bool = True,
+    ) -> None:
+        summary = {
+            "capture_kind": "stream_capture_lidar",
+            "task_title": task_title,
+            "safe_task_title": flight.sanitize_capture_task_title(task_title),
+            "interval_s": float(interval_s),
+            "stream_dir": str(stream_dir),
+            "frames_dir": str(stream_dir / "frames"),
+            "reconstruction_dir": str(stream_dir / "reconstruction"),
+            "started_at": started_at,
+            "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+            "stopped_at": stopped_at,
+            "running": bool(running),
+            "frame_count": len(self.lidar_stream_capture_trajectory),
+            "source_mode": "depth_backprojected_lidar",
+            "lidar_depth_min_cm": float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
+            "lidar_depth_max_cm": float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+            "lidar_depth_projection": str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
+            "depth_projection_selected": flight.select_lidar_depth_projection(
+                getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)
+            ),
+            "coordinate_frame": "standard_zup",
+            "coordinate_units": "m",
+            "source_point_count": int(self.lidar_stream_source_point_count),
+            "reconstruction": self.lidar_stream_last_reconstruction,
+        }
+        (stream_dir / "stream_capture_lidar.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        trajectory_payload = dict(summary)
+        trajectory_payload["trajectory"] = self.lidar_stream_capture_trajectory
+        (stream_dir / "trajectory.json").write_text(json.dumps(trajectory_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def save_lidar_stream_reconstruction(
+        self,
+        stream_dir: Path,
+        *,
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        cloud = self.lidar_stream_reconstruction_cloud
+        if cloud is None:
+            cloud = np.zeros((0, 6), dtype=np.float32)
+        if not force and int(len(self.lidar_stream_capture_trajectory)) % flight.DEFAULT_LIDAR_RECON_WRITE_EVERY != 0:
+            return self.lidar_stream_last_reconstruction
+        reconstruction = flight.save_lidar_reconstruction_outputs(
+            cloud,
+            stream_dir / "reconstruction",
+            source_frame_count=len(self.lidar_stream_capture_trajectory),
+            source_point_count=int(self.lidar_stream_source_point_count),
+            voxel_cm=flight.DEFAULT_LIDAR_RECON_VOXEL_CM,
+            max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
+            coordinate_frame="standard_zup",
+            coordinate_units="m",
+        )
+        merged_path = reconstruction.get("merged_point_cloud_world_standard_m_npy_path") or reconstruction["merged_point_cloud_world_npy_path"]
+        self.lidar_stream_reconstruction_cloud = np.load(merged_path).astype(np.float32, copy=False)
+        self.lidar_stream_last_reconstruction = reconstruction
+        return reconstruction
+
+    def update_lidar_stream_reconstruction_from_result(self, result: Dict[str, Any]) -> int:
+        raw_path = str(result.get("point_cloud_world_standard_m_npy_path", "") or "")
+        if not raw_path and result.get("capture_dir"):
+            ensured = flight.ensure_standard_world_cloud_for_capture(
+                Path(str(result.get("capture_dir"))),
+                capture_payload=result,
+                lidar_depth_projection=str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
+                min_depth_cm=float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
+                max_depth_cm=float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+            )
+            raw_path = str(ensured.get("point_cloud_world_standard_m_npy_path", "") or "")
+        if not raw_path:
+            raw_path = str(result.get("point_cloud_world_npy_path", "") or "")
+        frame_count = int(result.get("point_count", 0) or 0)
+        self.lidar_stream_source_point_count += max(0, frame_count)
+        if not raw_path:
+            return int(self.lidar_stream_reconstruction_cloud.shape[0]) if self.lidar_stream_reconstruction_cloud is not None else 0
+        world_path = Path(raw_path)
+        if not world_path.exists():
+            return int(self.lidar_stream_reconstruction_cloud.shape[0]) if self.lidar_stream_reconstruction_cloud is not None else 0
+        frame_cloud = np.load(world_path).astype(np.float32, copy=False)
+        if frame_cloud.ndim != 2 or frame_cloud.shape[1] != 6 or frame_cloud.shape[0] == 0:
+            return int(self.lidar_stream_reconstruction_cloud.shape[0]) if self.lidar_stream_reconstruction_cloud is not None else 0
+        if self.lidar_stream_reconstruction_cloud is None or self.lidar_stream_reconstruction_cloud.shape[0] == 0:
+            combined = frame_cloud
+        else:
+            combined = np.vstack((self.lidar_stream_reconstruction_cloud, frame_cloud))
+        self.lidar_stream_reconstruction_cloud = flight.downsample_colored_point_cloud_voxel(
+            combined,
+            voxel_cm=flight.standard_voxel_size_m(flight.DEFAULT_LIDAR_RECON_VOXEL_CM),
+            max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
+        )
+        return int(self.lidar_stream_reconstruction_cloud.shape[0])
+
     def on_start_stream_capture(self) -> None:
         session = self.active_session()
         if session is None:
             return
         if self.stream_capture_thread is not None and self.stream_capture_thread.is_alive():
             self.stream_status_var.set("Stream Capture: already running")
+            return
+        if self.lidar_stream_capture_thread is not None and self.lidar_stream_capture_thread.is_alive():
+            self.stream_status_var.set("Stream Capture: stop lidar capture first")
             return
 
         self.sync_capture_options_to_session(session)
@@ -492,6 +707,7 @@ class FlightControlMixin:
         self.stream_capture_stop_event.clear()
         started_at = datetime.now().isoformat(timespec="milliseconds")
         self.write_stream_capture_summary(stream_dir, task_title=task_title, interval_s=interval_s, started_at=started_at)
+        self.set_stream_task_entry_locked(True)
         self.stream_status_var.set(f"Stream Capture: 0 frames -> {stream_dir}")
         self.status_var.set(f"Stream Capture started: {stream_dir}")
 
@@ -560,8 +776,9 @@ class FlightControlMixin:
                     LOGGER.warning("Failed to write stream capture summary: %s", exc)
                 self.root.after(
                     0,
-                    lambda count=len(self.stream_capture_trajectory), d=stream_dir: self.stream_status_var.set(
-                        f"Stream Capture: stopped, {count} frames -> {d}"
+                    lambda count=len(self.stream_capture_trajectory), d=stream_dir: (
+                        self.stream_status_var.set(f"Stream Capture: stopped, {count} frames -> {d}"),
+                        self.set_stream_task_entry_locked(False),
                     ),
                 )
 
@@ -570,11 +787,371 @@ class FlightControlMixin:
 
     def on_stop_stream_capture(self) -> None:
         self.stream_capture_stop_event.set()
+        self.set_stream_task_entry_locked(False)
         if self.stream_capture_thread is not None and self.stream_capture_thread.is_alive():
             self.stream_status_var.set("Stream Capture: stopping...")
             self.status_var.set("Stopping Stream Capture...")
         else:
             self.stream_status_var.set("Stream Capture: idle")
+
+    def on_start_lidar_stream_capture(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        if self.stream_capture_thread is not None and self.stream_capture_thread.is_alive():
+            self.lidar_stream_status_var.set("Lidar Stream: stop Stream Capture first")
+            return
+        if self.lidar_stream_capture_thread is not None and self.lidar_stream_capture_thread.is_alive():
+            self.lidar_stream_status_var.set("Lidar Stream: already running")
+            return
+
+        self.sync_capture_options_to_session(session)
+        task_title = self.stream_task_title_var.get().strip() or "stream_task"
+        interval_s = self.parse_stream_interval_s()
+        stream_dir = self.make_lidar_stream_capture_dir(task_title)
+        (stream_dir / "frames").mkdir(parents=True, exist_ok=True)
+        (stream_dir / "reconstruction").mkdir(parents=True, exist_ok=True)
+        self.lidar_stream_capture_dir = stream_dir
+        self.lidar_stream_capture_trajectory = []
+        self.lidar_stream_reconstruction_cloud = np.zeros((0, 6), dtype=np.float32)
+        self.lidar_stream_source_point_count = 0
+        self.lidar_stream_last_reconstruction = {}
+        self.lidar_stream_capture_stop_event.clear()
+        started_at = datetime.now().isoformat(timespec="milliseconds")
+        self.write_lidar_stream_capture_summary(stream_dir, task_title=task_title, interval_s=interval_s, started_at=started_at)
+        self.set_stream_task_entry_locked(True)
+        self.lidar_stream_status_var.set(f"Lidar Stream: 0 frames, merged=0 -> {stream_dir}")
+        self.lidar_stream_analysis_status_var.set("Lidar Analysis: idle")
+        self.status_var.set(f"Lidar Stream started: {stream_dir}")
+
+        def worker() -> None:
+            frame_index = 0
+            try:
+                while not self.lidar_stream_capture_stop_event.is_set():
+                    frame_index += 1
+                    frame_started = time.monotonic()
+                    result = self.safe(
+                        "Lidar Stream Capture",
+                        lambda idx=frame_index, action=self.build_stream_action_detail(): session.capture_lidar_stream_frame(
+                            stream_dir,
+                            idx,
+                            action_detail=action,
+                        ),
+                    )
+                    if not isinstance(result, dict):
+                        break
+                    action_detail = result.get("action_detail", {}) if isinstance(result.get("action_detail"), dict) else {}
+                    merged_count = self.update_lidar_stream_reconstruction_from_result(result)
+                    entry = {
+                        "frame_index": int(result.get("frame_index", frame_index)),
+                        "capture_time": result.get("capture_time", ""),
+                        "pose": result.get("pose", {}),
+                        "commanded_pose": result.get("commanded_pose", {}),
+                        "actual_pose": result.get("actual_pose", {}),
+                        "pose_error": result.get("pose_error", {}),
+                        "action_detail": action_detail,
+                        "last_action": action_detail.get("last_action", result.get("last_action", "")),
+                        "movement_mode": action_detail.get("movement_mode", result.get("movement_mode", "")),
+                        "movement_enabled": bool(action_detail.get("movement_enabled", False)),
+                        "capture_dir": result.get("capture_dir", ""),
+                        "rgb_path": result.get("rgb_path", ""),
+                        "depth_npy_path": result.get("depth_npy_path", ""),
+                        "depth_cm_path": result.get("depth_cm_path", ""),
+                        "depth_preview_path": result.get("depth_preview_path", ""),
+                        "point_cloud_camera_npy_path": result.get("point_cloud_camera_npy_path", ""),
+                        "point_cloud_world_npy_path": result.get("point_cloud_world_npy_path", ""),
+                        "point_cloud_camera_ply_path": result.get("point_cloud_camera_ply_path", ""),
+                        "point_cloud_world_ply_path": result.get("point_cloud_world_ply_path", ""),
+                        "point_cloud_camera_standard_m_npy_path": result.get("point_cloud_camera_standard_m_npy_path", ""),
+                        "point_cloud_world_standard_m_npy_path": result.get("point_cloud_world_standard_m_npy_path", ""),
+                        "point_cloud_camera_standard_m_ply_path": result.get("point_cloud_camera_standard_m_ply_path", ""),
+                        "point_cloud_world_standard_m_ply_path": result.get("point_cloud_world_standard_m_ply_path", ""),
+                        "point_cloud_preview_path": result.get("point_cloud_preview_path", ""),
+                        "camera_info_path": result.get("camera_info_path", ""),
+                        "projection_diagnostics_path": result.get("projection_diagnostics_path", ""),
+                        "open3d_camera": result.get("open3d_camera", {}),
+                        "open3d_world": result.get("open3d_world", {}),
+                        "open3d_camera_standard_m": result.get("open3d_camera_standard_m", {}),
+                        "open3d_world_standard_m": result.get("open3d_world_standard_m", {}),
+                        "pose_json_path": result.get("pose_json_path", ""),
+                        "action_json_path": result.get("action_json_path", ""),
+                        "point_count": int(result.get("point_count", 0) or 0),
+                        "invalid_depth_count": int(result.get("invalid_depth_count", 0) or 0),
+                        "depth_projection_selected": result.get("depth_projection_selected", result.get("depth_projection", "")),
+                        "projection_corrected": bool(result.get("projection_corrected", True)),
+                        "coordinate_frame": result.get("coordinate_frame", "standard_zup"),
+                        "coordinate_units": result.get("coordinate_units", "m"),
+                        "merged_point_count": int(merged_count),
+                    }
+                    self.lidar_stream_capture_trajectory.append(entry)
+                    reconstruction = self.save_lidar_stream_reconstruction(stream_dir, force=False)
+                    if reconstruction:
+                        self.lidar_stream_capture_trajectory[-1]["reconstruction"] = reconstruction
+                    self.write_lidar_stream_capture_summary(
+                        stream_dir,
+                        task_title=task_title,
+                        interval_s=interval_s,
+                        started_at=started_at,
+                    )
+                    self.root.after(
+                        0,
+                        lambda r=result, count=len(self.lidar_stream_capture_trajectory), merged=merged_count, d=stream_dir: self.apply_lidar_stream_capture_result(
+                            r,
+                            count,
+                            merged,
+                            d,
+                        ),
+                    )
+                    elapsed_s = time.monotonic() - frame_started
+                    if self.lidar_stream_capture_stop_event.wait(max(0.0, interval_s - elapsed_s)):
+                        break
+            finally:
+                stopped_at = datetime.now().isoformat(timespec="milliseconds")
+                try:
+                    self.save_lidar_stream_reconstruction(stream_dir, force=True)
+                    self.write_lidar_stream_capture_summary(
+                        stream_dir,
+                        task_title=task_title,
+                        interval_s=interval_s,
+                        started_at=started_at,
+                        stopped_at=stopped_at,
+                        running=False,
+                    )
+                except Exception as exc:
+                    LOGGER.warning("Failed to finalize lidar stream capture: %s", exc)
+                self.root.after(
+                    0,
+                    lambda count=len(self.lidar_stream_capture_trajectory), d=stream_dir: (
+                        self.lidar_stream_status_var.set(f"Lidar Stream: stopped, {count} frames -> {d}"),
+                        self.lidar_stream_analysis_status_var.set(
+                            f"Lidar Analysis: merged={self.lidar_stream_last_reconstruction.get('merged_point_count', 0)} "
+                            f"units=m -> {self.lidar_stream_last_reconstruction.get('merged_point_cloud_world_standard_m_ply_path', self.lidar_stream_last_reconstruction.get('merged_point_cloud_world_ply_path', ''))}"
+                        ),
+                        self.set_stream_task_entry_locked(False),
+                    ),
+                )
+
+        self.lidar_stream_capture_thread = threading.Thread(target=worker, daemon=True)
+        self.lidar_stream_capture_thread.start()
+
+    def on_stop_lidar_stream_capture(self) -> None:
+        self.lidar_stream_capture_stop_event.set()
+        self.set_stream_task_entry_locked(False)
+        if self.lidar_stream_capture_thread is not None and self.lidar_stream_capture_thread.is_alive():
+            self.lidar_stream_status_var.set("Lidar Stream: stopping...")
+            self.status_var.set("Stopping Lidar Stream...")
+        else:
+            self.lidar_stream_status_var.set("Lidar Stream: idle")
+
+    def apply_lidar_stream_capture_result(
+        self,
+        result: Dict[str, Any],
+        frame_count: int,
+        merged_point_count: int,
+        stream_dir: Path,
+    ) -> None:
+        self.latest_state.setdefault("last_lidar_stream_capture", result)
+        self.latest_state["last_lidar_stream_capture"] = result
+        self.stream_player_dir = stream_dir
+        self.stream_player_image_mode_var.set("point_cloud_preview")
+        pose = result.get("pose") if isinstance(result.get("pose"), dict) else {}
+        if pose:
+            self.latest_state["pose"] = pose
+            self.pose_var.set(
+                "Pose "
+                f"x={float(pose.get('x', 0.0)):.1f} "
+                f"y={float(pose.get('y', 0.0)):.1f} "
+                f"z={float(pose.get('z', 0.0)):.1f} "
+                f"yaw={float(pose.get('task_yaw', pose.get('yaw', 0.0))):.1f} "
+                f"action=lidar_stream_{frame_count}"
+            )
+        point_count = int(result.get("point_count", 0) or 0)
+        invalid_count = int(result.get("invalid_depth_count", 0) or 0)
+        self.lidar_stream_status_var.set(
+            f"Lidar Stream: {frame_count} frames, last={point_count}, invalid={invalid_count}, "
+            f"merged={merged_point_count} -> {stream_dir}"
+        )
+        self.status_var.set(f"Lidar Stream frame {frame_count} saved")
+        self.refresh_map_once()
+
+    def collect_lidar_stream_world_cloud_paths(self, stream_dir: Path) -> List[Path]:
+        stream_path = Path(stream_dir)
+        paths: List[Path] = []
+        seen: set[str] = set()
+
+        def add_path(cloud_path: Path) -> None:
+            key = str(cloud_path.resolve())
+            if cloud_path.exists() and key not in seen:
+                paths.append(cloud_path)
+                seen.add(key)
+
+        def add_capture_standard_path(capture_dir: Path, payload: Optional[Dict[str, Any]] = None) -> None:
+            try:
+                ensured = flight.ensure_standard_world_cloud_for_capture(
+                    capture_dir,
+                    capture_payload=payload,
+                    lidar_depth_projection=str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
+                    min_depth_cm=float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
+                    max_depth_cm=float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+                )
+            except Exception as exc:
+                LOGGER.warning("Failed to ensure standard lidar frame %s: %s", capture_dir, exc)
+                ensured = {}
+            raw = ensured.get("point_cloud_world_standard_m_npy_path") if isinstance(ensured, dict) else ""
+            if raw:
+                add_path(Path(str(raw)))
+
+        trajectory_path = stream_path / "trajectory.json"
+        if trajectory_path.exists():
+            try:
+                payload = json.loads(trajectory_path.read_text(encoding="utf-8"))
+                trajectory = payload.get("trajectory", [])
+                if isinstance(trajectory, list):
+                    for entry in trajectory:
+                        if not isinstance(entry, dict):
+                            continue
+                        raw_capture_dir = entry.get("capture_dir")
+                        capture_dir = self.resolve_lidar_analysis_path(stream_path, raw_capture_dir) if hasattr(self, "resolve_lidar_analysis_path") and raw_capture_dir else Path(str(raw_capture_dir or ""))
+                        if raw_capture_dir and not capture_dir.is_absolute():
+                            capture_dir = (stream_path / capture_dir).resolve()
+                        if raw_capture_dir and capture_dir.exists():
+                            add_capture_standard_path(capture_dir, entry)
+                            continue
+                        raw_path = entry.get("point_cloud_world_standard_m_npy_path") or entry.get("point_cloud_world_npy_path")
+                        if not raw_path:
+                            continue
+                        cloud_path = Path(str(raw_path))
+                        if not cloud_path.is_absolute():
+                            cloud_path = stream_path / cloud_path
+                        if cloud_path.name == "point_cloud_world.npy":
+                            add_capture_standard_path(cloud_path.parent, entry)
+                        else:
+                            add_path(cloud_path)
+            except Exception as exc:
+                LOGGER.warning("Failed to read lidar stream trajectory %s: %s", trajectory_path, exc)
+        for capture_dir in sorted(path for path in (stream_path / "frames").glob("frame_*") if path.is_dir()):
+            add_capture_standard_path(capture_dir)
+        return paths
+
+    def update_lidar_stream_reconstruction_metadata(self, stream_dir: Path, reconstruction: Dict[str, Any]) -> None:
+        stream_path = Path(stream_dir)
+        summary_path = stream_path / "stream_capture_lidar.json"
+        summary: Dict[str, Any] = {}
+        if summary_path.exists():
+            try:
+                loaded = json.loads(summary_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    summary = loaded
+            except Exception as exc:
+                LOGGER.warning("Failed to update lidar stream summary %s: %s", summary_path, exc)
+        summary.update(
+            {
+                "capture_kind": "stream_capture_lidar",
+                "stream_dir": str(stream_path),
+                "frames_dir": str(stream_path / "frames"),
+                "reconstruction_dir": str(stream_path / "reconstruction"),
+                "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+                "source_mode": "depth_backprojected_lidar",
+                "coordinate_frame": "standard_zup",
+                "coordinate_units": "m",
+                "depth_projection_selected": reconstruction.get("depth_projection_selected", "standard_zup_merge"),
+                "source_point_count": int(reconstruction.get("source_point_count", 0) or 0),
+                "reconstruction": reconstruction,
+            }
+        )
+        summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        trajectory_path = stream_path / "trajectory.json"
+        trajectory_payload: Dict[str, Any] = {}
+        if trajectory_path.exists():
+            try:
+                loaded = json.loads(trajectory_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    trajectory_payload = loaded
+            except Exception as exc:
+                LOGGER.warning("Failed to update lidar stream trajectory %s: %s", trajectory_path, exc)
+        trajectory = trajectory_payload.get("trajectory", [])
+        if not isinstance(trajectory, list):
+            trajectory = []
+        trajectory_payload.update(summary)
+        trajectory_payload["trajectory"] = trajectory
+        trajectory_path.write_text(json.dumps(trajectory_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def rebuild_lidar_stream_reconstruction(self, stream_dir: Path) -> Dict[str, Any]:
+        cloud_paths = self.collect_lidar_stream_world_cloud_paths(stream_dir)
+        merged = np.zeros((0, 6), dtype=np.float32)
+        source_point_count = 0
+        valid_frame_count = 0
+        for cloud_path in cloud_paths:
+            cloud = np.load(cloud_path).astype(np.float32, copy=False)
+            if cloud.ndim != 2 or cloud.shape[1] != 6 or cloud.shape[0] == 0:
+                continue
+            source_point_count += int(cloud.shape[0])
+            valid_frame_count += 1
+            merged = cloud if merged.shape[0] == 0 else np.vstack((merged, cloud))
+            merged = flight.downsample_colored_point_cloud_voxel(
+                merged,
+                voxel_cm=flight.standard_voxel_size_m(flight.DEFAULT_LIDAR_RECON_VOXEL_CM),
+                max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
+            )
+        reconstruction = flight.save_lidar_reconstruction_outputs(
+            merged,
+            Path(stream_dir) / "reconstruction",
+            source_frame_count=valid_frame_count,
+            source_point_count=source_point_count,
+            voxel_cm=flight.DEFAULT_LIDAR_RECON_VOXEL_CM,
+            max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
+            coordinate_frame="standard_zup",
+            coordinate_units="m",
+        )
+        self.update_lidar_stream_reconstruction_metadata(Path(stream_dir), reconstruction)
+        reconstruction["stream_dir"] = str(stream_dir)
+        reconstruction["input_cloud_file_count"] = len(cloud_paths)
+        return reconstruction
+
+    def find_latest_lidar_stream_capture_dir(self) -> Optional[Path]:
+        root = self.lidar_stream_capture_root_path()
+        if not root.exists():
+            return None
+        candidates = [path for path in root.iterdir() if path.is_dir()]
+        candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        for candidate in candidates:
+            if self.collect_lidar_stream_world_cloud_paths(candidate):
+                return candidate
+        return None
+
+    def on_analyze_lidar_stream(self) -> None:
+        if self.lidar_stream_capture_thread is not None and self.lidar_stream_capture_thread.is_alive():
+            self.lidar_stream_analysis_status_var.set("Lidar Analysis: stop lidar capture before analyzing")
+            return
+        stream_dir = self.lidar_stream_capture_dir
+        if stream_dir is None or not Path(stream_dir).exists():
+            stream_dir = self.find_latest_lidar_stream_capture_dir()
+        if stream_dir is None:
+            self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: no folders under {self.lidar_stream_capture_root_path()}")
+            return
+        self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: rebuilding -> {stream_dir}")
+
+        def worker() -> None:
+            result = self.safe("Analyze Lidar", lambda: self.rebuild_lidar_stream_reconstruction(Path(stream_dir)))
+            if isinstance(result, dict):
+                self.root.after(0, lambda r=result: self.apply_lidar_stream_analysis_result(r))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_lidar_stream_analysis_result(self, result: Dict[str, Any]) -> None:
+        stream_dir = result.get("stream_dir", "")
+        merged_count = int(result.get("merged_point_count", 0) or 0)
+        frame_count = int(result.get("source_frame_count", 0) or 0)
+        self.lidar_stream_last_reconstruction = result
+        ply_path = result.get("merged_point_cloud_world_standard_m_ply_path", result.get("merged_point_cloud_world_ply_path", ""))
+        self.lidar_stream_analysis_status_var.set(
+            f"Lidar Analysis: frames={frame_count}, merged={merged_count}, units=m -> {ply_path}"
+        )
+        if stream_dir:
+            self.stream_player_dir = Path(stream_dir)
+            self.stream_player_image_mode_var.set("point_cloud_preview")
+        self.status_var.set(f"Lidar analysis complete: {merged_count} points")
 
     def apply_stream_capture_result(self, result: Dict[str, Any], frame_count: int, stream_dir: Path) -> None:
         self.latest_state.setdefault("last_stream_capture", result)
@@ -602,6 +1179,8 @@ class FlightControlMixin:
         mode = str(self.stream_player_image_mode_var.get() or "rgb").strip().lower()
         if mode == "depth_preview":
             return "depth_preview_path", "depth_preview.png"
+        if mode == "point_cloud_preview":
+            return "point_cloud_preview_path", "point_cloud_preview.png"
         return "rgb_path", "rgb.png"
 
     def collect_stream_player_frames(self, stream_dir: Path) -> Tuple[List[Path], float]:
@@ -674,10 +1253,10 @@ class FlightControlMixin:
             self.start_stream_player()
 
     def find_latest_stream_capture_dir(self) -> Optional[Path]:
-        root = self.stream_capture_root_path()
-        if not root.exists():
-            return None
-        candidates = [path for path in root.iterdir() if path.is_dir()]
+        candidates: List[Path] = []
+        for root in (self.stream_capture_root_path(), self.lidar_stream_capture_root_path()):
+            if root.exists():
+                candidates.extend(path for path in root.iterdir() if path.is_dir())
         candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
         for candidate in candidates:
             frames, _interval_s = self.collect_stream_player_frames(candidate)
@@ -706,9 +1285,9 @@ class FlightControlMixin:
         mode_combo = ttk.Combobox(
             toolbar,
             textvariable=self.stream_player_image_mode_var,
-            values=("rgb", "depth_preview"),
+            values=("rgb", "depth_preview", "point_cloud_preview"),
             state="readonly",
-            width=13,
+            width=20,
         )
         mode_combo.pack(side="left", padx=(0, 6))
         mode_combo.bind("<<ComboboxSelected>>", lambda _event: self.reload_stream_player_mode())
@@ -721,6 +1300,8 @@ class FlightControlMixin:
             self.load_stream_player_dir(self.stream_player_dir, autoplay=False)
         elif self.stream_capture_dir is not None:
             self.load_stream_player_dir(self.stream_capture_dir, autoplay=False)
+        elif self.lidar_stream_capture_dir is not None:
+            self.load_stream_player_dir(self.lidar_stream_capture_dir, autoplay=False)
 
     def close_stream_player_window(self) -> None:
         self.stop_stream_player()
@@ -741,7 +1322,9 @@ class FlightControlMixin:
         self.open_stream_player_window()
         latest_dir = self.find_latest_stream_capture_dir()
         if latest_dir is None:
-            self.stream_player_status_var.set(f"Stream Player: no stream folders under {self.stream_capture_root_path()}")
+            self.stream_player_status_var.set(
+                f"Stream Player: no stream folders under {self.stream_capture_root_path()} or {self.lidar_stream_capture_root_path()}"
+            )
             return
         self.load_stream_player_dir(latest_dir, autoplay=autoplay)
 

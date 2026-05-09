@@ -3,11 +3,12 @@ from __future__ import annotations
 from .common import *
 from .analysis_control import AnalysisControlMixin
 from .flight_control import FlightControlMixin
+from .lidar_analysis_control import LidarAnalysisControlMixin
 from .map_control import MapControlMixin
 from .route_control import RouteControlMixin
 
 
-class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin, AnalysisControlMixin):
+class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin, AnalysisControlMixin, LidarAnalysisControlMixin):
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.session: Optional[flight.DroneFlightSession] = None
@@ -18,10 +19,18 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.state_refresh_inflight = False
         self.preview_refresh_inflight = False
         self.temp_capture_inflight = False
+        self.temp_capture_lidar_inflight = False
         self.stream_capture_thread: Optional[threading.Thread] = None
         self.stream_capture_stop_event = threading.Event()
         self.stream_capture_dir: Optional[Path] = None
         self.stream_capture_trajectory: List[Dict[str, Any]] = []
+        self.lidar_stream_capture_thread: Optional[threading.Thread] = None
+        self.lidar_stream_capture_stop_event = threading.Event()
+        self.lidar_stream_capture_dir: Optional[Path] = None
+        self.lidar_stream_capture_trajectory: List[Dict[str, Any]] = []
+        self.lidar_stream_reconstruction_cloud: Optional[np.ndarray] = None
+        self.lidar_stream_source_point_count = 0
+        self.lidar_stream_last_reconstruction: Dict[str, Any] = {}
         self.sequence_thread: Optional[threading.Thread] = None
         self.sequence_stop_event = threading.Event()
         self.route_thread: Optional[threading.Thread] = None
@@ -83,11 +92,19 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.rgb_source_order_var = tk.StringVar(
             value=str(getattr(args, "rgb_source_order", flight.DEFAULT_RGB_SOURCE_ORDER) or flight.DEFAULT_RGB_SOURCE_ORDER)
         )
+        self.lidar_depth_min_cm_var = tk.StringVar(
+            value=str(getattr(args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM))
+        )
+        self.lidar_depth_max_cm_var = tk.StringVar(
+            value=str(getattr(args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM))
+        )
         self.stream_task_title_var = tk.StringVar(value="stream_task")
         self.stream_interval_s_var = tk.StringVar(
             value=str(getattr(args, "stream_interval_s", flight.DEFAULT_STREAM_CAPTURE_INTERVAL_S))
         )
         self.stream_status_var = tk.StringVar(value="Stream Capture: idle")
+        self.lidar_stream_status_var = tk.StringVar(value="Lidar Stream: idle")
+        self.lidar_stream_analysis_status_var = tk.StringVar(value="Lidar Analysis: idle")
         self.stream_player_status_var = tk.StringVar(value="Stream Player: idle")
         self.stream_player_image_mode_var = tk.StringVar(value="rgb")
         self.stream_analysis_status_var = tk.StringVar(value="Analysis: idle")
@@ -125,6 +142,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.stream_player_window: Optional[tk.Toplevel] = None
         self.stream_player_label: Optional[tk.Label] = None
         self.stream_player_photo: Optional[ImageTk.PhotoImage] = None
+        self.stream_task_entry: Optional[tk.Entry] = None
         self.stream_player_frames: List[Path] = []
         self.stream_player_index = 0
         self.stream_player_after_id: Optional[str] = None
@@ -146,6 +164,29 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.stream_analysis_pose_cache: Dict[str, Dict[str, Any]] = {}
         self.stream_analysis_live_after_id: Optional[str] = None
         self.stream_analysis_current_row: Optional[Dict[str, Any]] = None
+        self.lidar_analysis_window: Optional[tk.Toplevel] = None
+        self.lidar_analysis_stream_dir_var = tk.StringVar(value="")
+        self.lidar_analysis_mode_var = tk.StringVar(value="Cumulative")
+        self.lidar_analysis_max_points_var = tk.StringVar(value="60000")
+        self.lidar_analysis_color_mode_var = tk.StringVar(value="RGB")
+        self.lidar_analysis_point_size_var = tk.StringVar(value="1.0")
+        self.lidar_analysis_view_preset_var = tk.StringVar(value="Perspective")
+        self.lidar_analysis_rows: List[Dict[str, Any]] = []
+        self.lidar_analysis_listbox: Optional[tk.Listbox] = None
+        self.lidar_analysis_summary_text: Optional[tk.Text] = None
+        self.lidar_analysis_json_text: Optional[tk.Text] = None
+        self.lidar_analysis_fig: Any = None
+        self.lidar_analysis_ax: Any = None
+        self.lidar_analysis_canvas: Any = None
+        self.lidar_analysis_toolbar: Any = None
+        self.lidar_analysis_after_id: Optional[str] = None
+        self.lidar_analysis_playing = False
+        self.lidar_analysis_index = 0
+        self.lidar_analysis_cached_index = -1
+        self.lidar_analysis_cached_cloud: Optional[np.ndarray] = None
+        self.lidar_analysis_rebuild_thread: Optional[threading.Thread] = None
+        self.lidar_analysis_export_thread: Optional[threading.Thread] = None
+        self.lidar_analysis_open3d_thread: Optional[threading.Thread] = None
         self.map_window: Optional[tk.Toplevel] = None
         self.map_widget: Optional[OverheadMapWidget] = None
         self.map_refresh_inflight = False
@@ -321,6 +362,8 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Label(keyboard_row, text="Key ms").pack(side="left", padx=(12, 2))
         tk.Entry(keyboard_row, textvariable=self.keyboard_interval_ms_var, width=6).pack(side="left", padx=(0, 12))
         tk.Button(keyboard_row, text="Focus Keys", command=self.focus_keyboard_control).pack(side="left", padx=(0, 12))
+        tk.Button(keyboard_row, text="Stream Start (,)", command=self.on_start_stream_capture).pack(side="left", padx=(0, 6))
+        tk.Button(keyboard_row, text="Stream Stop (.)", command=self.on_stop_stream_capture).pack(side="left", padx=(0, 12))
         tk.Label(keyboard_row, textvariable=self.keyboard_status_var, anchor="w").pack(
             side="left", fill="x", expand=True, padx=6
         )
@@ -358,6 +401,11 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Button(preview, text="Refresh RGB", command=self.refresh_preview_window).pack(side="left", padx=6, pady=6)
         tk.Button(preview, text="Save Frame", command=self.on_save_frame).pack(side="left", padx=6, pady=6)
         tk.Button(preview, text="Temp Capture", command=self.on_temp_capture).pack(side="left", padx=6, pady=6)
+        tk.Button(preview, text="Temp Capture Lidar", command=self.on_temp_capture_lidar).pack(side="left", padx=6, pady=6)
+        tk.Label(preview, text="Lidar cm").pack(side="left", padx=(8, 2), pady=6)
+        tk.Entry(preview, textvariable=self.lidar_depth_min_cm_var, width=6).pack(side="left", padx=(0, 2), pady=6)
+        tk.Label(preview, text="-").pack(side="left", padx=(0, 2), pady=6)
+        tk.Entry(preview, textvariable=self.lidar_depth_max_cm_var, width=6).pack(side="left", padx=(0, 6), pady=6)
         tk.Checkbutton(preview, text="Auto RGB", variable=self.auto_rgb_var).pack(side="left", padx=6, pady=6)
         tk.Checkbutton(preview, text="Enhance RGB", variable=self.enhance_rgb_var).pack(side="left", padx=6, pady=6)
         tk.Label(preview, text="RGB Source").pack(side="left", padx=(12, 2), pady=6)
@@ -375,16 +423,27 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         stream.grid_columnconfigure(1, weight=1)
         stream.grid_columnconfigure(7, weight=1)
         tk.Label(stream, text="Task").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        tk.Entry(stream, textvariable=self.stream_task_title_var).grid(row=0, column=1, sticky="ew", padx=6, pady=6)
-        tk.Label(stream, text="Interval s").grid(row=0, column=2, sticky="w", padx=(12, 2), pady=6)
-        tk.Entry(stream, textvariable=self.stream_interval_s_var, width=7).grid(row=0, column=3, sticky="w", padx=(0, 8), pady=6)
-        tk.Button(stream, text="Start Timed Capture", command=self.on_start_stream_capture).grid(row=0, column=4, padx=6, pady=6)
-        tk.Button(stream, text="Stop Timed Capture", command=self.on_stop_stream_capture).grid(row=0, column=5, padx=6, pady=6)
-        tk.Label(stream, textvariable=self.stream_status_var, anchor="w").grid(row=0, column=6, columnspan=2, sticky="ew", padx=6, pady=6)
-        tk.Button(stream, text="Open Player", command=self.open_stream_player_window).grid(row=1, column=0, padx=6, pady=(0, 6))
-        tk.Button(stream, text="Play Latest", command=self.play_latest_stream_capture).grid(row=1, column=1, sticky="w", padx=6, pady=(0, 6))
-        tk.Button(stream, text="Analyze Stream", command=self.open_stream_analysis_window).grid(row=1, column=2, sticky="w", padx=6, pady=(0, 6))
-        tk.Label(stream, textvariable=self.stream_player_status_var, anchor="w").grid(row=1, column=3, columnspan=5, sticky="ew", padx=6, pady=(0, 6))
+        self.stream_task_entry = tk.Entry(
+            stream,
+            textvariable=self.stream_task_title_var,
+            readonlybackground="#f0f0f0",
+        )
+        self.stream_task_entry.grid(row=0, column=1, columnspan=3, sticky="ew", padx=6, pady=6)
+        tk.Label(stream, text="Interval s").grid(row=0, column=4, sticky="w", padx=(12, 2), pady=6)
+        tk.Entry(stream, textvariable=self.stream_interval_s_var, width=7).grid(row=0, column=5, sticky="w", padx=(0, 8), pady=6)
+        tk.Button(stream, text="Start Timed Capture", command=self.on_start_stream_capture).grid(row=1, column=0, padx=6, pady=(0, 6))
+        tk.Button(stream, text="Stop Timed Capture", command=self.on_stop_stream_capture).grid(row=1, column=1, sticky="w", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Open Player", command=self.open_stream_player_window).grid(row=1, column=2, sticky="w", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Play Latest", command=self.play_latest_stream_capture).grid(row=1, column=3, sticky="w", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Analyze Stream", command=self.open_stream_analysis_window).grid(row=1, column=4, sticky="w", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Start Lidar Capture", command=self.on_start_lidar_stream_capture).grid(row=2, column=0, padx=6, pady=(0, 6))
+        tk.Button(stream, text="Stop Lidar Capture", command=self.on_stop_lidar_stream_capture).grid(row=2, column=1, sticky="w", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Analyze Lidar", command=self.open_lidar_analysis_window).grid(row=2, column=2, sticky="w", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Export Open3D", command=self.export_lidar_analysis_open3d).grid(row=2, column=3, sticky="w", padx=6, pady=(0, 6))
+        tk.Label(stream, textvariable=self.stream_status_var, anchor="w").grid(row=3, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
+        tk.Label(stream, textvariable=self.lidar_stream_status_var, anchor="w").grid(row=4, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
+        tk.Label(stream, textvariable=self.lidar_stream_analysis_status_var, anchor="w").grid(row=5, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
+        tk.Label(stream, textvariable=self.stream_player_status_var, anchor="w").grid(row=6, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 6))
 
         map_frame = tk.LabelFrame(outer, text="Map")
         map_frame.grid(row=7, column=0, sticky="ew", padx=8, pady=4)
@@ -516,6 +575,15 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
             return alias
         return None
 
+    def _stream_capture_action_from_event(self, event: tk.Event) -> Optional[str]:
+        char = str(getattr(event, "char", "") or "")
+        keysym = str(getattr(event, "keysym", "") or "").lower()
+        if char in {",", "，"} or keysym == "comma":
+            return "start"
+        if char in {".", "。"} or keysym == "period":
+            return "stop"
+        return None
+
     def should_capture_movement_key(self, event: tk.Event, symbol: str) -> bool:
         if not self._event_widget_accepts_text(event):
             return True
@@ -535,6 +603,14 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.update_keyboard_status("ready")
 
     def _on_keyboard_press(self, event: tk.Event):
+        stream_action = self._stream_capture_action_from_event(event)
+        if stream_action is not None and not self._event_widget_accepts_text(event):
+            if stream_action == "start":
+                self.on_start_stream_capture()
+            else:
+                self.on_stop_stream_capture()
+            return "break"
+
         symbol = self._movement_symbol_from_event(event)
         if symbol is None:
             return None
@@ -585,6 +661,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         env_bin = self.env_bin_var.get().strip() or None
         output_dir = self.output_dir_var.get().strip() or "results/drone_flight_controller"
         initial_pos = self.parse_float_list(self.initial_pose_var.get().strip())
+        lidar_min_cm, lidar_max_cm = self.parse_lidar_depth_range()
         return flight.default_session_args(
             env_platform=self.env_platform_var.get().strip() or "auto",
             env_root=env_root,
@@ -607,10 +684,15 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
             rgb_enhance_gain=float(self.args.rgb_enhance_gain),
             rgb_source_order=self.rgb_source_order_var.get().strip() or flight.DEFAULT_RGB_SOURCE_ORDER,
             temp_capture_dir=str(getattr(self.args, "temp_capture_dir", flight.DEFAULT_TEMP_CAPTURE_DIR)),
+            temp_capture_lidar_dir=str(getattr(self.args, "temp_capture_lidar_dir", flight.DEFAULT_TEMP_CAPTURE_LIDAR_DIR)),
             stream_capture_dir=str(getattr(self.args, "stream_capture_dir", flight.DEFAULT_STREAM_CAPTURE_DIR)),
+            stream_capture_lidar_dir=str(getattr(self.args, "stream_capture_lidar_dir", flight.DEFAULT_STREAM_CAPTURE_LIDAR_DIR)),
             stream_interval_s=self.parse_stream_interval_s(),
             depth_min_cm=float(getattr(self.args, "depth_min_cm", flight.DEFAULT_DEPTH_MIN_CM)),
             depth_max_cm=float(getattr(self.args, "depth_max_cm", flight.DEFAULT_DEPTH_MAX_CM)),
+            lidar_depth_min_cm=lidar_min_cm,
+            lidar_depth_max_cm=lidar_max_cm,
+            lidar_depth_projection=str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
             force_kill_unreal_on_stop=bool(self.args.force_kill_unreal_on_stop),
             log_level=self.args.log_level,
         )
@@ -727,7 +809,9 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.stop_keyboard_control(send_hold=False)
         self.stop_stream_player()
         self.stop_stream_analysis()
+        self.close_lidar_analysis_window()
         self.stream_capture_stop_event.set()
+        self.lidar_stream_capture_stop_event.set()
         self.sequence_stop_event.set()
         self.route_stop_event.set()
         session = self.session

@@ -1,0 +1,1381 @@
+from __future__ import annotations
+
+from .common import *
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return str(value)
+
+
+class LidarAnalysisControlMixin:
+    def ensure_lidar_analysis_state(self) -> None:
+        if not hasattr(self, "lidar_analysis_window"):
+            self.lidar_analysis_window = None
+        if not hasattr(self, "lidar_analysis_stream_dir_var"):
+            self.lidar_analysis_stream_dir_var = tk.StringVar(value="")
+        if not hasattr(self, "lidar_analysis_mode_var"):
+            self.lidar_analysis_mode_var = tk.StringVar(value="Cumulative")
+        if not hasattr(self, "lidar_analysis_max_points_var"):
+            self.lidar_analysis_max_points_var = tk.StringVar(value="60000")
+        if not hasattr(self, "lidar_analysis_color_mode_var"):
+            self.lidar_analysis_color_mode_var = tk.StringVar(value="RGB")
+        if not hasattr(self, "lidar_analysis_point_size_var"):
+            self.lidar_analysis_point_size_var = tk.StringVar(value="1.0")
+        if not hasattr(self, "lidar_analysis_view_preset_var"):
+            self.lidar_analysis_view_preset_var = tk.StringVar(value="Perspective")
+        if not hasattr(self, "lidar_analysis_rows"):
+            self.lidar_analysis_rows = []
+        if not hasattr(self, "lidar_analysis_listbox"):
+            self.lidar_analysis_listbox = None
+        if not hasattr(self, "lidar_analysis_summary_text"):
+            self.lidar_analysis_summary_text = None
+        if not hasattr(self, "lidar_analysis_json_text"):
+            self.lidar_analysis_json_text = None
+        if not hasattr(self, "lidar_analysis_fig"):
+            self.lidar_analysis_fig = None
+        if not hasattr(self, "lidar_analysis_ax"):
+            self.lidar_analysis_ax = None
+        if not hasattr(self, "lidar_analysis_canvas"):
+            self.lidar_analysis_canvas = None
+        if not hasattr(self, "lidar_analysis_toolbar"):
+            self.lidar_analysis_toolbar = None
+        if not hasattr(self, "lidar_analysis_after_id"):
+            self.lidar_analysis_after_id = None
+        if not hasattr(self, "lidar_analysis_playing"):
+            self.lidar_analysis_playing = False
+        if not hasattr(self, "lidar_analysis_index"):
+            self.lidar_analysis_index = 0
+        if not hasattr(self, "lidar_analysis_cached_index"):
+            self.lidar_analysis_cached_index = -1
+        if not hasattr(self, "lidar_analysis_cached_cloud"):
+            self.lidar_analysis_cached_cloud = None
+        if not hasattr(self, "lidar_analysis_rebuild_thread"):
+            self.lidar_analysis_rebuild_thread = None
+        if not hasattr(self, "lidar_analysis_export_thread"):
+            self.lidar_analysis_export_thread = None
+        if not hasattr(self, "lidar_analysis_open3d_thread"):
+            self.lidar_analysis_open3d_thread = None
+
+    def open_lidar_analysis_window(self) -> None:
+        self.ensure_lidar_analysis_state()
+        if self.lidar_analysis_window is not None and self.lidar_analysis_window.winfo_exists():
+            self.lidar_analysis_window.lift()
+            return
+
+        if not self.lidar_analysis_stream_dir_var.get().strip():
+            default_dir = self.lidar_stream_capture_dir or self.find_latest_lidar_stream_capture_dir()
+            if default_dir is not None:
+                self.lidar_analysis_stream_dir_var.set(str(default_dir))
+
+        self.lidar_analysis_window = tk.Toplevel(self.root)
+        self.lidar_analysis_window.title("Lidar Stream Analysis")
+        self.lidar_analysis_window.geometry("1320x860")
+        self.lidar_analysis_window.protocol("WM_DELETE_WINDOW", self.close_lidar_analysis_window)
+        self.lidar_analysis_window.grid_columnconfigure(0, weight=1)
+        self.lidar_analysis_window.grid_rowconfigure(2, weight=1)
+
+        top = tk.Frame(self.lidar_analysis_window)
+        top.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        top.grid_columnconfigure(1, weight=1)
+        tk.Label(top, text="Lidar Folder").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=3)
+        tk.Entry(top, textvariable=self.lidar_analysis_stream_dir_var).grid(row=0, column=1, sticky="ew", padx=4, pady=3)
+        tk.Button(top, text="Browse", command=self.select_lidar_analysis_folder).grid(row=0, column=2, padx=4, pady=3)
+        tk.Button(top, text="Latest", command=self.use_latest_lidar_analysis_folder).grid(row=0, column=3, padx=4, pady=3)
+        tk.Button(top, text="Load Frames", command=self.load_lidar_analysis_frames).grid(row=0, column=4, padx=4, pady=3)
+
+        controls = tk.Frame(self.lidar_analysis_window)
+        controls.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        controls.grid_columnconfigure(18, weight=1)
+        tk.Label(controls, text="Mode").grid(row=0, column=0, padx=(0, 3), pady=3)
+        mode_combo = ttk.Combobox(
+            controls,
+            textvariable=self.lidar_analysis_mode_var,
+            values=("Cumulative", "Current Frame"),
+            state="readonly",
+            width=15,
+        )
+        mode_combo.grid(row=0, column=1, padx=(0, 8), pady=3)
+        mode_combo.bind("<<ComboboxSelected>>", lambda _event: self.reload_lidar_analysis_mode())
+        tk.Label(controls, text="Max Display Points").grid(row=0, column=2, padx=(0, 3), pady=3)
+        tk.Entry(controls, textvariable=self.lidar_analysis_max_points_var, width=9).grid(row=0, column=3, padx=(0, 8), pady=3)
+        tk.Label(controls, text="Color Mode").grid(row=0, column=4, padx=(0, 3), pady=3)
+        color_combo = ttk.Combobox(
+            controls,
+            textvariable=self.lidar_analysis_color_mode_var,
+            values=("RGB", "Height", "Depth"),
+            state="readonly",
+            width=9,
+        )
+        color_combo.grid(row=0, column=5, padx=(0, 8), pady=3)
+        color_combo.bind("<<ComboboxSelected>>", lambda _event: self.reload_lidar_analysis_view())
+        tk.Label(controls, text="Point Size").grid(row=0, column=6, padx=(0, 3), pady=3)
+        tk.Entry(controls, textvariable=self.lidar_analysis_point_size_var, width=6).grid(row=0, column=7, padx=(0, 8), pady=3)
+        tk.Label(controls, text="View").grid(row=0, column=8, padx=(0, 3), pady=3)
+        view_combo = ttk.Combobox(
+            controls,
+            textvariable=self.lidar_analysis_view_preset_var,
+            values=("Perspective", "Top", "Front", "Side"),
+            state="readonly",
+            width=12,
+        )
+        view_combo.grid(row=0, column=9, padx=(0, 8), pady=3)
+        view_combo.bind("<<ComboboxSelected>>", lambda _event: self.reload_lidar_analysis_view())
+        tk.Button(controls, text="Reset View", command=self.reset_lidar_analysis_view).grid(row=0, column=10, padx=4, pady=3)
+        tk.Button(controls, text="Export RViz", command=self.export_lidar_analysis_rviz).grid(row=0, column=11, padx=4, pady=3)
+        tk.Button(controls, text="Export Open3D", command=self.export_lidar_analysis_open3d).grid(row=0, column=12, padx=4, pady=3)
+        tk.Button(controls, text="Open3D Viewer", command=self.open_lidar_analysis_open3d_viewer).grid(row=0, column=13, padx=4, pady=3)
+        tk.Button(controls, text="Rebuild", command=self.rebuild_lidar_analysis_window).grid(row=0, column=14, padx=4, pady=3)
+        tk.Button(controls, text="Prev", command=self.show_lidar_analysis_prev).grid(row=0, column=15, padx=4, pady=3)
+        tk.Button(controls, text="Play/Pause", command=self.toggle_lidar_analysis_playback).grid(row=0, column=16, padx=4, pady=3)
+        tk.Button(controls, text="Stop", command=self.stop_lidar_analysis_playback).grid(row=0, column=17, padx=4, pady=3)
+        tk.Button(controls, text="Next", command=self.show_lidar_analysis_next).grid(row=0, column=18, padx=4, pady=3)
+
+        body = tk.PanedWindow(self.lidar_analysis_window, orient="horizontal", sashrelief="raised")
+        body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+
+        left = tk.Frame(body)
+        left.grid_rowconfigure(0, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+        self.lidar_analysis_listbox = tk.Listbox(left, width=52, exportselection=False)
+        list_scroll = tk.Scrollbar(left, orient="vertical", command=self.lidar_analysis_listbox.yview)
+        self.lidar_analysis_listbox.configure(yscrollcommand=list_scroll.set)
+        self.lidar_analysis_listbox.grid(row=0, column=0, sticky="nsew")
+        list_scroll.grid(row=0, column=1, sticky="ns")
+        self.lidar_analysis_listbox.bind("<<ListboxSelect>>", self.on_lidar_analysis_frame_selected)
+        body.add(left, minsize=380)
+
+        right = tk.Frame(body)
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(0, weight=1)
+        right.grid_rowconfigure(1, weight=0)
+        right.grid_rowconfigure(2, weight=1)
+
+        plot_frame = tk.Frame(right)
+        plot_frame.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=(0, 8))
+        plot_frame.grid_rowconfigure(0, weight=1)
+        plot_frame.grid_columnconfigure(0, weight=1)
+        self.build_lidar_analysis_plot(plot_frame)
+
+        self.lidar_analysis_summary_text = tk.Text(right, height=7, wrap="word")
+        self.lidar_analysis_summary_text.grid(row=1, column=0, sticky="ew", padx=(8, 0), pady=(0, 8))
+        json_frame = tk.Frame(right)
+        json_frame.grid(row=2, column=0, sticky="nsew", padx=(8, 0))
+        json_frame.grid_rowconfigure(0, weight=1)
+        json_frame.grid_columnconfigure(0, weight=1)
+        self.lidar_analysis_json_text = tk.Text(json_frame, height=12, wrap="none")
+        json_scroll = tk.Scrollbar(json_frame, orient="vertical", command=self.lidar_analysis_json_text.yview)
+        self.lidar_analysis_json_text.configure(yscrollcommand=json_scroll.set)
+        self.lidar_analysis_json_text.grid(row=0, column=0, sticky="nsew")
+        json_scroll.grid(row=0, column=1, sticky="ns")
+        body.add(right, minsize=820)
+
+        tk.Label(self.lidar_analysis_window, textvariable=self.lidar_stream_analysis_status_var, anchor="w").grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            padx=8,
+            pady=(0, 8),
+        )
+
+        if self.lidar_analysis_stream_dir_var.get().strip():
+            self.load_lidar_analysis_frames()
+
+    def close_lidar_analysis_window(self) -> None:
+        self.stop_lidar_analysis_playback()
+        if getattr(self, "lidar_analysis_window", None) is not None and self.lidar_analysis_window.winfo_exists():
+            self.lidar_analysis_window.destroy()
+        self.lidar_analysis_window = None
+        self.lidar_analysis_listbox = None
+        self.lidar_analysis_summary_text = None
+        self.lidar_analysis_json_text = None
+        self.lidar_analysis_fig = None
+        self.lidar_analysis_ax = None
+        self.lidar_analysis_canvas = None
+        self.lidar_analysis_toolbar = None
+
+    def build_lidar_analysis_plot(self, parent: tk.Widget) -> None:
+        try:
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+            from matplotlib.figure import Figure
+            from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+        except Exception as exc:
+            tk.Label(parent, text=f"Matplotlib 3D view unavailable: {exc}", anchor="center").grid(row=0, column=0, sticky="nsew")
+            self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: matplotlib unavailable: {exc}")
+            return
+
+        fig = Figure(figsize=(8.4, 5.8), dpi=100)
+        ax = fig.add_subplot(111, projection="3d")
+        canvas = FigureCanvasTkAgg(fig, master=parent)
+        widget = canvas.get_tk_widget()
+        widget.grid(row=0, column=0, sticky="nsew")
+        toolbar_frame = tk.Frame(parent)
+        toolbar_frame.grid(row=1, column=0, sticky="ew")
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame, pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(side="left", fill="x", expand=True)
+        self.lidar_analysis_fig = fig
+        self.lidar_analysis_ax = ax
+        self.lidar_analysis_canvas = canvas
+        self.lidar_analysis_toolbar = toolbar
+        self.plot_lidar_analysis_cloud(np.zeros((0, 6), dtype=np.float32), title="Load a stream_capture_lidar folder.")
+
+    def select_lidar_analysis_folder(self) -> None:
+        initial_dir = self.lidar_stream_capture_root_path()
+        selected = filedialog.askdirectory(title="Select stream_capture_lidar task folder", initialdir=str(initial_dir))
+        if selected:
+            self.lidar_analysis_stream_dir_var.set(str(Path(selected)))
+            self.load_lidar_analysis_frames()
+
+    def use_latest_lidar_analysis_folder(self) -> None:
+        latest_dir = self.find_latest_lidar_stream_capture_dir()
+        if latest_dir is None:
+            self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: no lidar stream folders under {self.lidar_stream_capture_root_path()}")
+            return
+        self.lidar_analysis_stream_dir_var.set(str(latest_dir))
+        self.load_lidar_analysis_frames()
+
+    def resolve_lidar_analysis_path(self, stream_dir: Path, raw_path: Any) -> Path:
+        raw = str(raw_path or "").strip()
+        if not raw:
+            return Path()
+        path = Path(raw)
+        if path.is_absolute():
+            return path
+        return (stream_dir / path).resolve()
+
+    def read_lidar_analysis_json(self, path: Path) -> Dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    def lidar_analysis_frame_from_dir(
+        self,
+        stream_dir: Path,
+        capture_dir: Path,
+        *,
+        trajectory_entry: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        entry = trajectory_entry if isinstance(trajectory_entry, dict) else {}
+        frame_name = capture_dir.name
+        frame_index = int(entry.get("frame_index") or self.parse_lidar_analysis_frame_index(frame_name) or 0)
+        capture_path = capture_dir / "capture.json"
+        pose_path = capture_dir / "pose.json"
+        capture_payload = self.read_lidar_analysis_json(capture_path)
+        pose_payload = self.read_lidar_analysis_json(pose_path)
+        combined_payload = dict(capture_payload)
+        combined_payload.update(entry)
+
+        ensured = flight.ensure_standard_world_cloud_for_capture(
+            capture_dir,
+            capture_payload=combined_payload,
+            lidar_depth_projection=str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
+            min_depth_cm=float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
+            max_depth_cm=float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+        )
+        diagnostics_path = Path(str(ensured.get("projection_diagnostics_path", capture_dir / "projection_diagnostics.json")))
+        diagnostics_payload = self.read_lidar_analysis_json(diagnostics_path)
+        raw_cloud = (
+            entry.get("point_cloud_world_standard_m_npy_path")
+            or capture_payload.get("point_cloud_world_standard_m_npy_path")
+            or ensured.get("point_cloud_world_standard_m_npy_path")
+        )
+        cloud_path = self.resolve_lidar_analysis_path(stream_dir, raw_cloud) if raw_cloud else capture_dir / "point_cloud_world_standard_m.npy"
+        if not cloud_path.exists():
+            return None
+        point_count = entry.get("point_count", capture_payload.get("point_count", 0))
+        if not point_count:
+            try:
+                point_count = int(np.load(cloud_path, mmap_mode="r").shape[0])
+            except Exception:
+                point_count = 0
+        return {
+            "frame_index": frame_index,
+            "frame_name": frame_name,
+            "capture_time": entry.get("capture_time") or capture_payload.get("capture_time", ""),
+            "capture_dir": str(capture_dir),
+            "point_cloud_world_npy_path": str(cloud_path),
+            "point_cloud_world_standard_m_npy_path": str(cloud_path),
+            "rgb_path": entry.get("rgb_path") or capture_payload.get("rgb_path", str(capture_dir / "rgb.png")),
+            "point_cloud_preview_path": entry.get("point_cloud_preview_path")
+            or capture_payload.get("point_cloud_preview_path", str(capture_dir / "point_cloud_preview.png")),
+            "pose_json_path": str(pose_path),
+            "capture_json_path": str(capture_path),
+            "projection_diagnostics_path": str(diagnostics_path),
+            "point_count": int(point_count or 0),
+            "invalid_depth_count": int(entry.get("invalid_depth_count", capture_payload.get("invalid_depth_count", 0)) or 0),
+            "depth_projection_selected": (
+                ensured.get("depth_projection_selected")
+                or diagnostics_payload.get("depth_projection_selected")
+                or entry.get("depth_projection_selected")
+                or capture_payload.get("depth_projection_selected")
+                or "plane_depth"
+            ),
+            "projection_corrected": bool(
+                ensured.get(
+                    "projection_corrected",
+                    diagnostics_payload.get(
+                        "projection_corrected",
+                        entry.get("projection_corrected", capture_payload.get("projection_corrected", True)),
+                    ),
+                )
+            ),
+            "coordinate_frame": "standard_zup",
+            "coordinate_units": "m",
+            "legacy_source_path": ensured.get("legacy_source_path", diagnostics_payload.get("legacy_source_path", "")),
+            "trajectory_entry": dict(entry),
+            "capture_payload": capture_payload,
+            "projection_diagnostics": diagnostics_payload,
+            "pose_payload": pose_payload,
+        }
+
+    def parse_lidar_analysis_frame_index(self, name: str) -> int:
+        match = re.search(r"(\d+)$", str(name or ""))
+        if not match:
+            return 0
+        try:
+            return int(match.group(1))
+        except Exception:
+            return 0
+
+    def scan_lidar_analysis_frames(self, stream_dir: str | Path) -> List[Dict[str, Any]]:
+        stream_path = Path(stream_dir).resolve()
+        rows: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        trajectory = self.read_lidar_analysis_json(stream_path / "trajectory.json")
+        entries = trajectory.get("trajectory", []) if isinstance(trajectory, dict) else []
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                raw_capture_dir = entry.get("capture_dir")
+                if raw_capture_dir:
+                    capture_dir = self.resolve_lidar_analysis_path(stream_path, raw_capture_dir)
+                elif entry.get("point_cloud_world_npy_path"):
+                    capture_dir = self.resolve_lidar_analysis_path(stream_path, entry.get("point_cloud_world_npy_path")).parent
+                else:
+                    continue
+                key = str(capture_dir.resolve())
+                if key in seen:
+                    continue
+                row = self.lidar_analysis_frame_from_dir(stream_path, capture_dir, trajectory_entry=entry)
+                if row is not None:
+                    rows.append(row)
+                    seen.add(key)
+
+        frames_root = stream_path / "frames"
+        if frames_root.exists():
+            for capture_dir in sorted(path for path in frames_root.glob("frame_*") if path.is_dir()):
+                key = str(capture_dir.resolve())
+                if key in seen:
+                    continue
+                row = self.lidar_analysis_frame_from_dir(stream_path, capture_dir)
+                if row is not None:
+                    rows.append(row)
+                    seen.add(key)
+
+        rows.sort(key=lambda item: (int(item.get("frame_index", 0)), str(item.get("frame_name", ""))))
+        cumulative_points = 0
+        for row in rows:
+            cumulative_points += int(row.get("point_count", 0) or 0)
+            row["cumulative_point_count"] = cumulative_points
+        return rows
+
+    def load_lidar_analysis_frames(self) -> None:
+        self.ensure_lidar_analysis_state()
+        stream_text = self.lidar_analysis_stream_dir_var.get().strip()
+        if not stream_text:
+            self.use_latest_lidar_analysis_folder()
+            stream_text = self.lidar_analysis_stream_dir_var.get().strip()
+        if not stream_text:
+            return
+        stream_dir = Path(stream_text)
+        try:
+            rows = self.scan_lidar_analysis_frames(stream_dir)
+        except Exception as exc:
+            self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: folder scan failed: {exc}")
+            return
+        self.lidar_analysis_rows = rows
+        self.lidar_analysis_index = 0
+        self.reset_lidar_analysis_cache()
+        self.populate_lidar_analysis_frames(rows)
+        total_points = int(rows[-1].get("cumulative_point_count", 0) or 0) if rows else 0
+        self.lidar_stream_analysis_status_var.set(
+            f"Lidar Analysis: {len(rows)} frames, standard cumulative points={total_points}, units=m -> {stream_dir}"
+        )
+        if rows and self.lidar_analysis_listbox is not None:
+            self.lidar_analysis_listbox.selection_clear(0, "end")
+            self.lidar_analysis_listbox.selection_set(0)
+            self.lidar_analysis_listbox.see(0)
+            self.show_lidar_analysis_row(0)
+        elif not rows:
+            self.plot_lidar_analysis_cloud(np.zeros((0, 6), dtype=np.float32), title="No point cloud frames found.")
+
+    def populate_lidar_analysis_frames(self, rows: List[Dict[str, Any]]) -> None:
+        if self.lidar_analysis_listbox is None:
+            return
+        self.lidar_analysis_listbox.delete(0, "end")
+        for row in rows:
+            self.lidar_analysis_listbox.insert(
+                "end",
+                (
+                    f"frame={int(row.get('frame_index', 0)):06d} "
+                    f"points={int(row.get('point_count', 0)):7d} "
+                    f"cum={int(row.get('cumulative_point_count', 0)):9d} "
+                    f"proj={row.get('depth_projection_selected', '')} "
+                    f"units={row.get('coordinate_units', 'm')} "
+                    f"{row.get('capture_time', '')}"
+                ),
+            )
+
+    def on_lidar_analysis_frame_selected(self, _event=None) -> None:
+        if self.lidar_analysis_listbox is None:
+            return
+        selection = self.lidar_analysis_listbox.curselection()
+        if not selection:
+            return
+        self.show_lidar_analysis_row(int(selection[0]))
+
+    def reload_lidar_analysis_mode(self) -> None:
+        self.reset_lidar_analysis_cache()
+        if self.lidar_analysis_rows:
+            self.show_lidar_analysis_row(self.lidar_analysis_index)
+
+    def reload_lidar_analysis_view(self) -> None:
+        if self.lidar_analysis_rows:
+            self.show_lidar_analysis_row(self.lidar_analysis_index)
+
+    def reset_lidar_analysis_view(self) -> None:
+        self.lidar_analysis_view_preset_var.set("Perspective")
+        if self.lidar_analysis_rows:
+            self.show_lidar_analysis_row(self.lidar_analysis_index)
+
+    def reset_lidar_analysis_cache(self) -> None:
+        self.lidar_analysis_cached_index = -1
+        self.lidar_analysis_cached_cloud = None
+
+    def parse_lidar_analysis_max_points(self) -> int:
+        try:
+            value = int(float(self.lidar_analysis_max_points_var.get().strip() or "60000"))
+        except Exception:
+            value = 60000
+        value = max(1000, min(500000, value))
+        self.lidar_analysis_max_points_var.set(str(value))
+        return value
+
+    def parse_lidar_analysis_point_size(self) -> float:
+        try:
+            value = float(self.lidar_analysis_point_size_var.get().strip() or "1.0")
+        except Exception:
+            value = 1.0
+        value = max(0.1, min(20.0, value))
+        self.lidar_analysis_point_size_var.set(f"{value:g}")
+        return value
+
+    def load_lidar_analysis_cloud(self, row: Dict[str, Any]) -> np.ndarray:
+        cloud_path = Path(str(row.get("point_cloud_world_npy_path", "")))
+        if not cloud_path.exists():
+            return np.zeros((0, 6), dtype=np.float32)
+        cloud = np.load(cloud_path).astype(np.float32, copy=False)
+        if cloud.ndim != 2 or cloud.shape[1] != 6:
+            return np.zeros((0, 6), dtype=np.float32)
+        return cloud
+
+    def build_lidar_analysis_cloud_for_index(self, index: int) -> np.ndarray:
+        rows = self.lidar_analysis_rows
+        if not rows:
+            return np.zeros((0, 6), dtype=np.float32)
+        index = max(0, min(index, len(rows) - 1))
+        mode = str(self.lidar_analysis_mode_var.get() or "Cumulative").strip().lower()
+        if mode == "current frame":
+            return self.load_lidar_analysis_cloud(rows[index])
+
+        cached_cloud = self.lidar_analysis_cached_cloud
+        cached_index = int(self.lidar_analysis_cached_index)
+        if cached_cloud is not None and cached_index >= 0 and cached_index <= index:
+            merged = cached_cloud
+            start_index = cached_index + 1
+        else:
+            merged = np.zeros((0, 6), dtype=np.float32)
+            start_index = 0
+
+        for row in rows[start_index : index + 1]:
+            cloud = self.load_lidar_analysis_cloud(row)
+            if cloud.shape[0] == 0:
+                continue
+            merged = cloud if merged.shape[0] == 0 else np.vstack((merged, cloud))
+            merged = flight.downsample_colored_point_cloud_voxel(
+                merged,
+                voxel_cm=flight.standard_voxel_size_m(flight.DEFAULT_LIDAR_RECON_VOXEL_CM),
+                max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
+            )
+        self.lidar_analysis_cached_index = index
+        self.lidar_analysis_cached_cloud = merged
+        return merged
+
+    def sample_lidar_analysis_display_cloud(self, cloud: np.ndarray, max_points: int) -> np.ndarray:
+        points = np.asarray(cloud, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 6 or points.shape[0] == 0:
+            return np.zeros((0, 6), dtype=np.float32)
+        finite = np.isfinite(points[:, :3]).all(axis=1)
+        if not np.all(finite):
+            points = points[finite]
+        if points.shape[0] > max_points:
+            step = int(math.ceil(points.shape[0] / max_points))
+            points = points[::step][:max_points]
+        return points
+
+    def show_lidar_analysis_row(self, index: int) -> None:
+        if not self.lidar_analysis_rows:
+            return
+        index = max(0, min(index, len(self.lidar_analysis_rows) - 1))
+        self.lidar_analysis_index = index
+        if self.lidar_analysis_listbox is not None:
+            self.lidar_analysis_listbox.selection_clear(0, "end")
+            self.lidar_analysis_listbox.selection_set(index)
+            self.lidar_analysis_listbox.see(index)
+        row = self.lidar_analysis_rows[index]
+        try:
+            cloud = self.build_lidar_analysis_cloud_for_index(index)
+            display_cloud = self.sample_lidar_analysis_display_cloud(cloud, self.parse_lidar_analysis_max_points())
+            mode = str(self.lidar_analysis_mode_var.get() or "Cumulative")
+            projection = str(row.get("depth_projection_selected", "plane_depth"))
+            title = (
+                f"{mode}: frame {int(row.get('frame_index', 0)):06d} "
+                f"display={display_cloud.shape[0]} merged={cloud.shape[0]} "
+                f"projection={projection} units=m"
+            )
+            self.plot_lidar_analysis_cloud(display_cloud, title=title)
+            self.show_lidar_analysis_summary(row, cloud.shape[0], display_cloud.shape[0])
+            self.show_lidar_analysis_json(row)
+            self.lidar_stream_analysis_status_var.set(
+                f"Lidar Analysis: frame {index + 1}/{len(self.lidar_analysis_rows)}, "
+                f"mode={mode}, projection={projection}, units=m, display={display_cloud.shape[0]}, source={cloud.shape[0]}"
+            )
+        except Exception as exc:
+            self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: render failed: {exc}")
+
+    def plot_lidar_analysis_cloud(self, cloud: np.ndarray, *, title: str) -> None:
+        ax = getattr(self, "lidar_analysis_ax", None)
+        canvas = getattr(self, "lidar_analysis_canvas", None)
+        if ax is None or canvas is None:
+            return
+        ax.clear()
+        points = np.asarray(cloud, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 6 or points.shape[0] == 0:
+            ax.set_title(title)
+            ax.text2D(0.35, 0.5, "No valid point cloud", transform=ax.transAxes)
+            ax.set_xlabel("World X (m)")
+            ax.set_ylabel("World Y (m)")
+            ax.set_zlabel("World Z (m)")
+            canvas.draw_idle()
+            return
+
+        xyz = points[:, :3]
+        color_mode = str(self.lidar_analysis_color_mode_var.get() or "RGB").strip().lower()
+        point_size = self.parse_lidar_analysis_point_size()
+        if color_mode == "height":
+            values = xyz[:, 2]
+            vmin, vmax = self.lidar_analysis_percentile_limits(values)
+            ax.scatter(
+                xyz[:, 0],
+                xyz[:, 1],
+                xyz[:, 2],
+                c=values,
+                cmap="viridis",
+                vmin=vmin,
+                vmax=vmax,
+                s=point_size,
+                depthshade=False,
+                linewidths=0,
+            )
+        elif color_mode == "depth":
+            values = np.linalg.norm(xyz - np.nanmean(xyz, axis=0), axis=1)
+            vmin, vmax = self.lidar_analysis_percentile_limits(values)
+            ax.scatter(
+                xyz[:, 0],
+                xyz[:, 1],
+                xyz[:, 2],
+                c=values,
+                cmap="turbo",
+                vmin=vmin,
+                vmax=vmax,
+                s=point_size,
+                depthshade=False,
+                linewidths=0,
+            )
+        else:
+            colors = np.clip(points[:, 3:6] / 255.0, 0.0, 1.0)
+            ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c=colors, s=point_size, depthshade=False, linewidths=0)
+        ax.set_title(title)
+        ax.set_xlabel("World X (m)")
+        ax.set_ylabel("World Y (m)")
+        ax.set_zlabel("World Z (m)")
+        self.apply_lidar_analysis_view_preset(ax)
+        self.set_lidar_analysis_equal_axes(ax, xyz)
+        canvas.draw_idle()
+
+    def lidar_analysis_percentile_limits(self, values: np.ndarray) -> Tuple[float, float]:
+        finite_values = np.asarray(values, dtype=np.float32)
+        finite_values = finite_values[np.isfinite(finite_values)]
+        if finite_values.size == 0:
+            return 0.0, 1.0
+        vmin, vmax = np.nanpercentile(finite_values, [2.0, 98.0])
+        if not math.isfinite(float(vmin)) or not math.isfinite(float(vmax)) or vmax <= vmin:
+            vmin = float(np.nanmin(finite_values))
+            vmax = float(np.nanmax(finite_values))
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        return float(vmin), float(vmax)
+
+    def apply_lidar_analysis_view_preset(self, ax: Any) -> None:
+        preset = str(self.lidar_analysis_view_preset_var.get() or "Perspective").strip().lower()
+        if preset == "top":
+            ax.view_init(elev=90, azim=-90)
+        elif preset == "front":
+            ax.view_init(elev=0, azim=-90)
+        elif preset == "side":
+            ax.view_init(elev=0, azim=0)
+        else:
+            ax.view_init(elev=24, azim=-58)
+
+    def set_lidar_analysis_equal_axes(self, ax: Any, xyz: np.ndarray) -> None:
+        mins = np.nanpercentile(xyz, 2.0, axis=0)
+        maxs = np.nanpercentile(xyz, 98.0, axis=0)
+        if not np.isfinite(mins).all() or not np.isfinite(maxs).all():
+            mins = np.nanmin(xyz, axis=0)
+            maxs = np.nanmax(xyz, axis=0)
+        ranges = np.maximum(maxs - mins, 1.0)
+        center = (mins + maxs) * 0.5
+        radius = float(np.max(ranges) * 0.55)
+        ax.set_xlim(center[0] - radius, center[0] + radius)
+        ax.set_ylim(center[1] - radius, center[1] + radius)
+        ax.set_zlim(center[2] - radius, center[2] + radius)
+
+    def show_lidar_analysis_summary(self, row: Dict[str, Any], source_count: int, display_count: int) -> None:
+        if self.lidar_analysis_summary_text is None:
+            return
+        pose_payload = row.get("pose_payload") if isinstance(row.get("pose_payload"), dict) else {}
+        pose = pose_payload.get("pose") if isinstance(pose_payload.get("pose"), dict) else {}
+        lines = [
+            f"Frame: {int(row.get('frame_index', 0)):06d} ({row.get('frame_name', '')})",
+            f"Mode: {self.lidar_analysis_mode_var.get()}",
+            f"Color mode: {self.lidar_analysis_color_mode_var.get()}",
+            f"Point size: {self.parse_lidar_analysis_point_size():g}",
+            f"View preset: {self.lidar_analysis_view_preset_var.get()}",
+            f"Projection: {row.get('depth_projection_selected', 'plane_depth')}",
+            f"Units: {row.get('coordinate_units', 'm')}",
+            f"Coordinate frame: {row.get('coordinate_frame', 'standard_zup')}",
+            f"Projection corrected: {bool(row.get('projection_corrected', True))}",
+            f"Frame points: {int(row.get('point_count', 0) or 0)}",
+            f"Raw cumulative points: {int(row.get('cumulative_point_count', 0) or 0)}",
+            f"Rendered source points: {int(source_count)}",
+            f"Displayed points: {int(display_count)}",
+            f"Invalid depth: {int(row.get('invalid_depth_count', 0) or 0)}",
+            f"Capture time: {row.get('capture_time', '')}",
+            f"Cloud: {row.get('point_cloud_world_npy_path', '')}",
+        ]
+        if row.get("legacy_source_path"):
+            lines.append(f"Legacy source: {row.get('legacy_source_path', '')}")
+        if pose:
+            lines.append(
+                "Pose: "
+                f"x={float(pose.get('x', 0.0)):.1f}, "
+                f"y={float(pose.get('y', 0.0)):.1f}, "
+                f"z={float(pose.get('z', 0.0)):.1f}, "
+                f"yaw={float(pose.get('task_yaw', pose.get('yaw', 0.0))):.1f}"
+            )
+        self.lidar_analysis_summary_text.delete("1.0", "end")
+        self.lidar_analysis_summary_text.insert("1.0", "\n".join(lines))
+
+    def show_lidar_analysis_json(self, row: Dict[str, Any]) -> None:
+        if self.lidar_analysis_json_text is None:
+            return
+        payload = {
+            "frame": row,
+            "display": {
+                "mode": self.lidar_analysis_mode_var.get(),
+                "color_mode": self.lidar_analysis_color_mode_var.get(),
+                "point_size": self.parse_lidar_analysis_point_size(),
+                "view_preset": self.lidar_analysis_view_preset_var.get(),
+                "max_display_points": self.parse_lidar_analysis_max_points(),
+            },
+        }
+        self.lidar_analysis_json_text.delete("1.0", "end")
+        self.lidar_analysis_json_text.insert("1.0", json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default))
+
+    def show_lidar_analysis_next(self) -> None:
+        if not self.lidar_analysis_rows:
+            return
+        self.show_lidar_analysis_row((self.lidar_analysis_index + 1) % len(self.lidar_analysis_rows))
+
+    def show_lidar_analysis_prev(self) -> None:
+        if not self.lidar_analysis_rows:
+            return
+        self.show_lidar_analysis_row((self.lidar_analysis_index - 1) % len(self.lidar_analysis_rows))
+
+    def toggle_lidar_analysis_playback(self) -> None:
+        if self.lidar_analysis_playing:
+            self.stop_lidar_analysis_playback()
+        else:
+            self.start_lidar_analysis_playback()
+
+    def start_lidar_analysis_playback(self) -> None:
+        if not self.lidar_analysis_rows:
+            self.load_lidar_analysis_frames()
+        if not self.lidar_analysis_rows:
+            return
+        self.lidar_analysis_playing = True
+        self.cancel_lidar_analysis_after()
+        self.lidar_analysis_after_id = self.root.after(self.lidar_analysis_interval_ms(), self.lidar_analysis_tick)
+        self.show_lidar_analysis_row(self.lidar_analysis_index)
+
+    def stop_lidar_analysis_playback(self) -> None:
+        self.lidar_analysis_playing = False
+        self.cancel_lidar_analysis_after()
+        if self.lidar_analysis_rows:
+            self.lidar_stream_analysis_status_var.set(
+                f"Lidar Analysis: paused {self.lidar_analysis_index + 1}/{len(self.lidar_analysis_rows)}"
+            )
+
+    def cancel_lidar_analysis_after(self) -> None:
+        after_id = getattr(self, "lidar_analysis_after_id", None)
+        self.lidar_analysis_after_id = None
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+
+    def lidar_analysis_tick(self) -> None:
+        self.lidar_analysis_after_id = None
+        if not self.lidar_analysis_playing:
+            return
+        if self.lidar_analysis_window is None or not self.lidar_analysis_window.winfo_exists():
+            self.stop_lidar_analysis_playback()
+            return
+        self.show_lidar_analysis_next()
+        self.lidar_analysis_after_id = self.root.after(self.lidar_analysis_interval_ms(), self.lidar_analysis_tick)
+
+    def lidar_analysis_interval_ms(self) -> int:
+        stream_text = self.lidar_analysis_stream_dir_var.get().strip()
+        interval_s = self.parse_stream_interval_s()
+        if stream_text:
+            for name in ("trajectory.json", "stream_capture_lidar.json"):
+                payload = self.read_lidar_analysis_json(Path(stream_text) / name)
+                if payload:
+                    try:
+                        interval_s = float(payload.get("interval_s", interval_s) or interval_s)
+                        break
+                    except Exception:
+                        pass
+        return int(max(80.0, interval_s * 1000.0))
+
+    def lidar_analysis_packed_rgb_float(self, colors: np.ndarray) -> np.ndarray:
+        clipped = np.clip(np.rint(colors), 0, 255).astype(np.uint32, copy=False)
+        rgb_u32 = (clipped[:, 0] << 16) | (clipped[:, 1] << 8) | clipped[:, 2]
+        return rgb_u32.astype(np.uint32, copy=False).view(np.float32)
+
+    def write_lidar_analysis_pcd(self, path: Path, point_cloud: np.ndarray) -> Dict[str, Any]:
+        points = np.asarray(point_cloud, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 6:
+            raise ValueError(f"Point cloud must be Nx6, got shape {points.shape}")
+        finite = np.isfinite(points[:, :3]).all(axis=1)
+        if not np.all(finite):
+            points = points[finite]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rgb_float = self.lidar_analysis_packed_rgb_float(points[:, 3:6]) if points.shape[0] else np.zeros((0,), dtype=np.float32)
+        payload = np.column_stack((points[:, :3], rgb_float)).astype(np.float32, copy=False)
+        header = (
+            "# .PCD v0.7 - Point Cloud Data file format\n"
+            "VERSION 0.7\n"
+            "FIELDS x y z rgb\n"
+            "SIZE 4 4 4 4\n"
+            "TYPE F F F F\n"
+            "COUNT 1 1 1 1\n"
+            f"WIDTH {payload.shape[0]}\n"
+            "HEIGHT 1\n"
+            "VIEWPOINT 0 0 0 1 0 0 0\n"
+            f"POINTS {payload.shape[0]}\n"
+            "DATA ascii\n"
+        )
+        with path.open("w", encoding="ascii", newline="\n") as handle:
+            handle.write(header)
+            if payload.size:
+                np.savetxt(handle, payload, fmt=("%.6f", "%.6f", "%.6f", "%.8e"))
+        return {"path": str(path), "point_count": int(payload.shape[0])}
+
+    def build_lidar_analysis_open3d_readme(self, status: Dict[str, Any]) -> str:
+        install_hint = (
+            "C:\\Users\\Administrator\\miniconda3\\envs\\unrealcv\\python.exe -m pip install \"open3d>=0.19.0\""
+        )
+        availability = "available" if status.get("available") else f"unavailable: {status.get('error', '')}"
+        return f"""# Open3D export for stream_capture_lidar
+
+This folder contains Open3D-generated point cloud files exported from the UAV controller lidar stream.
+
+Open3D status: {availability}
+
+Files:
+- frames/frame_000001_world_standard_m.ply and .pcd: per-frame standard Z-up world point clouds.
+- reconstruction_world_standard_m.ply and .pcd: accumulated standard Z-up world point cloud.
+- reconstruction_world_standard_m.npy: processed Nx6 point/color array.
+- open3d_viewer.py: standalone Open3D viewer script.
+- open3d_export_summary.json: export metadata.
+
+The coordinates are right-handed standard Z-up world coordinates in meters.
+
+If Open3D is missing, install it in the UnrealCV environment:
+
+```powershell
+{install_hint}
+```
+"""
+
+    def build_lidar_analysis_open3d_viewer_script(self) -> str:
+        return r'''from pathlib import Path
+
+import open3d as o3d
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+def load_clouds():
+    clouds = []
+    reconstruction = ROOT / "reconstruction_world_standard_m.ply"
+    if reconstruction.exists():
+        pcd = o3d.io.read_point_cloud(str(reconstruction))
+        if pcd.has_points():
+            clouds.append(pcd)
+    if not clouds:
+        for path in sorted((ROOT / "frames").glob("*_world_standard_m.ply"))[:8]:
+            pcd = o3d.io.read_point_cloud(str(path))
+            if pcd.has_points():
+                clouds.append(pcd)
+    return clouds
+
+
+def main():
+    geometries = load_clouds()
+    if not geometries:
+        raise SystemExit(f"No Open3D point clouds found under {ROOT}")
+    axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2.0, origin=[0.0, 0.0, 0.0])
+    o3d.visualization.draw_geometries(
+        [*geometries, axis],
+        window_name="UAV Open3D Point Cloud",
+        width=1400,
+        height=900,
+    )
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+    def build_lidar_analysis_open3d_export(
+        self,
+        stream_dir: Path,
+        rows: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        stream_path = Path(stream_dir).resolve()
+        frame_rows = list(rows) if rows is not None else self.scan_lidar_analysis_frames(stream_path)
+        if not frame_rows:
+            raise RuntimeError(f"No lidar point cloud frames found in {stream_path}")
+
+        export_dir = stream_path / "open3d_export"
+        frames_dir = export_dir / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        status = flight.open3d_status()
+        readme_path = export_dir / "README_open3d.md"
+        viewer_path = export_dir / "open3d_viewer.py"
+        summary_path = export_dir / "open3d_export_summary.json"
+        readme_path.write_text(self.build_lidar_analysis_open3d_readme(status), encoding="utf-8")
+        viewer_path.write_text(self.build_lidar_analysis_open3d_viewer_script(), encoding="utf-8")
+
+        summary: Dict[str, Any] = {
+            "export_kind": "open3d_point_cloud_export",
+            "stream_dir": str(stream_path),
+            "export_dir": str(export_dir),
+            "frames_dir": str(frames_dir),
+            "open3d": status,
+            "frame_count": len(frame_rows),
+            "source_point_count": 0,
+            "reconstruction_point_count": 0,
+            "frame_exports": [],
+            "readme_path": str(readme_path),
+            "viewer_path": str(viewer_path),
+            "coordinate_frame": "standard_zup",
+            "coordinate_units": "m",
+            "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        if not status.get("available"):
+            summary["status"] = "open3d_unavailable"
+            summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+            summary["summary_path"] = str(summary_path)
+            return summary
+
+        merged = np.zeros((0, 6), dtype=np.float32)
+        source_point_count = 0
+        frame_exports: List[Dict[str, Any]] = []
+        for row in frame_rows:
+            cloud = self.load_lidar_analysis_cloud(row)
+            source_point_count += int(cloud.shape[0])
+            frame_index = int(row.get("frame_index", len(frame_exports) + 1) or len(frame_exports) + 1)
+            frame_export = flight.save_open3d_point_cloud_outputs(
+                cloud,
+                frames_dir,
+                basename=f"frame_{frame_index:06d}_world_standard_m",
+                voxel_cm=0.0,
+                voxel_size=0.0,
+                max_points=0,
+                estimate_normals=False,
+                coordinate_units="m",
+            )
+            frame_exports.append({"frame_index": frame_index, **frame_export})
+            if cloud.shape[0]:
+                merged = cloud if merged.shape[0] == 0 else np.vstack((merged, cloud))
+                merged = flight.downsample_colored_point_cloud_voxel(
+                    merged,
+                    voxel_cm=flight.standard_voxel_size_m(flight.DEFAULT_LIDAR_RECON_VOXEL_CM),
+                    max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
+                )
+
+        reconstruction_export = flight.save_open3d_point_cloud_outputs(
+            merged,
+            export_dir,
+            basename="reconstruction_world_standard_m",
+            voxel_cm=flight.DEFAULT_OPEN3D_VOXEL_CM,
+            voxel_size=flight.standard_voxel_size_m(flight.DEFAULT_OPEN3D_VOXEL_CM),
+            max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
+            estimate_normals=True,
+            normal_radius_cm=flight.DEFAULT_OPEN3D_NORMAL_RADIUS_CM,
+            normal_radius=flight.DEFAULT_OPEN3D_NORMAL_RADIUS_CM / 100.0,
+            coordinate_units="m",
+        )
+        summary.update(
+            {
+                "status": "ok",
+                "source_point_count": int(source_point_count),
+                "reconstruction_point_count": int(reconstruction_export.get("processed_point_count", 0) or 0),
+                "frame_exports": frame_exports,
+                "reconstruction": reconstruction_export,
+                "reconstruction_world_standard_m_ply_path": reconstruction_export.get("ply_path", ""),
+                "reconstruction_world_standard_m_pcd_path": reconstruction_export.get("pcd_path", ""),
+                "reconstruction_world_standard_m_npy_path": reconstruction_export.get("npy_path", ""),
+                "reconstruction_world_ply_path": reconstruction_export.get("ply_path", ""),
+                "reconstruction_world_pcd_path": reconstruction_export.get("pcd_path", ""),
+                "reconstruction_world_npy_path": reconstruction_export.get("npy_path", ""),
+            }
+        )
+        summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+        summary["summary_path"] = str(summary_path)
+        return summary
+
+    def export_lidar_analysis_open3d(self) -> None:
+        self.ensure_lidar_analysis_state()
+        if self.lidar_analysis_open3d_thread is not None and self.lidar_analysis_open3d_thread.is_alive():
+            self.lidar_stream_analysis_status_var.set("Lidar Analysis: Open3D export already running")
+            return
+        stream_text = self.lidar_analysis_stream_dir_var.get().strip()
+        if not stream_text:
+            latest = self.lidar_stream_capture_dir or self.find_latest_lidar_stream_capture_dir()
+            if latest is not None:
+                self.lidar_analysis_stream_dir_var.set(str(latest))
+                stream_text = str(latest)
+        if not stream_text:
+            self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: no folders under {self.lidar_stream_capture_root_path()}")
+            return
+        stream_dir = Path(stream_text)
+        rows = list(self.lidar_analysis_rows)
+        if not rows:
+            try:
+                rows = self.scan_lidar_analysis_frames(stream_dir)
+            except Exception as exc:
+                self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: scan before Open3D export failed: {exc}")
+                return
+        self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: exporting Open3D files -> {stream_dir / 'open3d_export'}")
+
+        def worker() -> None:
+            result = self.safe("Export Open3D", lambda: self.build_lidar_analysis_open3d_export(stream_dir, rows))
+            if isinstance(result, dict):
+                self.root.after(0, lambda r=result: self.apply_lidar_analysis_open3d_export_result(r))
+
+        self.lidar_analysis_open3d_thread = threading.Thread(target=worker, daemon=True)
+        self.lidar_analysis_open3d_thread.start()
+
+    def apply_lidar_analysis_open3d_export_result(self, result: Dict[str, Any]) -> None:
+        status = str(result.get("status", ""))
+        if status == "open3d_unavailable":
+            error_text = result.get("open3d", {}).get("error", "") if isinstance(result.get("open3d"), dict) else ""
+            self.lidar_stream_analysis_status_var.set(
+                f"Lidar Analysis: Open3D unavailable: {error_text} -> {result.get('export_dir', '')}"
+            )
+            self.status_var.set("Open3D export needs the open3d package")
+            return
+        self.lidar_stream_analysis_status_var.set(
+            f"Lidar Analysis: Open3D export frames={result.get('frame_count', 0)}, "
+            f"points={result.get('reconstruction_point_count', 0)} -> {result.get('export_dir', '')}"
+        )
+        self.status_var.set(f"Open3D export saved: {result.get('export_dir', '')}")
+
+    def open_lidar_analysis_open3d_viewer(self) -> None:
+        stream_text = self.lidar_analysis_stream_dir_var.get().strip()
+        if not stream_text:
+            latest = self.lidar_stream_capture_dir or self.find_latest_lidar_stream_capture_dir()
+            if latest is not None:
+                stream_text = str(latest)
+                self.lidar_analysis_stream_dir_var.set(stream_text)
+        if not stream_text:
+            self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: no folders under {self.lidar_stream_capture_root_path()}")
+            return
+        export_dir = Path(stream_text) / "open3d_export"
+        viewer_path = export_dir / "open3d_viewer.py"
+        if not viewer_path.exists():
+            self.lidar_stream_analysis_status_var.set("Lidar Analysis: export Open3D files before opening viewer")
+            return
+        status = flight.open3d_status()
+        if not status.get("available"):
+            self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: Open3D unavailable: {status.get('error', '')}")
+            return
+        try:
+            import subprocess
+            import sys
+
+            subprocess.Popen([sys.executable, str(viewer_path)], cwd=str(export_dir))
+            self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: Open3D viewer launched -> {viewer_path}")
+        except Exception as exc:
+            self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: Open3D viewer launch failed: {exc}")
+
+    def build_lidar_analysis_rviz_config(self) -> str:
+        return """Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: Grid
+      Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: true
+      Name: Lidar Reconstruction
+      Topic:
+        Value: /uav/lidar/reconstruction
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: RGB8
+    - Class: rviz_default_plugins/PointCloud2
+      Enabled: true
+      Name: Lidar Current Frame
+      Topic:
+        Value: /uav/lidar/frame
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: RGB8
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Value: true
+Window Geometry:
+  Height: 900
+  Width: 1400
+"""
+
+    def build_lidar_analysis_ros2_publisher_script(self) -> str:
+        return r'''#!/usr/bin/env python3
+"""Publish exported stream_capture_lidar PCD files for RViz2.
+
+Usage:
+  source /opt/ros/<distro>/setup.bash
+  python3 publish_lidar_stream_ros2.py
+  rviz2 -d rviz_config.rviz
+"""
+from __future__ import annotations
+
+import struct
+import time
+from pathlib import Path
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import PointCloud2, PointField
+from std_msgs.msg import Header
+
+
+EXPORT_DIR = Path(__file__).resolve().parent
+FRAME_ID = "map"
+
+
+def read_pcd_ascii(path: Path):
+    fields = []
+    data_started = False
+    rows = []
+    for line in path.read_text(encoding="ascii", errors="ignore").splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        upper = text.upper()
+        if upper.startswith("FIELDS "):
+            fields = text.split()[1:]
+            continue
+        if upper.startswith("DATA "):
+            data_started = True
+            continue
+        if not data_started:
+            continue
+        parts = text.split()
+        if len(parts) < 4:
+            continue
+        try:
+            values = [float(part) for part in parts]
+            x = values[fields.index("x")] if "x" in fields else values[0]
+            y = values[fields.index("y")] if "y" in fields else values[1]
+            z = values[fields.index("z")] if "z" in fields else values[2]
+            rgb = values[fields.index("rgb")] if "rgb" in fields else values[3]
+            rows.append((x, y, z, rgb))
+        except Exception:
+            continue
+    return rows
+
+
+def make_cloud(points, frame_id: str) -> PointCloud2:
+    msg = PointCloud2()
+    msg.header = Header()
+    msg.header.frame_id = frame_id
+    msg.height = 1
+    msg.width = len(points)
+    msg.fields = [
+        PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+        PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+        PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+        PointField(name="rgb", offset=12, datatype=PointField.FLOAT32, count=1),
+    ]
+    msg.is_bigendian = False
+    msg.point_step = 16
+    msg.row_step = msg.point_step * msg.width
+    msg.is_dense = True
+    msg.data = b"".join(struct.pack("<ffff", float(x), float(y), float(z), float(rgb)) for x, y, z, rgb in points)
+    return msg
+
+
+class LidarStreamPublisher(Node):
+    def __init__(self):
+        super().__init__("uav_lidar_stream_publisher")
+        self.reconstruction_pub = self.create_publisher(PointCloud2, "/uav/lidar/reconstruction", 1)
+        self.frame_pub = self.create_publisher(PointCloud2, "/uav/lidar/frame", 1)
+        self.frame_paths = sorted((EXPORT_DIR / "frames").glob("frame_*_world.pcd"))
+        self.frame_index = 0
+        reconstruction_path = EXPORT_DIR / "reconstruction_world.pcd"
+        self.reconstruction_points = read_pcd_ascii(reconstruction_path) if reconstruction_path.exists() else []
+        self.timer = self.create_timer(0.5, self.publish_once)
+        self.get_logger().info(f"Loaded {len(self.frame_paths)} frame PCD files from {EXPORT_DIR}")
+
+    def publish_once(self):
+        now = self.get_clock().now().to_msg()
+        if self.reconstruction_points:
+            msg = make_cloud(self.reconstruction_points, FRAME_ID)
+            msg.header.stamp = now
+            self.reconstruction_pub.publish(msg)
+        if self.frame_paths:
+            path = self.frame_paths[self.frame_index % len(self.frame_paths)]
+            msg = make_cloud(read_pcd_ascii(path), FRAME_ID)
+            msg.header.stamp = now
+            self.frame_pub.publish(msg)
+            self.frame_index += 1
+
+
+def main():
+    rclpy.init()
+    node = LidarStreamPublisher()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+    def build_lidar_analysis_rviz_readme(self) -> str:
+        return """# RViz export for stream_capture_lidar
+
+This folder contains standard Z-up meter PCD files exported from the UAV controller lidar stream.
+
+Files:
+- frames/frame_000001_world.pcd: per-frame world point clouds.
+- reconstruction_world.pcd: accumulated world point cloud.
+- rviz_config.rviz: RViz2 display config for /uav/lidar/reconstruction and /uav/lidar/frame.
+- publish_lidar_stream_ros2.py: optional ROS2 publisher for RViz2.
+
+The coordinates are right-handed standard Z-up world coordinates in meters.
+
+Example ROS2 usage:
+
+```bash
+source /opt/ros/<distro>/setup.bash
+cd /path/to/rviz_export
+python3 publish_lidar_stream_ros2.py
+rviz2 -d rviz_config.rviz
+```
+
+If RViz opens but the cloud is not visible, check that Fixed Frame is `map` and that the two PointCloud2 topics are active.
+"""
+
+    def build_lidar_analysis_rviz_export(self, stream_dir: Path, rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        stream_path = Path(stream_dir).resolve()
+        frame_rows = list(rows) if rows is not None else self.scan_lidar_analysis_frames(stream_path)
+        if not frame_rows:
+            raise RuntimeError(f"No lidar point cloud frames found in {stream_path}")
+        export_dir = stream_path / "rviz_export"
+        frames_dir = export_dir / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        merged = np.zeros((0, 6), dtype=np.float32)
+        source_point_count = 0
+        frame_exports: List[Dict[str, Any]] = []
+        for row in frame_rows:
+            cloud = self.load_lidar_analysis_cloud(row)
+            source_point_count += int(cloud.shape[0])
+            frame_index = int(row.get("frame_index", len(frame_exports) + 1) or len(frame_exports) + 1)
+            frame_path = frames_dir / f"frame_{frame_index:06d}_world.pcd"
+            frame_exports.append(
+                {
+                    "frame_index": frame_index,
+                    **self.write_lidar_analysis_pcd(frame_path, cloud),
+                }
+            )
+            if cloud.shape[0]:
+                merged = cloud if merged.shape[0] == 0 else np.vstack((merged, cloud))
+                merged = flight.downsample_colored_point_cloud_voxel(
+                    merged,
+                    voxel_cm=flight.standard_voxel_size_m(flight.DEFAULT_LIDAR_RECON_VOXEL_CM),
+                    max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
+                )
+
+        reconstruction_pcd = export_dir / "reconstruction_world.pcd"
+        reconstruction_export = self.write_lidar_analysis_pcd(reconstruction_pcd, merged)
+        rviz_config_path = export_dir / "rviz_config.rviz"
+        publisher_path = export_dir / "publish_lidar_stream_ros2.py"
+        readme_path = export_dir / "README_rviz.md"
+        summary_path = export_dir / "rviz_export_summary.json"
+        rviz_config_path.write_text(self.build_lidar_analysis_rviz_config(), encoding="utf-8")
+        publisher_path.write_text(self.build_lidar_analysis_ros2_publisher_script(), encoding="utf-8")
+        readme_path.write_text(self.build_lidar_analysis_rviz_readme(), encoding="utf-8")
+        summary = {
+            "export_kind": "rviz_point_cloud_export",
+            "stream_dir": str(stream_path),
+            "export_dir": str(export_dir),
+            "frames_dir": str(frames_dir),
+            "frame_count": len(frame_exports),
+            "source_point_count": int(source_point_count),
+            "reconstruction_point_count": int(reconstruction_export["point_count"]),
+            "frame_pcd_paths": [item["path"] for item in frame_exports],
+            "reconstruction_world_pcd_path": str(reconstruction_pcd),
+            "rviz_config_path": str(rviz_config_path),
+            "ros2_publisher_path": str(publisher_path),
+            "readme_path": str(readme_path),
+            "coordinate_frame": "standard_zup",
+            "coordinate_units": "m",
+            "topics": {
+                "reconstruction": "/uav/lidar/reconstruction",
+                "frame": "/uav/lidar/frame",
+            },
+            "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+        summary["summary_path"] = str(summary_path)
+        return summary
+
+    def export_lidar_analysis_rviz(self) -> None:
+        self.ensure_lidar_analysis_state()
+        if self.lidar_analysis_export_thread is not None and self.lidar_analysis_export_thread.is_alive():
+            self.lidar_stream_analysis_status_var.set("Lidar Analysis: RViz export already running")
+            return
+        stream_text = self.lidar_analysis_stream_dir_var.get().strip()
+        if not stream_text:
+            self.use_latest_lidar_analysis_folder()
+            stream_text = self.lidar_analysis_stream_dir_var.get().strip()
+        if not stream_text:
+            return
+        stream_dir = Path(stream_text)
+        rows = list(self.lidar_analysis_rows)
+        if not rows:
+            try:
+                rows = self.scan_lidar_analysis_frames(stream_dir)
+            except Exception as exc:
+                self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: scan before export failed: {exc}")
+                return
+        self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: exporting RViz files -> {stream_dir / 'rviz_export'}")
+
+        def worker() -> None:
+            result = self.safe("Export RViz", lambda: self.build_lidar_analysis_rviz_export(stream_dir, rows))
+            if isinstance(result, dict):
+                self.root.after(0, lambda r=result: self.apply_lidar_analysis_rviz_export_result(r))
+
+        self.lidar_analysis_export_thread = threading.Thread(target=worker, daemon=True)
+        self.lidar_analysis_export_thread.start()
+
+    def apply_lidar_analysis_rviz_export_result(self, result: Dict[str, Any]) -> None:
+        self.lidar_stream_analysis_status_var.set(
+            f"Lidar Analysis: RViz export frames={result.get('frame_count', 0)}, "
+            f"points={result.get('reconstruction_point_count', 0)} -> {result.get('export_dir', '')}"
+        )
+        self.status_var.set(f"RViz export saved: {result.get('export_dir', '')}")
+
+    def rebuild_lidar_analysis_window(self) -> None:
+        self.ensure_lidar_analysis_state()
+        if self.lidar_analysis_rebuild_thread is not None and self.lidar_analysis_rebuild_thread.is_alive():
+            self.lidar_stream_analysis_status_var.set("Lidar Analysis: rebuild already running")
+            return
+        stream_text = self.lidar_analysis_stream_dir_var.get().strip()
+        if not stream_text:
+            self.use_latest_lidar_analysis_folder()
+            stream_text = self.lidar_analysis_stream_dir_var.get().strip()
+        if not stream_text:
+            return
+        stream_dir = Path(stream_text)
+        self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: rebuilding -> {stream_dir}")
+
+        def worker() -> None:
+            result = self.safe("Analyze Lidar", lambda: self.rebuild_lidar_stream_reconstruction(stream_dir))
+            if isinstance(result, dict):
+                self.root.after(0, lambda r=result: self.apply_lidar_analysis_rebuild_result(r))
+
+        self.lidar_analysis_rebuild_thread = threading.Thread(target=worker, daemon=True)
+        self.lidar_analysis_rebuild_thread.start()
+
+    def apply_lidar_analysis_rebuild_result(self, result: Dict[str, Any]) -> None:
+        stream_dir = result.get("stream_dir", "")
+        merged_count = int(result.get("merged_point_count", 0) or 0)
+        frame_count = int(result.get("source_frame_count", 0) or 0)
+        self.lidar_stream_last_reconstruction = result
+        ply_path = result.get("merged_point_cloud_world_standard_m_ply_path", result.get("merged_point_cloud_world_ply_path", ""))
+        self.lidar_stream_analysis_status_var.set(
+            f"Lidar Analysis: rebuilt frames={frame_count}, merged={merged_count}, units=m -> {ply_path}"
+        )
+        if stream_dir:
+            self.lidar_analysis_stream_dir_var.set(str(stream_dir))
+        self.reset_lidar_analysis_cache()
+        if self.lidar_analysis_rows:
+            self.show_lidar_analysis_row(self.lidar_analysis_index)
