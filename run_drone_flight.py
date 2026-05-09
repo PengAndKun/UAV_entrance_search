@@ -73,6 +73,7 @@ DEFAULT_DEPTH_MAX_CM = 1200.0
 DEFAULT_LIDAR_DEPTH_MIN_CM = DEFAULT_DEPTH_MIN_CM
 DEFAULT_LIDAR_DEPTH_MAX_CM = DEFAULT_DEPTH_MAX_CM
 DEFAULT_LIDAR_DEPTH_PROJECTION = "auto"
+DEFAULT_LIDAR_CAPTURE_PROCESSING = "smooth"
 DEFAULT_LIDAR_RECON_VOXEL_CM = 8.0
 DEFAULT_LIDAR_RECON_MAX_POINTS = 500000
 DEFAULT_LIDAR_RECON_WRITE_EVERY = 5
@@ -634,6 +635,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Maximum depth in cm retained in Temp Capture Lidar point clouds")
     parser.add_argument("--lidar_depth_projection", choices=["auto", "plane", "ray"], default=DEFAULT_LIDAR_DEPTH_PROJECTION,
                         help="Depth backprojection for standard Lidar clouds; auto uses plane depth for UnrealCV depth npy")
+    parser.add_argument("--lidar_capture_processing", choices=["smooth", "full"], default=DEFAULT_LIDAR_CAPTURE_PROCESSING,
+                        help="Lidar stream processing mode: smooth stores raw frames first; full writes point clouds every frame")
     parser.add_argument("--force_kill_unreal_on_stop", dest="force_kill_unreal_on_stop", action="store_true",
                         default=DEFAULT_FORCE_KILL_UNREAL_ON_STOP,
                         help="Force-kill packaged Unreal processes when stopping a session")
@@ -924,6 +927,13 @@ def normalize_lidar_depth_projection(value: Any) -> str:
     if projection not in {"auto", "plane", "ray"}:
         return DEFAULT_LIDAR_DEPTH_PROJECTION
     return projection
+
+
+def normalize_lidar_capture_processing(value: Any) -> str:
+    mode = str(value or DEFAULT_LIDAR_CAPTURE_PROCESSING).strip().lower()
+    if mode not in {"smooth", "full"}:
+        return DEFAULT_LIDAR_CAPTURE_PROCESSING
+    return mode
 
 
 def select_lidar_depth_projection(value: Any, *, depth_input_mode: str = "unrealcv_depth_npy") -> str:
@@ -1263,7 +1273,7 @@ def render_point_cloud_preview(
         xyz = xyz[::step]
 
     x_values = xyz[:, 0]
-    y_values = -xyz[:, 1]
+    y_values = xyz[:, 1]
     z_values = xyz[:, 2]
     x_min, x_max = np.percentile(x_values, [1.0, 99.0])
     y_min, y_max = np.percentile(y_values, [1.0, 99.0])
@@ -1441,6 +1451,23 @@ def save_open3d_point_cloud_outputs(
     output_dir.mkdir(parents=True, exist_ok=True)
     pcd, source_count = colored_point_cloud_to_open3d(point_cloud)
     summary["source_point_count"] = int(source_count)
+    ply_path = output_dir / f"{basename}.ply"
+    pcd_path = output_dir / f"{basename}.pcd"
+    npy_path = output_dir / f"{basename}.npy"
+
+    if source_count <= 0:
+        np.save(npy_path, np.zeros((0, 6), dtype=np.float32))
+        summary.update(
+            {
+                "processed_point_count": 0,
+                "normals_estimated": False,
+                "skipped_empty": True,
+                "ply_path": "",
+                "pcd_path": "",
+                "npy_path": str(npy_path),
+            }
+        )
+        return summary
 
     if source_count > 0 and math.isfinite(effective_voxel) and effective_voxel > 0.0:
         pcd = pcd.voxel_down_sample(voxel_size=float(effective_voxel))
@@ -1456,9 +1483,20 @@ def save_open3d_point_cloud_outputs(
         )
         normals_estimated = True
 
-    ply_path = output_dir / f"{basename}.ply"
-    pcd_path = output_dir / f"{basename}.pcd"
-    npy_path = output_dir / f"{basename}.npy"
+    if processed_count <= 0:
+        np.save(npy_path, np.zeros((0, 6), dtype=np.float32))
+        summary.update(
+            {
+                "processed_point_count": 0,
+                "normals_estimated": False,
+                "skipped_empty": True,
+                "ply_path": "",
+                "pcd_path": "",
+                "npy_path": str(npy_path),
+            }
+        )
+        return summary
+
     o3d.io.write_point_cloud(str(ply_path), pcd, write_ascii=False, compressed=False, print_progress=False)
     o3d.io.write_point_cloud(str(pcd_path), pcd, write_ascii=False, compressed=False, print_progress=False)
     np.save(npy_path, open3d_point_cloud_to_colored_numpy(pcd))
@@ -1467,12 +1505,67 @@ def save_open3d_point_cloud_outputs(
         {
             "processed_point_count": processed_count,
             "normals_estimated": normals_estimated,
+            "skipped_empty": False,
             "ply_path": str(ply_path),
             "pcd_path": str(pcd_path),
             "npy_path": str(npy_path),
         }
     )
     return summary
+
+
+def save_open3d_point_cloud_from_npy_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    npy_path = Path(str(task.get("npy_path", "")))
+    output_dir = Path(str(task.get("output_dir", "")))
+    basename = str(task.get("basename", npy_path.stem))
+    frame_index = int(task.get("frame_index", 0) or 0)
+    reuse_existing = bool(task.get("reuse_existing", False))
+    ply_path = output_dir / f"{basename}.ply"
+    pcd_path = output_dir / f"{basename}.pcd"
+    out_npy_path = output_dir / f"{basename}.npy"
+    if reuse_existing and ply_path.exists() and pcd_path.exists() and out_npy_path.exists():
+        try:
+            point_count = int(np.load(out_npy_path, mmap_mode="r").shape[0])
+        except Exception:
+            point_count = 0
+        return {
+            "frame_index": frame_index,
+            "backend": "open3d",
+            "available": True,
+            "basename": basename,
+            "source_path": str(npy_path),
+            "source_point_count": point_count,
+            "processed_point_count": point_count,
+            "skipped_empty": point_count <= 0,
+            "skipped_existing": True,
+            "ply_path": str(ply_path) if point_count > 0 else "",
+            "pcd_path": str(pcd_path) if point_count > 0 else "",
+            "npy_path": str(out_npy_path),
+            "coordinate_units": str(task.get("coordinate_units", "m")),
+        }
+
+    cloud = np.load(npy_path).astype(np.float32, copy=False)
+    result = save_open3d_point_cloud_outputs(
+        cloud,
+        output_dir,
+        basename=basename,
+        voxel_cm=float(task.get("voxel_cm", DEFAULT_OPEN3D_VOXEL_CM)),
+        voxel_size=task.get("voxel_size"),
+        max_points=int(task.get("max_points", DEFAULT_LIDAR_RECON_MAX_POINTS)),
+        estimate_normals=bool(task.get("estimate_normals", False)),
+        normal_radius_cm=float(task.get("normal_radius_cm", DEFAULT_OPEN3D_NORMAL_RADIUS_CM)),
+        normal_radius=task.get("normal_radius"),
+        normal_max_nn=int(task.get("normal_max_nn", DEFAULT_OPEN3D_NORMAL_MAX_NN)),
+        coordinate_units=str(task.get("coordinate_units", "m")),
+    )
+    result.update(
+        {
+            "frame_index": frame_index,
+            "source_path": str(npy_path),
+            "skipped_existing": False,
+        }
+    )
+    return result
 
 
 def save_lidar_reconstruction_outputs(
@@ -1904,6 +1997,195 @@ def ensure_standard_world_cloud_for_capture(
             capture_payload=payload,
         )
     return {}
+
+
+def update_capture_json(capture_dir: Path, updates: Dict[str, Any]) -> Dict[str, Any]:
+    capture_path = Path(capture_dir) / "capture.json"
+    payload = read_json_object(capture_path)
+    payload.update(updates)
+    capture_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return payload
+
+
+def postprocess_lidar_stream_capture(
+    stream_dir: Path,
+    *,
+    lidar_depth_projection: str = DEFAULT_LIDAR_DEPTH_PROJECTION,
+    min_depth_cm: float = DEFAULT_LIDAR_DEPTH_MIN_CM,
+    max_depth_cm: float = DEFAULT_LIDAR_DEPTH_MAX_CM,
+    voxel_cm: float = DEFAULT_LIDAR_RECON_VOXEL_CM,
+    max_points: int = DEFAULT_LIDAR_RECON_MAX_POINTS,
+) -> Dict[str, Any]:
+    stream_path = Path(stream_dir).resolve()
+    frames_root = stream_path / "frames"
+    started_at = datetime.now().isoformat(timespec="milliseconds")
+    frame_dirs = sorted(path for path in frames_root.glob("frame_*") if path.is_dir()) if frames_root.exists() else []
+    frame_results: List[Dict[str, Any]] = []
+    cloud_paths: List[Path] = []
+    source_point_count = 0
+    failed_count = 0
+
+    summary_path = stream_path / "stream_capture_lidar.json"
+    trajectory_path = stream_path / "trajectory.json"
+    summary = read_json_object(summary_path)
+    trajectory_payload = read_json_object(trajectory_path)
+    trajectory = trajectory_payload.get("trajectory", []) if isinstance(trajectory_payload.get("trajectory"), list) else []
+
+    summary.update(
+        {
+            "postprocess_status": "running",
+            "postprocess_started_at": started_at,
+            "postprocess_finished_at": "",
+            "postprocess_error": "",
+            "updated_at": started_at,
+        }
+    )
+    if summary:
+        summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    for capture_dir in frame_dirs:
+        capture_payload = read_json_object(capture_dir / "capture.json")
+        frame_index = int(capture_payload.get("frame_index", 0) or 0)
+        frame_started_at = datetime.now().isoformat(timespec="milliseconds")
+        try:
+            capture_payload = update_capture_json(
+                capture_dir,
+                {
+                    "postprocess_status": "running",
+                    "postprocess_started_at": frame_started_at,
+                    "postprocess_finished_at": "",
+                    "postprocess_error": "",
+                },
+            )
+            ensured = ensure_standard_world_cloud_for_capture(
+                capture_dir,
+                capture_payload=capture_payload,
+                lidar_depth_projection=lidar_depth_projection,
+                min_depth_cm=float(min_depth_cm),
+                max_depth_cm=float(max_depth_cm),
+            )
+            raw_path = str(ensured.get("point_cloud_world_standard_m_npy_path", "") or "")
+            point_count = int(ensured.get("point_count", 0) or 0)
+            if raw_path:
+                cloud_path = Path(raw_path)
+                if cloud_path.exists():
+                    cloud_paths.append(cloud_path)
+                    if point_count <= 0:
+                        try:
+                            point_count = int(np.load(cloud_path, mmap_mode="r").shape[0])
+                        except Exception:
+                            point_count = 0
+                    source_point_count += max(0, point_count)
+            frame_finished_at = datetime.now().isoformat(timespec="milliseconds")
+            frame_update = {
+                **ensured,
+                "raw_capture_only": False,
+                "postprocess_status": "done",
+                "postprocess_finished_at": frame_finished_at,
+                "postprocess_error": "",
+            }
+            update_capture_json(capture_dir, frame_update)
+            frame_results.append(
+                {
+                    "frame_index": frame_index,
+                    "capture_dir": str(capture_dir),
+                    "point_count": point_count,
+                    "postprocess_status": "done",
+                    **ensured,
+                }
+            )
+        except Exception as exc:
+            failed_count += 1
+            error_text = f"{type(exc).__name__}: {exc}"
+            update_capture_json(
+                capture_dir,
+                {
+                    "postprocess_status": "failed",
+                    "postprocess_finished_at": datetime.now().isoformat(timespec="milliseconds"),
+                    "postprocess_error": error_text,
+                },
+            )
+            frame_results.append(
+                {
+                    "frame_index": frame_index,
+                    "capture_dir": str(capture_dir),
+                    "postprocess_status": "failed",
+                    "postprocess_error": error_text,
+                }
+            )
+
+    merged = np.zeros((0, 6), dtype=np.float32)
+    for cloud_path in cloud_paths:
+        cloud = np.load(cloud_path).astype(np.float32, copy=False)
+        if cloud.ndim != 2 or cloud.shape[1] != 6 or cloud.shape[0] == 0:
+            continue
+        merged = cloud if merged.shape[0] == 0 else np.vstack((merged, cloud))
+        merged = downsample_colored_point_cloud_voxel(
+            merged,
+            voxel_cm=standard_voxel_size_m(voxel_cm),
+            max_points=max_points,
+        )
+
+    reconstruction = save_lidar_reconstruction_outputs(
+        merged,
+        stream_path / "reconstruction",
+        source_frame_count=len(cloud_paths),
+        source_point_count=source_point_count,
+        voxel_cm=voxel_cm,
+        max_points=max_points,
+        coordinate_frame="standard_zup",
+        coordinate_units="m",
+    )
+    finished_at = datetime.now().isoformat(timespec="milliseconds")
+    status = "failed" if failed_count else "done"
+
+    frame_result_by_dir = {str(Path(item.get("capture_dir", "")).resolve()): item for item in frame_results}
+    if isinstance(trajectory, list):
+        for entry in trajectory:
+            if not isinstance(entry, dict):
+                continue
+            raw_capture_dir = str(entry.get("capture_dir", "") or "")
+            if not raw_capture_dir:
+                continue
+            capture_dir = Path(raw_capture_dir)
+            if not capture_dir.is_absolute():
+                capture_dir = (stream_path / capture_dir).resolve()
+            frame_result = frame_result_by_dir.get(str(capture_dir.resolve()))
+            if frame_result:
+                entry.update(frame_result)
+                entry["raw_capture_only"] = False if frame_result.get("postprocess_status") == "done" else bool(entry.get("raw_capture_only", True))
+
+    final_summary = {
+        **summary,
+        "capture_kind": "stream_capture_lidar",
+        "stream_dir": str(stream_path),
+        "frames_dir": str(frames_root),
+        "reconstruction_dir": str(stream_path / "reconstruction"),
+        "frame_count": len(frame_dirs),
+        "source_point_count": int(source_point_count),
+        "coordinate_frame": "standard_zup",
+        "coordinate_units": "m",
+        "depth_projection_selected": select_lidar_depth_projection(lidar_depth_projection),
+        "postprocess_status": status,
+        "postprocess_started_at": started_at,
+        "postprocess_finished_at": finished_at,
+        "postprocess_error": "" if status != "failed" else f"{failed_count} frame(s) failed during postprocess",
+        "failed_frame_count": int(failed_count),
+        "reconstruction": reconstruction,
+        "updated_at": finished_at,
+    }
+    summary_path.write_text(json.dumps(final_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    trajectory_payload.update(final_summary)
+    trajectory_payload["trajectory"] = trajectory
+    trajectory_path.write_text(json.dumps(trajectory_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    return {
+        **final_summary,
+        "frame_results": frame_results,
+        "source_frame_count": len(cloud_paths),
+        "input_cloud_file_count": len(cloud_paths),
+        "merged_point_count": int(reconstruction.get("merged_point_count", 0) or 0),
+    }
 
 
 def make_env(args: argparse.Namespace):
@@ -3194,6 +3476,7 @@ class DroneFlightSession:
         extra_result: Optional[Dict[str, Any]] = None,
         extra_pose: Optional[Dict[str, Any]] = None,
         controller_action: Optional[Dict[str, Any]] = None,
+        raw_capture_only: bool = False,
     ) -> Dict[str, Any]:
         capture_dir.mkdir(parents=True, exist_ok=True)
         rgb = read_drone_observation(env, drone_name)
@@ -3217,6 +3500,7 @@ class DroneFlightSession:
         pose_json_path = capture_dir / "pose.json"
         action_json_path = capture_dir / "action.json"
         capture_json_path = capture_dir / "capture.json"
+        camera_info_path = capture_dir / "camera_info.json"
 
         Image.fromarray(rgb_image).save(rgb_path)
         depth_summary = save_depth_capture_outputs(
@@ -3228,15 +3512,63 @@ class DroneFlightSession:
             max_depth_cm=float(getattr(self.args, "lidar_depth_max_cm", DEFAULT_LIDAR_DEPTH_MAX_CM)),
         )
         camera_info = read_drone_camera_info(env, drone_name, rgb=rgb_image, depth=depth)
-        lidar_outputs = save_lidar_capture_outputs(
-            rgb_image=rgb_image,
-            depth_image=depth,
-            camera_info=camera_info,
-            output_dir=capture_dir,
-            min_depth_cm=float(getattr(self.args, "lidar_depth_min_cm", DEFAULT_LIDAR_DEPTH_MIN_CM)),
-            max_depth_cm=float(getattr(self.args, "lidar_depth_max_cm", DEFAULT_LIDAR_DEPTH_MAX_CM)),
-            lidar_depth_projection=str(getattr(self.args, "lidar_depth_projection", DEFAULT_LIDAR_DEPTH_PROJECTION)),
-        )
+        if raw_capture_only:
+            camera_info_payload = dict(camera_info)
+            camera_info_payload.update(
+                {
+                    "min_depth_cm": float(getattr(self.args, "lidar_depth_min_cm", DEFAULT_LIDAR_DEPTH_MIN_CM)),
+                    "max_depth_cm": float(getattr(self.args, "lidar_depth_max_cm", DEFAULT_LIDAR_DEPTH_MAX_CM)),
+                    "depth_input_mode": "unrealcv_depth_npy",
+                    "depth_projection_requested": str(getattr(self.args, "lidar_depth_projection", DEFAULT_LIDAR_DEPTH_PROJECTION)),
+                    "depth_projection_selected": select_lidar_depth_projection(
+                        getattr(self.args, "lidar_depth_projection", DEFAULT_LIDAR_DEPTH_PROJECTION)
+                    ),
+                    "coordinate_frame": "standard_zup",
+                    "coordinate_units": "m",
+                }
+            )
+            camera_info_path.write_text(json.dumps(camera_info_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            lidar_outputs = {
+                "point_count": 0,
+                "invalid_depth_count": 0,
+                "source_mode": "raw_depth_lidar",
+                "point_cloud_shape": [0, 6],
+                "min_depth_cm": float(getattr(self.args, "lidar_depth_min_cm", DEFAULT_LIDAR_DEPTH_MIN_CM)),
+                "max_depth_cm": float(getattr(self.args, "lidar_depth_max_cm", DEFAULT_LIDAR_DEPTH_MAX_CM)),
+                "depth_input_mode": "unrealcv_depth_npy",
+                "depth_projection": select_lidar_depth_projection(
+                    getattr(self.args, "lidar_depth_projection", DEFAULT_LIDAR_DEPTH_PROJECTION)
+                ),
+                "depth_projection_selected": select_lidar_depth_projection(
+                    getattr(self.args, "lidar_depth_projection", DEFAULT_LIDAR_DEPTH_PROJECTION)
+                ),
+                "projection_corrected": False,
+                "coordinate_frame": "standard_zup",
+                "coordinate_units": "m",
+                "camera_info_path": str(camera_info_path),
+                "raw_capture_only": True,
+                "postprocess_status": "pending",
+                "postprocess_started_at": "",
+                "postprocess_finished_at": "",
+            }
+        else:
+            lidar_outputs = save_lidar_capture_outputs(
+                rgb_image=rgb_image,
+                depth_image=depth,
+                camera_info=camera_info,
+                output_dir=capture_dir,
+                min_depth_cm=float(getattr(self.args, "lidar_depth_min_cm", DEFAULT_LIDAR_DEPTH_MIN_CM)),
+                max_depth_cm=float(getattr(self.args, "lidar_depth_max_cm", DEFAULT_LIDAR_DEPTH_MAX_CM)),
+                lidar_depth_projection=str(getattr(self.args, "lidar_depth_projection", DEFAULT_LIDAR_DEPTH_PROJECTION)),
+            )
+            lidar_outputs.update(
+                {
+                    "raw_capture_only": False,
+                    "postprocess_status": "done",
+                    "postprocess_started_at": "",
+                    "postprocess_finished_at": datetime.now().isoformat(timespec="milliseconds"),
+                }
+            )
         self.last_observation = rgb
         self.last_actual_pose = pose_values
 
@@ -3277,6 +3609,9 @@ class DroneFlightSession:
             "lidar_depth_min_cm": float(getattr(self.args, "lidar_depth_min_cm", DEFAULT_LIDAR_DEPTH_MIN_CM)),
             "lidar_depth_max_cm": float(getattr(self.args, "lidar_depth_max_cm", DEFAULT_LIDAR_DEPTH_MAX_CM)),
             "lidar_depth_projection": str(getattr(self.args, "lidar_depth_projection", DEFAULT_LIDAR_DEPTH_PROJECTION)),
+            "lidar_capture_processing": normalize_lidar_capture_processing(
+                getattr(self.args, "lidar_capture_processing", DEFAULT_LIDAR_CAPTURE_PROCESSING)
+            ),
             "pose": pose,
             "commanded_pose": action_detail.get("commanded_pose", {}),
             "actual_pose": action_detail.get("actual_pose", {}),
@@ -3365,6 +3700,9 @@ class DroneFlightSession:
         frame_number = max(0, int(frame_index))
         frame_name = f"frame_{frame_number:06d}"
         capture_dir = make_unique_child_dir(frames_dir, frame_name)
+        processing_mode = normalize_lidar_capture_processing(
+            getattr(self.args, "lidar_capture_processing", DEFAULT_LIDAR_CAPTURE_PROCESSING)
+        )
         return self._capture_lidar_bundle_to_dir(
             env,
             drone_name,
@@ -3375,9 +3713,11 @@ class DroneFlightSession:
                 "frame_index": frame_number,
                 "stream_dir": str(stream_path),
                 "frames_dir": str(frames_dir),
+                "lidar_capture_processing": processing_mode,
                 "message": f"Stream lidar frame {frame_number} saved: {capture_dir}",
             },
             controller_action=action_detail,
+            raw_capture_only=(processing_mode == "smooth"),
         )
 
     @serialized_unrealcv_method

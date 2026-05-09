@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lidar_depth_min_cm", type=float, default=flight.DEFAULT_LIDAR_DEPTH_MIN_CM)
     parser.add_argument("--lidar_depth_max_cm", type=float, default=flight.DEFAULT_LIDAR_DEPTH_MAX_CM)
     parser.add_argument("--lidar_depth_projection", choices=["auto", "plane", "ray"], default=flight.DEFAULT_LIDAR_DEPTH_PROJECTION)
+    parser.add_argument("--lidar_capture_processing", choices=["smooth", "full"], default=flight.DEFAULT_LIDAR_CAPTURE_PROCESSING)
     parser.add_argument("--force_kill_unreal_on_stop", dest="force_kill_unreal_on_stop", action="store_true",
                         default=flight.DEFAULT_FORCE_KILL_UNREAL_ON_STOP)
     parser.add_argument("--no_force_kill_unreal_on_stop", dest="force_kill_unreal_on_stop", action="store_false")

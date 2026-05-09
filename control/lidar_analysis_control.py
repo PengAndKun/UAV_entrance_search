@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from .common import *
 
+import concurrent.futures
+
 
 def _json_default(value: Any) -> Any:
     if isinstance(value, Path):
@@ -276,14 +278,33 @@ class LidarAnalysisControlMixin:
         pose_payload = self.read_lidar_analysis_json(pose_path)
         combined_payload = dict(capture_payload)
         combined_payload.update(entry)
-
-        ensured = flight.ensure_standard_world_cloud_for_capture(
-            capture_dir,
-            capture_payload=combined_payload,
-            lidar_depth_projection=str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
-            min_depth_cm=float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
-            max_depth_cm=float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+        pending_status = str(
+            combined_payload.get("postprocess_status", "")
+            or ("pending" if combined_payload.get("raw_capture_only") else "")
+        ).lower()
+        existing_standard_path = (
+            entry.get("point_cloud_world_standard_m_npy_path")
+            or capture_payload.get("point_cloud_world_standard_m_npy_path")
+            or str(capture_dir / "point_cloud_world_standard_m.npy")
         )
+        existing_standard = self.resolve_lidar_analysis_path(stream_dir, existing_standard_path)
+        if pending_status in {"pending", "running"} and not existing_standard.exists():
+            ensured = {
+                "point_cloud_world_standard_m_npy_path": "",
+                "depth_projection_selected": combined_payload.get("depth_projection_selected", combined_payload.get("depth_projection", "plane_depth")),
+                "projection_corrected": bool(combined_payload.get("projection_corrected", False)),
+                "coordinate_frame": "standard_zup",
+                "coordinate_units": "m",
+                "postprocess_status": pending_status,
+            }
+        else:
+            ensured = flight.ensure_standard_world_cloud_for_capture(
+                capture_dir,
+                capture_payload=combined_payload,
+                lidar_depth_projection=str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
+                min_depth_cm=float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
+                max_depth_cm=float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+            )
         diagnostics_path = Path(str(ensured.get("projection_diagnostics_path", capture_dir / "projection_diagnostics.json")))
         diagnostics_payload = self.read_lidar_analysis_json(diagnostics_path)
         raw_cloud = (
@@ -292,7 +313,7 @@ class LidarAnalysisControlMixin:
             or ensured.get("point_cloud_world_standard_m_npy_path")
         )
         cloud_path = self.resolve_lidar_analysis_path(stream_dir, raw_cloud) if raw_cloud else capture_dir / "point_cloud_world_standard_m.npy"
-        if not cloud_path.exists():
+        if not cloud_path.exists() and pending_status not in {"pending", "running"}:
             return None
         point_count = entry.get("point_count", capture_payload.get("point_count", 0))
         if not point_count:
@@ -333,6 +354,9 @@ class LidarAnalysisControlMixin:
             ),
             "coordinate_frame": "standard_zup",
             "coordinate_units": "m",
+            "raw_capture_only": bool(combined_payload.get("raw_capture_only", False)),
+            "postprocess_status": ensured.get("postprocess_status", combined_payload.get("postprocess_status", "")),
+            "postprocess_error": combined_payload.get("postprocess_error", ""),
             "legacy_source_path": ensured.get("legacy_source_path", diagnostics_payload.get("legacy_source_path", "")),
             "trajectory_entry": dict(entry),
             "capture_payload": capture_payload,
@@ -435,6 +459,7 @@ class LidarAnalysisControlMixin:
                     f"cum={int(row.get('cumulative_point_count', 0)):9d} "
                     f"proj={row.get('depth_projection_selected', '')} "
                     f"units={row.get('coordinate_units', 'm')} "
+                    f"post={row.get('postprocess_status', '')} "
                     f"{row.get('capture_time', '')}"
                 ),
             )
@@ -678,6 +703,7 @@ class LidarAnalysisControlMixin:
             f"Units: {row.get('coordinate_units', 'm')}",
             f"Coordinate frame: {row.get('coordinate_frame', 'standard_zup')}",
             f"Projection corrected: {bool(row.get('projection_corrected', True))}",
+            f"Postprocess: {row.get('postprocess_status', '')}",
             f"Frame points: {int(row.get('point_count', 0) or 0)}",
             f"Raw cumulative points: {int(row.get('cumulative_point_count', 0) or 0)}",
             f"Rendered source points: {int(source_count)}",
@@ -688,6 +714,8 @@ class LidarAnalysisControlMixin:
         ]
         if row.get("legacy_source_path"):
             lines.append(f"Legacy source: {row.get('legacy_source_path', '')}")
+        if row.get("postprocess_error"):
+            lines.append(f"Postprocess error: {row.get('postprocess_error', '')}")
         if pose:
             lines.append(
                 "Pose: "
@@ -888,11 +916,72 @@ if __name__ == "__main__":
         self,
         stream_dir: Path,
         rows: Optional[List[Dict[str, Any]]] = None,
+        *,
+        export_mode: str = "reconstruction_only",
+        frame_stride: int = 10,
+        max_workers: int = 1,
+        estimate_reconstruction_normals: bool = True,
+        reuse_existing: bool = True,
+        progress_callback: Any = None,
     ) -> Dict[str, Any]:
         stream_path = Path(stream_dir).resolve()
+        export_mode = str(export_mode or "reconstruction_only").strip().lower()
+        if export_mode not in {"reconstruction_only", "sampled_frames", "all_frames"}:
+            export_mode = "reconstruction_only"
+        frame_stride = max(1, int(frame_stride or 1))
+        max_workers = max(1, int(max_workers or 1))
+
+        def emit_progress(stage: str, processed: int, total: int, message: str = "") -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(
+                    {
+                        "stage": stage,
+                        "processed": int(processed),
+                        "total": int(max(1, total)),
+                        "message": str(message),
+                        "export_mode": export_mode,
+                    }
+                )
+            except Exception:
+                pass
+
+        emit_progress("postprocess_check", 0, 1, "Checking standard point clouds")
+        postprocess_result: Dict[str, Any] = {}
+        stream_summary = self.read_lidar_analysis_json(stream_path / "stream_capture_lidar.json")
+        needs_postprocess = str(stream_summary.get("postprocess_status", "")).lower() in {"pending", "running", ""}
+        if not needs_postprocess:
+            for capture_dir in sorted(path for path in (stream_path / "frames").glob("frame_*") if path.is_dir()):
+                if not (capture_dir / "point_cloud_world_standard_m.npy").exists():
+                    needs_postprocess = True
+                    break
+        if needs_postprocess:
+            emit_progress("postprocess", 0, 1, "Postprocessing raw frames")
+            postprocess_result = flight.postprocess_lidar_stream_capture(
+                stream_path,
+                lidar_depth_projection=str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
+                min_depth_cm=float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
+                max_depth_cm=float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+                voxel_cm=flight.DEFAULT_LIDAR_RECON_VOXEL_CM,
+                max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
+            )
+            rows = None
+            emit_progress("postprocess", 1, 1, "Postprocess complete")
         frame_rows = list(rows) if rows is not None else self.scan_lidar_analysis_frames(stream_path)
         if not frame_rows:
             raise RuntimeError(f"No lidar point cloud frames found in {stream_path}")
+
+        if export_mode == "reconstruction_only":
+            export_rows: List[Dict[str, Any]] = []
+        elif export_mode == "sampled_frames":
+            export_rows = [
+                row
+                for index, row in enumerate(frame_rows)
+                if index == 0 or index == len(frame_rows) - 1 or index % frame_stride == 0
+            ]
+        else:
+            export_rows = list(frame_rows)
 
         export_dir = stream_path / "open3d_export"
         frames_dir = export_dir / "frames"
@@ -911,6 +1000,7 @@ if __name__ == "__main__":
             "frames_dir": str(frames_dir),
             "open3d": status,
             "frame_count": len(frame_rows),
+            "exported_frame_count": len(export_rows),
             "source_point_count": 0,
             "reconstruction_point_count": 0,
             "frame_exports": [],
@@ -918,6 +1008,16 @@ if __name__ == "__main__":
             "viewer_path": str(viewer_path),
             "coordinate_frame": "standard_zup",
             "coordinate_units": "m",
+            "postprocess_checked": True,
+            "postprocess_ran": bool(postprocess_result),
+            "postprocess": postprocess_result,
+            "skipped_empty_frame_count": 0,
+            "skipped_existing_frame_count": 0,
+            "export_mode": export_mode,
+            "frame_stride": int(frame_stride),
+            "max_workers": int(max_workers),
+            "estimate_reconstruction_normals": bool(estimate_reconstruction_normals),
+            "reuse_existing": bool(reuse_existing),
             "updated_at": datetime.now().isoformat(timespec="milliseconds"),
         }
         if not status.get("available"):
@@ -926,49 +1026,155 @@ if __name__ == "__main__":
             summary["summary_path"] = str(summary_path)
             return summary
 
-        merged = np.zeros((0, 6), dtype=np.float32)
-        source_point_count = 0
+        source_point_count = int(
+            stream_summary.get("source_point_count", 0)
+            or postprocess_result.get("source_point_count", 0)
+            or 0
+        )
+        if source_point_count <= 0:
+            source_point_count = sum(int(row.get("point_count", 0) or 0) for row in frame_rows)
+        skipped_empty_frame_count = 0
+        skipped_existing_frame_count = 0
         frame_exports: List[Dict[str, Any]] = []
-        for row in frame_rows:
-            cloud = self.load_lidar_analysis_cloud(row)
-            source_point_count += int(cloud.shape[0])
-            frame_index = int(row.get("frame_index", len(frame_exports) + 1) or len(frame_exports) + 1)
-            frame_export = flight.save_open3d_point_cloud_outputs(
-                cloud,
-                frames_dir,
-                basename=f"frame_{frame_index:06d}_world_standard_m",
-                voxel_cm=0.0,
-                voxel_size=0.0,
-                max_points=0,
-                estimate_normals=False,
-                coordinate_units="m",
+        frame_tasks: List[Dict[str, Any]] = []
+        for row in export_rows:
+            frame_index = int(row.get("frame_index", len(frame_tasks) + 1) or len(frame_tasks) + 1)
+            raw_path = str(row.get("point_cloud_world_standard_m_npy_path") or row.get("point_cloud_world_npy_path") or "")
+            if not raw_path or not Path(raw_path).exists() or int(row.get("point_count", 0) or 0) <= 0:
+                skipped_empty_frame_count += 1
+                frame_exports.append(
+                    {
+                        "frame_index": frame_index,
+                        "backend": "open3d",
+                        "available": bool(status.get("available")),
+                        "version": status.get("version", ""),
+                        "basename": f"frame_{frame_index:06d}_world_standard_m",
+                        "source_point_count": 0,
+                        "processed_point_count": 0,
+                        "skipped_empty": True,
+                        "coordinate_units": "m",
+                        "ply_path": "",
+                        "pcd_path": "",
+                        "npy_path": "",
+                    }
+                )
+                continue
+            frame_tasks.append(
+                {
+                    "frame_index": frame_index,
+                    "npy_path": raw_path,
+                    "output_dir": str(frames_dir),
+                    "basename": f"frame_{frame_index:06d}_world_standard_m",
+                    "voxel_cm": 0.0,
+                    "voxel_size": 0.0,
+                    "max_points": 0,
+                    "estimate_normals": False,
+                    "coordinate_units": "m",
+                    "reuse_existing": bool(reuse_existing),
+                }
             )
-            frame_exports.append({"frame_index": frame_index, **frame_export})
-            if cloud.shape[0]:
+
+        total_units = len(frame_tasks) + 1
+        completed_units = 0
+        emit_progress("frame_export", completed_units, total_units, f"Exporting {len(frame_tasks)} frame clouds")
+        if frame_tasks and max_workers > 1:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(flight.save_open3d_point_cloud_from_npy_task, task): task
+                    for task in frame_tasks
+                }
+                for future in concurrent.futures.as_completed(future_map):
+                    frame_export = future.result()
+                    if frame_export.get("skipped_empty"):
+                        skipped_empty_frame_count += 1
+                    if frame_export.get("skipped_existing"):
+                        skipped_existing_frame_count += 1
+                    frame_exports.append(frame_export)
+                    completed_units += 1
+                    emit_progress(
+                        "frame_export",
+                        completed_units,
+                        total_units,
+                        f"Exported frame {frame_export.get('frame_index', '')}",
+                    )
+        else:
+            for task in frame_tasks:
+                frame_export = flight.save_open3d_point_cloud_from_npy_task(task)
+                if frame_export.get("skipped_empty"):
+                    skipped_empty_frame_count += 1
+                if frame_export.get("skipped_existing"):
+                    skipped_existing_frame_count += 1
+                frame_exports.append(frame_export)
+                completed_units += 1
+                emit_progress(
+                    "frame_export",
+                    completed_units,
+                    total_units,
+                    f"Exported frame {frame_export.get('frame_index', '')}",
+                )
+        frame_exports.sort(key=lambda item: int(item.get("frame_index", 0) or 0))
+
+        reconstruction_npy = ""
+        for candidate in (
+            stream_path / "reconstruction" / "merged_point_cloud_world_standard_m.npy",
+            stream_path / "reconstruction" / "reconstruction_world_standard_m.npy",
+        ):
+            if candidate.exists():
+                reconstruction_npy = str(candidate)
+                break
+        emit_progress("reconstruction_export", completed_units, total_units, "Exporting reconstruction")
+        if reconstruction_npy:
+            reconstruction_export = flight.save_open3d_point_cloud_from_npy_task(
+                {
+                    "frame_index": 0,
+                    "npy_path": reconstruction_npy,
+                    "output_dir": str(export_dir),
+                    "basename": "reconstruction_world_standard_m",
+                    "voxel_cm": flight.DEFAULT_OPEN3D_VOXEL_CM,
+                    "voxel_size": flight.standard_voxel_size_m(flight.DEFAULT_OPEN3D_VOXEL_CM),
+                    "max_points": flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
+                    "estimate_normals": bool(estimate_reconstruction_normals),
+                    "normal_radius_cm": flight.DEFAULT_OPEN3D_NORMAL_RADIUS_CM,
+                    "normal_radius": flight.DEFAULT_OPEN3D_NORMAL_RADIUS_CM / 100.0,
+                    "coordinate_units": "m",
+                    "reuse_existing": bool(reuse_existing),
+                }
+            )
+        else:
+            merged = np.zeros((0, 6), dtype=np.float32)
+            for row in frame_rows:
+                cloud = self.load_lidar_analysis_cloud(row)
+                if cloud.shape[0] == 0:
+                    continue
                 merged = cloud if merged.shape[0] == 0 else np.vstack((merged, cloud))
                 merged = flight.downsample_colored_point_cloud_voxel(
                     merged,
                     voxel_cm=flight.standard_voxel_size_m(flight.DEFAULT_LIDAR_RECON_VOXEL_CM),
                     max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
                 )
-
-        reconstruction_export = flight.save_open3d_point_cloud_outputs(
-            merged,
-            export_dir,
-            basename="reconstruction_world_standard_m",
-            voxel_cm=flight.DEFAULT_OPEN3D_VOXEL_CM,
-            voxel_size=flight.standard_voxel_size_m(flight.DEFAULT_OPEN3D_VOXEL_CM),
-            max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
-            estimate_normals=True,
-            normal_radius_cm=flight.DEFAULT_OPEN3D_NORMAL_RADIUS_CM,
-            normal_radius=flight.DEFAULT_OPEN3D_NORMAL_RADIUS_CM / 100.0,
-            coordinate_units="m",
-        )
+            reconstruction_export = flight.save_open3d_point_cloud_outputs(
+                merged,
+                export_dir,
+                basename="reconstruction_world_standard_m",
+                voxel_cm=flight.DEFAULT_OPEN3D_VOXEL_CM,
+                voxel_size=flight.standard_voxel_size_m(flight.DEFAULT_OPEN3D_VOXEL_CM),
+                max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
+                estimate_normals=bool(estimate_reconstruction_normals),
+                normal_radius_cm=flight.DEFAULT_OPEN3D_NORMAL_RADIUS_CM,
+                normal_radius=flight.DEFAULT_OPEN3D_NORMAL_RADIUS_CM / 100.0,
+                coordinate_units="m",
+            )
+        if reconstruction_export.get("skipped_existing"):
+            reconstruction_export["reused_existing"] = True
+        completed_units = total_units
+        emit_progress("done", completed_units, total_units, "Open3D export complete")
         summary.update(
             {
                 "status": "ok",
                 "source_point_count": int(source_point_count),
                 "reconstruction_point_count": int(reconstruction_export.get("processed_point_count", 0) or 0),
+                "skipped_empty_frame_count": int(skipped_empty_frame_count),
+                "skipped_existing_frame_count": int(skipped_existing_frame_count),
                 "frame_exports": frame_exports,
                 "reconstruction": reconstruction_export,
                 "reconstruction_world_standard_m_ply_path": reconstruction_export.get("ply_path", ""),
@@ -997,23 +1203,165 @@ if __name__ == "__main__":
         if not stream_text:
             self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: no folders under {self.lidar_stream_capture_root_path()}")
             return
-        stream_dir = Path(stream_text)
-        rows = list(self.lidar_analysis_rows)
-        if not rows:
+        self.open_lidar_analysis_open3d_export_dialog(Path(stream_text))
+
+    def open_lidar_analysis_open3d_export_dialog(self, stream_dir: Path) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Open3D Export Options")
+        dialog.geometry("720x310")
+        dialog.resizable(True, False)
+        dialog.grid_columnconfigure(1, weight=1)
+
+        folder_var = tk.StringVar(value=str(Path(stream_dir).resolve()))
+        mode_var = tk.StringVar(value="reconstruction_only")
+        stride_var = tk.StringVar(value="10")
+        workers_default = max(1, min(4, (os.cpu_count() or 2) - 1))
+        workers_var = tk.StringVar(value=str(workers_default))
+        normals_var = tk.BooleanVar(value=True)
+        reuse_var = tk.BooleanVar(value=True)
+        progress_var = tk.DoubleVar(value=0.0)
+        status_var = tk.StringVar(value="Choose export parameters, then start.")
+        eta_var = tk.StringVar(value="ETA: --")
+
+        def set_latest_folder() -> None:
+            latest = self.lidar_stream_capture_dir or self.find_latest_lidar_stream_capture_dir()
+            if latest is not None:
+                folder_var.set(str(Path(latest).resolve()))
+
+        def browse_folder() -> None:
+            selected = filedialog.askdirectory(
+                title="Select stream_capture_lidar task folder",
+                initialdir=str(self.lidar_stream_capture_root_path()),
+            )
+            if selected:
+                folder_var.set(str(Path(selected).resolve()))
+
+        tk.Label(dialog, text="Folder").grid(row=0, column=0, sticky="e", padx=8, pady=(10, 4))
+        tk.Entry(dialog, textvariable=folder_var).grid(row=0, column=1, sticky="ew", padx=4, pady=(10, 4))
+        tk.Button(dialog, text="Browse", command=browse_folder).grid(row=0, column=2, padx=4, pady=(10, 4))
+        tk.Button(dialog, text="Latest", command=set_latest_folder).grid(row=0, column=3, padx=8, pady=(10, 4))
+
+        tk.Label(dialog, text="Mode").grid(row=1, column=0, sticky="e", padx=8, pady=4)
+        ttk.Combobox(
+            dialog,
+            textvariable=mode_var,
+            values=("reconstruction_only", "sampled_frames", "all_frames"),
+            state="readonly",
+            width=22,
+        ).grid(row=1, column=1, sticky="w", padx=4, pady=4)
+
+        tk.Label(dialog, text="Frame stride").grid(row=2, column=0, sticky="e", padx=8, pady=4)
+        tk.Entry(dialog, textvariable=stride_var, width=8).grid(row=2, column=1, sticky="w", padx=4, pady=4)
+        tk.Label(dialog, text="CPU workers").grid(row=2, column=2, sticky="e", padx=8, pady=4)
+        tk.Entry(dialog, textvariable=workers_var, width=8).grid(row=2, column=3, sticky="w", padx=8, pady=4)
+
+        tk.Checkbutton(dialog, text="Estimate reconstruction normals", variable=normals_var).grid(
+            row=3, column=1, sticky="w", padx=4, pady=4
+        )
+        tk.Checkbutton(dialog, text="Reuse existing exports when present", variable=reuse_var).grid(
+            row=4, column=1, sticky="w", padx=4, pady=4
+        )
+
+        progress = ttk.Progressbar(dialog, variable=progress_var, maximum=100.0)
+        progress.grid(row=5, column=0, columnspan=4, sticky="ew", padx=8, pady=(12, 4))
+        tk.Label(dialog, textvariable=status_var, anchor="w").grid(row=6, column=0, columnspan=4, sticky="ew", padx=8, pady=2)
+        tk.Label(dialog, textvariable=eta_var, anchor="w").grid(row=7, column=0, columnspan=4, sticky="ew", padx=8, pady=2)
+
+        buttons = tk.Frame(dialog)
+        buttons.grid(row=8, column=0, columnspan=4, sticky="e", padx=8, pady=(10, 8))
+        start_button = tk.Button(buttons, text="Start Export")
+        start_button.pack(side="left", padx=4)
+        tk.Button(buttons, text="Close", command=dialog.destroy).pack(side="left", padx=4)
+
+        def parse_positive_int(var: tk.StringVar, default: int, *, minimum: int = 1, maximum: int = 9999) -> int:
             try:
-                rows = self.scan_lidar_analysis_frames(stream_dir)
-            except Exception as exc:
-                self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: scan before Open3D export failed: {exc}")
+                value = int(float(var.get().strip()))
+            except Exception:
+                value = default
+            value = max(minimum, min(maximum, value))
+            var.set(str(value))
+            return value
+
+        def apply_progress(payload: Dict[str, Any], started_at: float) -> None:
+            processed = int(payload.get("processed", 0) or 0)
+            total = max(1, int(payload.get("total", 1) or 1))
+            progress_var.set(min(100.0, processed * 100.0 / total))
+            elapsed = max(0.0, time.monotonic() - started_at)
+            if processed > 0 and total > processed:
+                eta_s = elapsed * (total - processed) / processed
+                eta_var.set(f"ETA: {eta_s:,.1f}s remaining | elapsed {elapsed:,.1f}s")
+            elif processed >= total:
+                eta_var.set(f"ETA: done | elapsed {elapsed:,.1f}s")
+            else:
+                eta_var.set(f"ETA: estimating... | elapsed {elapsed:,.1f}s")
+            stage = str(payload.get("stage", "export"))
+            message = str(payload.get("message", ""))
+            status_var.set(f"{stage}: {processed}/{total} {message}".strip())
+
+        def start_export() -> None:
+            if self.lidar_analysis_open3d_thread is not None and self.lidar_analysis_open3d_thread.is_alive():
+                status_var.set("Open3D export is already running.")
                 return
-        self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: exporting Open3D files -> {stream_dir / 'open3d_export'}")
+            selected_dir = Path(folder_var.get().strip()).resolve()
+            if not selected_dir.exists():
+                status_var.set(f"Folder does not exist: {selected_dir}")
+                return
+            self.lidar_analysis_stream_dir_var.set(str(selected_dir))
+            stride = parse_positive_int(stride_var, 10, minimum=1, maximum=100000)
+            workers = parse_positive_int(workers_var, workers_default, minimum=1, maximum=max(1, os.cpu_count() or 1))
+            selected_mode = mode_var.get()
+            selected_normals = bool(normals_var.get())
+            selected_reuse = bool(reuse_var.get())
+            progress_var.set(0.0)
+            eta_var.set("ETA: estimating...")
+            status_var.set(f"Starting Open3D export -> {selected_dir / 'open3d_export'}")
+            start_button.configure(state="disabled")
+            started_at = time.monotonic()
 
-        def worker() -> None:
-            result = self.safe("Export Open3D", lambda: self.build_lidar_analysis_open3d_export(stream_dir, rows))
-            if isinstance(result, dict):
-                self.root.after(0, lambda r=result: self.apply_lidar_analysis_open3d_export_result(r))
+            def progress_callback(payload: Dict[str, Any]) -> None:
+                self.root.after(0, lambda p=payload: apply_progress(p, started_at))
 
-        self.lidar_analysis_open3d_thread = threading.Thread(target=worker, daemon=True)
-        self.lidar_analysis_open3d_thread.start()
+            def worker() -> None:
+                try:
+                    result = self.build_lidar_analysis_open3d_export(
+                        selected_dir,
+                        rows=None,
+                        export_mode=selected_mode,
+                        frame_stride=stride,
+                        max_workers=workers,
+                        estimate_reconstruction_normals=selected_normals,
+                        reuse_existing=selected_reuse,
+                        progress_callback=progress_callback,
+                    )
+                except Exception as exc:
+                    self.root.after(
+                        0,
+                        lambda e=exc: (
+                            status_var.set(f"Open3D export failed: {e}"),
+                            eta_var.set("ETA: failed"),
+                            start_button.configure(state="normal"),
+                            self.lidar_stream_analysis_status_var.set(f"Lidar Analysis: Open3D export failed: {e}"),
+                        ),
+                    )
+                    return
+                self.root.after(
+                    0,
+                    lambda r=result: (
+                        self.apply_lidar_analysis_open3d_export_result(r),
+                        status_var.set(
+                            f"Done: mode={r.get('export_mode')} frames={r.get('exported_frame_count', 0)} "
+                            f"points={r.get('reconstruction_point_count', 0)}"
+                        ),
+                        eta_var.set(f"ETA: done | total {time.monotonic() - started_at:,.1f}s"),
+                        progress_var.set(100.0),
+                        start_button.configure(state="normal"),
+                    ),
+                )
+
+            self.lidar_analysis_open3d_thread = threading.Thread(target=worker, daemon=True)
+            self.lidar_analysis_open3d_thread.start()
+
+        start_button.configure(command=start_export)
 
     def apply_lidar_analysis_open3d_export_result(self, result: Dict[str, Any]) -> None:
         status = str(result.get("status", ""))
@@ -1025,7 +1373,9 @@ if __name__ == "__main__":
             self.status_var.set("Open3D export needs the open3d package")
             return
         self.lidar_stream_analysis_status_var.set(
-            f"Lidar Analysis: Open3D export frames={result.get('frame_count', 0)}, "
+            f"Lidar Analysis: Open3D export mode={result.get('export_mode', '')}, "
+            f"frames={result.get('exported_frame_count', 0)}/{result.get('frame_count', 0)}, "
+            f"reused={result.get('skipped_existing_frame_count', 0)}, "
             f"points={result.get('reconstruction_point_count', 0)} -> {result.get('export_dir', '')}"
         )
         self.status_var.set(f"Open3D export saved: {result.get('export_dir', '')}")

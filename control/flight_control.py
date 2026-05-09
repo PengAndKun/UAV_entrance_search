@@ -387,6 +387,11 @@ class FlightControlMixin:
         session.args.lidar_depth_projection = str(
             getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)
         )
+        session.args.lidar_capture_processing = flight.normalize_lidar_capture_processing(
+            getattr(self, "lidar_capture_processing_var", None).get()
+            if getattr(self, "lidar_capture_processing_var", None) is not None
+            else getattr(self.args, "lidar_capture_processing", flight.DEFAULT_LIDAR_CAPTURE_PROCESSING)
+        )
 
     def parse_lidar_depth_range(self) -> Tuple[float, float]:
         try:
@@ -586,6 +591,13 @@ class FlightControlMixin:
         )
         return flight.resolve_project_output_path(root_value, flight.DEFAULT_STREAM_CAPTURE_LIDAR_DIR)
 
+    def lidar_capture_processing_mode(self) -> str:
+        return flight.normalize_lidar_capture_processing(
+            getattr(self, "lidar_capture_processing_var", None).get()
+            if getattr(self, "lidar_capture_processing_var", None) is not None
+            else getattr(self.args, "lidar_capture_processing", flight.DEFAULT_LIDAR_CAPTURE_PROCESSING)
+        )
+
     def write_lidar_stream_capture_summary(
         self,
         stream_dir: Path,
@@ -610,6 +622,7 @@ class FlightControlMixin:
             "running": bool(running),
             "frame_count": len(self.lidar_stream_capture_trajectory),
             "source_mode": "depth_backprojected_lidar",
+            "lidar_capture_processing": self.lidar_capture_processing_mode(),
             "lidar_depth_min_cm": float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
             "lidar_depth_max_cm": float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
             "lidar_depth_projection": str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
@@ -618,6 +631,11 @@ class FlightControlMixin:
             ),
             "coordinate_frame": "standard_zup",
             "coordinate_units": "m",
+            "postprocess_status": (
+                self.lidar_stream_last_reconstruction.get("postprocess_status")
+                if isinstance(self.lidar_stream_last_reconstruction, dict) and self.lidar_stream_last_reconstruction.get("postprocess_status")
+                else ("pending" if self.lidar_capture_processing_mode() == "smooth" else "done")
+            ),
             "source_point_count": int(self.lidar_stream_source_point_count),
             "reconstruction": self.lidar_stream_last_reconstruction,
         }
@@ -651,6 +669,36 @@ class FlightControlMixin:
         self.lidar_stream_reconstruction_cloud = np.load(merged_path).astype(np.float32, copy=False)
         self.lidar_stream_last_reconstruction = reconstruction
         return reconstruction
+
+    def postprocess_lidar_stream_capture(self, stream_dir: Path) -> Dict[str, Any]:
+        result = flight.postprocess_lidar_stream_capture(
+            Path(stream_dir),
+            lidar_depth_projection=str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
+            min_depth_cm=float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
+            max_depth_cm=float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+            voxel_cm=flight.DEFAULT_LIDAR_RECON_VOXEL_CM,
+            max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
+        )
+        reconstruction = result.get("reconstruction", {}) if isinstance(result.get("reconstruction"), dict) else {}
+        self.lidar_stream_last_reconstruction = reconstruction
+        self.lidar_stream_source_point_count = int(result.get("source_point_count", self.lidar_stream_source_point_count) or 0)
+        if isinstance(result.get("frame_results"), list):
+            by_dir = {
+                str(Path(str(item.get("capture_dir", ""))).resolve()): item
+                for item in result["frame_results"]
+                if isinstance(item, dict) and item.get("capture_dir")
+            }
+            for entry in self.lidar_stream_capture_trajectory:
+                raw_capture_dir = str(entry.get("capture_dir", "") or "")
+                if not raw_capture_dir:
+                    continue
+                key = str(Path(raw_capture_dir).resolve())
+                if key in by_dir:
+                    entry.update(by_dir[key])
+        merged_path = reconstruction.get("merged_point_cloud_world_standard_m_npy_path") or reconstruction.get("merged_point_cloud_world_npy_path", "")
+        if merged_path and Path(str(merged_path)).exists():
+            self.lidar_stream_reconstruction_cloud = np.load(str(merged_path)).astype(np.float32, copy=False)
+        return result
 
     def update_lidar_stream_reconstruction_from_result(self, result: Dict[str, Any]) -> int:
         raw_path = str(result.get("point_cloud_world_standard_m_npy_path", "") or "")
@@ -806,6 +854,7 @@ class FlightControlMixin:
             return
 
         self.sync_capture_options_to_session(session)
+        processing_mode = self.lidar_capture_processing_mode()
         task_title = self.stream_task_title_var.get().strip() or "stream_task"
         interval_s = self.parse_stream_interval_s()
         stream_dir = self.make_lidar_stream_capture_dir(task_title)
@@ -820,9 +869,14 @@ class FlightControlMixin:
         started_at = datetime.now().isoformat(timespec="milliseconds")
         self.write_lidar_stream_capture_summary(stream_dir, task_title=task_title, interval_s=interval_s, started_at=started_at)
         self.set_stream_task_entry_locked(True)
-        self.lidar_stream_status_var.set(f"Lidar Stream: 0 frames, merged=0 -> {stream_dir}")
-        self.lidar_stream_analysis_status_var.set("Lidar Analysis: idle")
-        self.status_var.set(f"Lidar Stream started: {stream_dir}")
+        if processing_mode == "smooth":
+            self.lidar_stream_status_var.set(f"Lidar Stream: 0 raw frames, mode=smooth -> {stream_dir}")
+            self.lidar_stream_analysis_status_var.set("Lidar Analysis: pending until capture stops")
+            self.status_var.set("Capturing raw frames...")
+        else:
+            self.lidar_stream_status_var.set(f"Lidar Stream: 0 frames, merged=0, mode=full -> {stream_dir}")
+            self.lidar_stream_analysis_status_var.set("Lidar Analysis: idle")
+            self.status_var.set(f"Lidar Stream started: {stream_dir}")
 
         def worker() -> None:
             frame_index = 0
@@ -841,7 +895,10 @@ class FlightControlMixin:
                     if not isinstance(result, dict):
                         break
                     action_detail = result.get("action_detail", {}) if isinstance(result.get("action_detail"), dict) else {}
-                    merged_count = self.update_lidar_stream_reconstruction_from_result(result)
+                    if processing_mode == "smooth":
+                        merged_count = int(self.lidar_stream_reconstruction_cloud.shape[0]) if self.lidar_stream_reconstruction_cloud is not None else 0
+                    else:
+                        merged_count = self.update_lidar_stream_reconstruction_from_result(result)
                     entry = {
                         "frame_index": int(result.get("frame_index", frame_index)),
                         "capture_time": result.get("capture_time", ""),
@@ -881,12 +938,19 @@ class FlightControlMixin:
                         "projection_corrected": bool(result.get("projection_corrected", True)),
                         "coordinate_frame": result.get("coordinate_frame", "standard_zup"),
                         "coordinate_units": result.get("coordinate_units", "m"),
+                        "raw_capture_only": bool(result.get("raw_capture_only", processing_mode == "smooth")),
+                        "postprocess_status": result.get("postprocess_status", "pending" if processing_mode == "smooth" else "done"),
+                        "postprocess_started_at": result.get("postprocess_started_at", ""),
+                        "postprocess_finished_at": result.get("postprocess_finished_at", ""),
+                        "postprocess_error": result.get("postprocess_error", ""),
+                        "lidar_capture_processing": processing_mode,
                         "merged_point_count": int(merged_count),
                     }
                     self.lidar_stream_capture_trajectory.append(entry)
-                    reconstruction = self.save_lidar_stream_reconstruction(stream_dir, force=False)
-                    if reconstruction:
-                        self.lidar_stream_capture_trajectory[-1]["reconstruction"] = reconstruction
+                    if processing_mode == "full":
+                        reconstruction = self.save_lidar_stream_reconstruction(stream_dir, force=False)
+                        if reconstruction:
+                            self.lidar_stream_capture_trajectory[-1]["reconstruction"] = reconstruction
                     self.write_lidar_stream_capture_summary(
                         stream_dir,
                         task_title=task_title,
@@ -908,7 +972,6 @@ class FlightControlMixin:
             finally:
                 stopped_at = datetime.now().isoformat(timespec="milliseconds")
                 try:
-                    self.save_lidar_stream_reconstruction(stream_dir, force=True)
                     self.write_lidar_stream_capture_summary(
                         stream_dir,
                         task_title=task_title,
@@ -917,6 +980,30 @@ class FlightControlMixin:
                         stopped_at=stopped_at,
                         running=False,
                     )
+                    if processing_mode == "smooth":
+                        self.root.after(
+                            0,
+                            lambda d=stream_dir: (
+                                self.lidar_stream_status_var.set(f"Lidar Stream: stopped, postprocessing -> {d}"),
+                                self.lidar_stream_analysis_status_var.set("Lidar Analysis: postprocessing point clouds..."),
+                                self.status_var.set("Postprocessing point clouds..."),
+                            ),
+                        )
+                        postprocess_result = self.postprocess_lidar_stream_capture(stream_dir)
+                        self.root.after(
+                            0,
+                            lambda r=postprocess_result: self.apply_lidar_stream_postprocess_result(r),
+                        )
+                    else:
+                        self.save_lidar_stream_reconstruction(stream_dir, force=True)
+                        self.write_lidar_stream_capture_summary(
+                            stream_dir,
+                            task_title=task_title,
+                            interval_s=interval_s,
+                            started_at=started_at,
+                            stopped_at=stopped_at,
+                            running=False,
+                        )
                 except Exception as exc:
                     LOGGER.warning("Failed to finalize lidar stream capture: %s", exc)
                 self.root.after(
@@ -953,7 +1040,8 @@ class FlightControlMixin:
         self.latest_state.setdefault("last_lidar_stream_capture", result)
         self.latest_state["last_lidar_stream_capture"] = result
         self.stream_player_dir = stream_dir
-        self.stream_player_image_mode_var.set("point_cloud_preview")
+        raw_only = bool(result.get("raw_capture_only", False))
+        self.stream_player_image_mode_var.set("rgb" if raw_only else "point_cloud_preview")
         pose = result.get("pose") if isinstance(result.get("pose"), dict) else {}
         if pose:
             self.latest_state["pose"] = pose
@@ -967,12 +1055,41 @@ class FlightControlMixin:
             )
         point_count = int(result.get("point_count", 0) or 0)
         invalid_count = int(result.get("invalid_depth_count", 0) or 0)
-        self.lidar_stream_status_var.set(
-            f"Lidar Stream: {frame_count} frames, last={point_count}, invalid={invalid_count}, "
-            f"merged={merged_point_count} -> {stream_dir}"
+        if raw_only:
+            self.lidar_stream_status_var.set(
+                f"Lidar Stream: {frame_count} raw frames, postprocess=pending -> {stream_dir}"
+            )
+            self.status_var.set(f"Capturing raw frames... frame {frame_count}")
+        else:
+            self.lidar_stream_status_var.set(
+                f"Lidar Stream: {frame_count} frames, last={point_count}, invalid={invalid_count}, "
+                f"merged={merged_point_count} -> {stream_dir}"
+            )
+            self.status_var.set(f"Lidar Stream frame {frame_count} saved")
+        now = time.monotonic()
+        if now - float(getattr(self, "lidar_stream_last_map_refresh", 0.0) or 0.0) >= 1.5:
+            self.lidar_stream_last_map_refresh = now
+            self.refresh_map_once()
+
+    def apply_lidar_stream_postprocess_result(self, result: Dict[str, Any]) -> None:
+        stream_dir = result.get("stream_dir", "")
+        reconstruction = result.get("reconstruction", {}) if isinstance(result.get("reconstruction"), dict) else {}
+        if reconstruction:
+            self.lidar_stream_last_reconstruction = reconstruction
+        merged_count = int(result.get("merged_point_count", reconstruction.get("merged_point_count", 0)) or 0)
+        frame_count = int(result.get("frame_count", 0) or 0)
+        status = str(result.get("postprocess_status", "done") or "done")
+        ply_path = reconstruction.get(
+            "merged_point_cloud_world_standard_m_ply_path",
+            reconstruction.get("merged_point_cloud_world_ply_path", ""),
         )
-        self.status_var.set(f"Lidar Stream frame {frame_count} saved")
-        self.refresh_map_once()
+        self.lidar_stream_status_var.set(
+            f"Lidar Stream: postprocess {status}, frames={frame_count}, merged={merged_count} -> {stream_dir}"
+        )
+        self.lidar_stream_analysis_status_var.set(
+            f"Lidar Analysis: postprocess {status}, units=m -> {ply_path}"
+        )
+        self.status_var.set(f"Lidar postprocess {status}: {merged_count} points")
 
     def collect_lidar_stream_world_cloud_paths(self, stream_dir: Path) -> List[Path]:
         stream_path = Path(stream_dir)
@@ -1078,36 +1195,23 @@ class FlightControlMixin:
         trajectory_path.write_text(json.dumps(trajectory_payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def rebuild_lidar_stream_reconstruction(self, stream_dir: Path) -> Dict[str, Any]:
-        cloud_paths = self.collect_lidar_stream_world_cloud_paths(stream_dir)
-        merged = np.zeros((0, 6), dtype=np.float32)
-        source_point_count = 0
-        valid_frame_count = 0
-        for cloud_path in cloud_paths:
-            cloud = np.load(cloud_path).astype(np.float32, copy=False)
-            if cloud.ndim != 2 or cloud.shape[1] != 6 or cloud.shape[0] == 0:
-                continue
-            source_point_count += int(cloud.shape[0])
-            valid_frame_count += 1
-            merged = cloud if merged.shape[0] == 0 else np.vstack((merged, cloud))
-            merged = flight.downsample_colored_point_cloud_voxel(
-                merged,
-                voxel_cm=flight.standard_voxel_size_m(flight.DEFAULT_LIDAR_RECON_VOXEL_CM),
-                max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
-            )
-        reconstruction = flight.save_lidar_reconstruction_outputs(
-            merged,
-            Path(stream_dir) / "reconstruction",
-            source_frame_count=valid_frame_count,
-            source_point_count=source_point_count,
-            voxel_cm=flight.DEFAULT_LIDAR_RECON_VOXEL_CM,
-            max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
-            coordinate_frame="standard_zup",
-            coordinate_units="m",
+        result = self.postprocess_lidar_stream_capture(Path(stream_dir))
+        reconstruction = result.get("reconstruction", {}) if isinstance(result.get("reconstruction"), dict) else {}
+        merged_result = dict(reconstruction)
+        merged_result.update(
+            {
+                "stream_dir": str(stream_dir),
+                "input_cloud_file_count": int(result.get("input_cloud_file_count", 0) or 0),
+                "source_frame_count": int(result.get("source_frame_count", reconstruction.get("source_frame_count", 0)) or 0),
+                "source_point_count": int(result.get("source_point_count", reconstruction.get("source_point_count", 0)) or 0),
+                "merged_point_count": int(result.get("merged_point_count", reconstruction.get("merged_point_count", 0)) or 0),
+                "postprocess_status": result.get("postprocess_status", "done"),
+                "postprocess_started_at": result.get("postprocess_started_at", ""),
+                "postprocess_finished_at": result.get("postprocess_finished_at", ""),
+                "postprocess_error": result.get("postprocess_error", ""),
+            }
         )
-        self.update_lidar_stream_reconstruction_metadata(Path(stream_dir), reconstruction)
-        reconstruction["stream_dir"] = str(stream_dir)
-        reconstruction["input_cloud_file_count"] = len(cloud_paths)
-        return reconstruction
+        return merged_result
 
     def find_latest_lidar_stream_capture_dir(self) -> Optional[Path]:
         root = self.lidar_stream_capture_root_path()
@@ -1116,7 +1220,8 @@ class FlightControlMixin:
         candidates = [path for path in root.iterdir() if path.is_dir()]
         candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
         for candidate in candidates:
-            if self.collect_lidar_stream_world_cloud_paths(candidate):
+            frames_root = candidate / "frames"
+            if frames_root.exists() and any(path.is_dir() for path in frames_root.glob("frame_*")):
                 return candidate
         return None
 

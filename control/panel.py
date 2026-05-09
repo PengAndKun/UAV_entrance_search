@@ -31,6 +31,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.lidar_stream_reconstruction_cloud: Optional[np.ndarray] = None
         self.lidar_stream_source_point_count = 0
         self.lidar_stream_last_reconstruction: Dict[str, Any] = {}
+        self.lidar_stream_last_map_refresh = 0.0
         self.sequence_thread: Optional[threading.Thread] = None
         self.sequence_stop_event = threading.Event()
         self.route_thread: Optional[threading.Thread] = None
@@ -97,6 +98,11 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         )
         self.lidar_depth_max_cm_var = tk.StringVar(
             value=str(getattr(args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM))
+        )
+        self.lidar_capture_processing_var = tk.StringVar(
+            value=flight.normalize_lidar_capture_processing(
+                getattr(args, "lidar_capture_processing", flight.DEFAULT_LIDAR_CAPTURE_PROCESSING)
+            )
         )
         self.stream_task_title_var = tk.StringVar(value="stream_task")
         self.stream_interval_s_var = tk.StringVar(
@@ -440,6 +446,14 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Button(stream, text="Stop Lidar Capture", command=self.on_stop_lidar_stream_capture).grid(row=2, column=1, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Analyze Lidar", command=self.open_lidar_analysis_window).grid(row=2, column=2, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Export Open3D", command=self.export_lidar_analysis_open3d).grid(row=2, column=3, sticky="w", padx=6, pady=(0, 6))
+        tk.Label(stream, text="Lidar mode").grid(row=2, column=4, sticky="e", padx=(12, 2), pady=(0, 6))
+        ttk.Combobox(
+            stream,
+            textvariable=self.lidar_capture_processing_var,
+            values=("smooth", "full"),
+            state="readonly",
+            width=8,
+        ).grid(row=2, column=5, sticky="w", padx=(0, 8), pady=(0, 6))
         tk.Label(stream, textvariable=self.stream_status_var, anchor="w").grid(row=3, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
         tk.Label(stream, textvariable=self.lidar_stream_status_var, anchor="w").grid(row=4, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
         tk.Label(stream, textvariable=self.lidar_stream_analysis_status_var, anchor="w").grid(row=5, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
@@ -693,6 +707,9 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
             lidar_depth_min_cm=lidar_min_cm,
             lidar_depth_max_cm=lidar_max_cm,
             lidar_depth_projection=str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
+            lidar_capture_processing=flight.normalize_lidar_capture_processing(
+                self.lidar_capture_processing_var.get()
+            ),
             force_kill_unreal_on_stop=bool(self.args.force_kill_unreal_on_stop),
             log_level=self.args.log_level,
         )
