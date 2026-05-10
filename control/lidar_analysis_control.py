@@ -1933,6 +1933,7 @@ import open3d as o3d
 
 ROOT = Path(__file__).resolve().parent
 LABELS_PATH = os.environ.get("UAV_LIDAR_LABELS_PATH", "").strip()
+SEMANTIC_FILTER_RADIUS_M = float(os.environ.get("UAV_LIDAR_SEMANTIC_FILTER_RADIUS_M", "6.0"))
 
 
 def load_json(path):
@@ -1951,7 +1952,89 @@ def load_point_cloud(path):
     return pcd if pcd.has_points() else None
 
 
-def load_clouds():
+def make_point_cloud(points, colors=None):
+    pcd = o3d.geometry.PointCloud()
+    if points is None or len(points) == 0:
+        return pcd
+    pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+    if colors is not None and len(colors) == len(points):
+        color_arr = np.asarray(colors, dtype=np.float64)
+        if color_arr.size and float(np.nanmax(color_arr)) > 1.0:
+            color_arr = color_arr / 255.0
+        color_arr = np.clip(color_arr, 0.0, 1.0)
+        pcd.colors = o3d.utility.Vector3dVector(color_arr)
+    return pcd
+
+
+def semantic_color_rgb(label):
+    color = label.get("color_rgb")
+    if isinstance(color, list) and len(color) >= 3:
+        try:
+            return tuple(int(round(float(color[i]))) for i in range(3))
+        except Exception:
+            pass
+    class_name = str(label.get("class_name_normalized") or label.get("class_name") or "").strip().lower()
+    defaults = {
+        "window": (50, 170, 255),
+        "door": (255, 245, 80),
+        "close_door": (255, 145, 30),
+        "closed_door": (255, 145, 30),
+        "open_door": (40, 230, 80),
+        "open door": (40, 230, 80),
+    }
+    return defaults.get(class_name)
+
+
+def load_semantic_point_cloud(labels):
+    ply_path = ROOT / "semantic" / "semantic_points_standard_m.ply"
+    npy_path = ROOT / "semantic" / "semantic_points_standard_m.npy"
+    if not LABELS_PATH:
+        return load_point_cloud(ply_path)
+    if not labels or not npy_path.exists():
+        return make_point_cloud([], [])
+    wanted_colors = {color for color in (semantic_color_rgb(label) for label in labels) if color is not None}
+    if not wanted_colors:
+        return make_point_cloud([], [])
+    try:
+        arr = np.load(npy_path)
+    except Exception as exc:
+        print(f"Could not load semantic npy for Lidar2 filtering: {exc}")
+        return make_point_cloud([], [])
+    if arr.ndim != 2 or arr.shape[1] < 6:
+        return make_point_cloud([], [])
+    point_colors = np.rint(arr[:, 3:6]).astype(np.int16)
+    mask = np.zeros(len(arr), dtype=bool)
+    for rgb in wanted_colors:
+        target = np.array(rgb, dtype=np.int16)
+        mask |= np.all(np.abs(point_colors - target) <= 2, axis=1)
+    spatial_mask = np.zeros(len(arr), dtype=bool)
+    for label in labels:
+        rgb = semantic_color_rgb(label)
+        center = label.get("center_world_m")
+        if rgb is None or not isinstance(center, list) or len(center) < 2:
+            continue
+        try:
+            xy = np.array([float(center[0]), float(center[1])], dtype=np.float32)
+        except Exception:
+            continue
+        if not np.isfinite(xy).all():
+            continue
+        target = np.array(rgb, dtype=np.int16)
+        same_color = np.all(np.abs(point_colors - target) <= 2, axis=1)
+        near_label = np.linalg.norm(arr[:, :2] - xy[None, :], axis=1) <= SEMANTIC_FILTER_RADIUS_M
+        spatial_mask |= same_color & near_label
+    if spatial_mask.any():
+        mask = spatial_mask
+    filtered = arr[mask]
+    print(
+        f"Lidar2 filtered semantic points: {len(filtered)}/{len(arr)} "
+        f"using {len(wanted_colors)} label color(s), radius={SEMANTIC_FILTER_RADIUS_M:g}m "
+        f"from {LABELS_PATH}"
+    )
+    return make_point_cloud(filtered[:, :3], filtered[:, 3:6])
+
+
+def load_clouds(labels=None):
     named = []
     reconstruction = load_point_cloud(ROOT / "reconstruction_world_standard_m.ply")
     if reconstruction is not None:
@@ -1961,10 +2044,11 @@ def load_clouds():
             pcd = load_point_cloud(path)
             if pcd is not None:
                 named.append((path.stem, pcd))
-    if not LABELS_PATH:
-        semantic = load_point_cloud(ROOT / "semantic" / "semantic_points_standard_m.ply")
-        if semantic is not None:
-            named.append(("semantic_yolo_points", semantic))
+    semantic = load_semantic_point_cloud(labels or [])
+    if semantic is not None:
+        if semantic.has_points():
+            suffix = "_filtered" if LABELS_PATH else ""
+            named.append((f"semantic_yolo_points{suffix}", semantic))
     return named
 
 
@@ -1983,19 +2067,22 @@ def load_labels():
 
 def label_text(label):
     assessment = label.get("entry_assessment") if isinstance(label.get("entry_assessment"), dict) else {}
-    if assessment.get("crossing_ready"):
-        entry_state = "crossing"
-    elif assessment.get("traversable"):
-        entry_state = "enterable"
-    elif assessment:
-        entry_state = "rejected"
-    else:
-        entry_state = "semantic"
-    house = label.get("house_name") or "no_house"
+    extras = []
+    house = str(label.get("house_name") or "").strip()
+    if house:
+        extras.append(house)
+    if assessment:
+        if assessment.get("crossing_ready"):
+            extras.append("crossing")
+        elif assessment.get("traversable"):
+            extras.append("enterable")
+        else:
+            extras.append("rejected")
+    extra_text = (" " + " ".join(extras)) if extras else ""
     return (
         f"{label.get('class_name', 'object')} #{label.get('label_id', '')} "
-        f"{float(label.get('best_confidence') or 0.0):.2f} "
-        f"{house} {entry_state} obs={label.get('observation_count', 0)}"
+        f"{float(label.get('best_confidence') or 0.0):.2f}"
+        f"{extra_text} obs={label.get('observation_count', 0)}"
     )
 
 
@@ -2064,8 +2151,8 @@ def try_gui_view(named_geometries, labels):
 
 
 def main():
-    named_geometries = load_clouds()
     labels = load_labels()
+    named_geometries = load_clouds(labels)
     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=2.0, origin=[0.0, 0.0, 0.0])
     named_geometries.append(("axis", axis))
     if labels and try_gui_view(named_geometries, labels):
