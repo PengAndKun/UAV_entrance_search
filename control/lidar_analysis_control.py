@@ -86,6 +86,788 @@ class LidarAnalysisControlMixin:
             self.lidar_yolo_dedupe_radius_var = tk.StringVar(value=f"{lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_DEDUPE_RADIUS_M:g}")
         if not hasattr(self, "lidar_yolo_max_points_var"):
             self.lidar_yolo_max_points_var = tk.StringVar(value=str(lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_MAX_POINTS_PER_DETECTION))
+        if not hasattr(self, "lidar2_window"):
+            self.lidar2_window = None
+        if not hasattr(self, "lidar2_stream_dir_var"):
+            self.lidar2_stream_dir_var = tk.StringVar(value="")
+        if not hasattr(self, "lidar2_rgb_mode_var"):
+            self.lidar2_rgb_mode_var = tk.StringVar(value="YOLO Annotated")
+        if not hasattr(self, "lidar2_house_filter_var"):
+            self.lidar2_house_filter_var = tk.StringVar(value="Auto")
+        if not hasattr(self, "lidar2_entry_filter_var"):
+            self.lidar2_entry_filter_var = tk.StringVar(value="All")
+        if not hasattr(self, "lidar2_traces_bound"):
+            self.lidar2_traces_bound = False
+        if not hasattr(self, "lidar2_rows"):
+            self.lidar2_rows = []
+        if not hasattr(self, "lidar2_labels"):
+            self.lidar2_labels = []
+        if not hasattr(self, "lidar2_filtered_labels"):
+            self.lidar2_filtered_labels = []
+        if not hasattr(self, "lidar2_house_regions"):
+            self.lidar2_house_regions = []
+        if not hasattr(self, "lidar2_index"):
+            self.lidar2_index = 0
+        if not hasattr(self, "lidar2_cached_index"):
+            self.lidar2_cached_index = -1
+        if not hasattr(self, "lidar2_cached_cloud"):
+            self.lidar2_cached_cloud = None
+        if not hasattr(self, "lidar2_frame_listbox"):
+            self.lidar2_frame_listbox = None
+        if not hasattr(self, "lidar2_label_listbox"):
+            self.lidar2_label_listbox = None
+        if not hasattr(self, "lidar2_summary_text"):
+            self.lidar2_summary_text = None
+        if not hasattr(self, "lidar2_json_text"):
+            self.lidar2_json_text = None
+        if not hasattr(self, "lidar2_rgb_label"):
+            self.lidar2_rgb_label = None
+        if not hasattr(self, "lidar2_rgb_photo"):
+            self.lidar2_rgb_photo = None
+        if not hasattr(self, "lidar2_semantic_frame_map"):
+            self.lidar2_semantic_frame_map = {}
+
+    def open_lidar2_analysis_window(self) -> None:
+        self.ensure_lidar_analysis_state()
+        if self.lidar2_window is not None and self.lidar2_window.winfo_exists():
+            self.lidar2_window.lift()
+            return
+        if not self.lidar2_stream_dir_var.get().strip():
+            default_dir = self.lidar_stream_capture_dir or self.find_latest_lidar_stream_capture_dir()
+            if default_dir is not None:
+                self.lidar2_stream_dir_var.set(str(default_dir))
+
+        self.lidar2_window = tk.Toplevel(self.root)
+        self.lidar2_window.title("Analyze Lidar 2")
+        self.lidar2_window.geometry("1480x920")
+        self.lidar2_window.protocol("WM_DELETE_WINDOW", self.close_lidar2_analysis_window)
+        self.lidar2_window.grid_columnconfigure(0, weight=1)
+        self.lidar2_window.grid_rowconfigure(2, weight=1)
+
+        top = tk.Frame(self.lidar2_window)
+        top.grid(row=0, column=0, sticky="ew", padx=8, pady=8)
+        top.grid_columnconfigure(1, weight=1)
+        tk.Label(top, text="Lidar Folder").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=3)
+        tk.Entry(top, textvariable=self.lidar2_stream_dir_var).grid(row=0, column=1, sticky="ew", padx=4, pady=3)
+        tk.Button(top, text="Browse", command=self.select_lidar2_analysis_folder).grid(row=0, column=2, padx=4, pady=3)
+        tk.Button(top, text="Latest", command=self.use_latest_lidar2_analysis_folder).grid(row=0, column=3, padx=4, pady=3)
+        tk.Button(top, text="Load Frames", command=self.load_lidar2_analysis_frames).grid(row=0, column=4, padx=4, pady=3)
+
+        controls = tk.Frame(self.lidar2_window)
+        controls.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
+        controls.grid_columnconfigure(12, weight=1)
+        tk.Label(controls, text="RGB").grid(row=0, column=0, padx=(0, 3), pady=3)
+        ttk.Combobox(
+            controls,
+            textvariable=self.lidar2_rgb_mode_var,
+            values=("YOLO Annotated", "Raw RGB"),
+            state="readonly",
+            width=14,
+        ).grid(row=0, column=1, padx=(0, 8), pady=3)
+        tk.Label(controls, text="House").grid(row=0, column=2, padx=(0, 3), pady=3)
+        self.lidar2_house_combo = ttk.Combobox(
+            controls,
+            textvariable=self.lidar2_house_filter_var,
+            values=("Auto", "All"),
+            state="readonly",
+            width=13,
+        )
+        self.lidar2_house_combo.grid(row=0, column=3, padx=(0, 8), pady=3)
+        tk.Label(controls, text="Entry").grid(row=0, column=4, padx=(0, 3), pady=3)
+        ttk.Combobox(
+            controls,
+            textvariable=self.lidar2_entry_filter_var,
+            values=("All", "Enterable Only", "Crossing Ready Only", "Rejected Only"),
+            state="readonly",
+            width=18,
+        ).grid(row=0, column=5, padx=(0, 8), pady=3)
+        tk.Button(controls, text="Apply Filter", command=self.apply_lidar2_filters_and_refresh).grid(row=0, column=6, padx=4, pady=3)
+        tk.Button(controls, text="Export Open3D", command=self.export_lidar2_open3d).grid(row=0, column=7, padx=4, pady=3)
+        tk.Button(controls, text="YOLO Labels", command=self.open_lidar2_yolo_labels_dialog).grid(row=0, column=8, padx=4, pady=3)
+        tk.Button(controls, text="Open3D Viewer", command=self.open_lidar2_open3d_viewer).grid(row=0, column=9, padx=4, pady=3)
+
+        if not self.lidar2_traces_bound:
+            for var in (
+                self.lidar2_rgb_mode_var,
+                self.lidar2_house_filter_var,
+                self.lidar2_entry_filter_var,
+            ):
+                var.trace_add("write", lambda *_args: self.apply_lidar2_filters_and_refresh())
+            self.lidar2_traces_bound = True
+
+        body = tk.PanedWindow(self.lidar2_window, orient="horizontal", sashrelief="raised")
+        body.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 8))
+
+        left = tk.PanedWindow(body, orient="vertical", sashrelief="raised")
+        frame_panel = tk.Frame(left)
+        frame_panel.grid_rowconfigure(1, weight=1)
+        frame_panel.grid_columnconfigure(0, weight=1)
+        tk.Label(frame_panel, text="Frames", anchor="w").grid(row=0, column=0, sticky="ew")
+        self.lidar2_frame_listbox = tk.Listbox(frame_panel, width=52, height=12, exportselection=False)
+        frame_scroll = tk.Scrollbar(frame_panel, orient="vertical", command=self.lidar2_frame_listbox.yview)
+        self.lidar2_frame_listbox.configure(yscrollcommand=frame_scroll.set)
+        self.lidar2_frame_listbox.grid(row=1, column=0, sticky="nsew")
+        frame_scroll.grid(row=1, column=1, sticky="ns")
+        self.lidar2_frame_listbox.bind("<<ListboxSelect>>", self.on_lidar2_frame_selected)
+        left.add(frame_panel, minsize=220)
+
+        label_panel = tk.Frame(left)
+        label_panel.grid_rowconfigure(1, weight=1)
+        label_panel.grid_columnconfigure(0, weight=1)
+        tk.Label(label_panel, text="Filtered YOLO / Entry Labels", anchor="w").grid(row=0, column=0, sticky="ew")
+        self.lidar2_label_listbox = tk.Listbox(label_panel, width=52, exportselection=False)
+        label_scroll = tk.Scrollbar(label_panel, orient="vertical", command=self.lidar2_label_listbox.yview)
+        self.lidar2_label_listbox.configure(yscrollcommand=label_scroll.set)
+        self.lidar2_label_listbox.grid(row=1, column=0, sticky="nsew")
+        label_scroll.grid(row=1, column=1, sticky="ns")
+        self.lidar2_label_listbox.bind("<<ListboxSelect>>", self.on_lidar2_label_selected)
+        left.add(label_panel, minsize=360)
+        body.add(left, minsize=430)
+
+        right = tk.PanedWindow(body, orient="vertical", sashrelief="raised")
+        rgb_panel = tk.Frame(right)
+        rgb_panel.grid_rowconfigure(0, weight=1)
+        rgb_panel.grid_columnconfigure(0, weight=1)
+        self.lidar2_rgb_label = tk.Label(rgb_panel, text="Load a Lidar2 frame.", anchor="center")
+        self.lidar2_rgb_label.grid(row=0, column=0, sticky="nsew")
+        right.add(rgb_panel, minsize=520)
+
+        text_panel = tk.PanedWindow(right, orient="horizontal", sashrelief="raised")
+        self.lidar2_summary_text = tk.Text(text_panel, height=9, wrap="word")
+        text_panel.add(self.lidar2_summary_text, minsize=460)
+        json_frame = tk.Frame(text_panel)
+        json_frame.grid_rowconfigure(0, weight=1)
+        json_frame.grid_columnconfigure(0, weight=1)
+        self.lidar2_json_text = tk.Text(json_frame, height=9, wrap="none")
+        json_scroll = tk.Scrollbar(json_frame, orient="vertical", command=self.lidar2_json_text.yview)
+        self.lidar2_json_text.configure(yscrollcommand=json_scroll.set)
+        self.lidar2_json_text.grid(row=0, column=0, sticky="nsew")
+        json_scroll.grid(row=0, column=1, sticky="ns")
+        text_panel.add(json_frame, minsize=460)
+        right.add(text_panel, minsize=190)
+        body.add(right, minsize=760)
+
+        tk.Label(self.lidar2_window, textvariable=self.lidar_stream_analysis_status_var, anchor="w").grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            padx=8,
+            pady=(0, 8),
+        )
+
+        if self.lidar2_stream_dir_var.get().strip():
+            self.load_lidar2_analysis_frames()
+
+    def close_lidar2_analysis_window(self) -> None:
+        if getattr(self, "lidar2_window", None) is not None and self.lidar2_window.winfo_exists():
+            self.lidar2_window.destroy()
+        self.lidar2_window = None
+        self.lidar2_frame_listbox = None
+        self.lidar2_label_listbox = None
+        self.lidar2_summary_text = None
+        self.lidar2_json_text = None
+        self.lidar2_rgb_label = None
+        self.lidar2_rgb_photo = None
+
+    def select_lidar2_analysis_folder(self) -> None:
+        selected = filedialog.askdirectory(
+            title="Select stream_capture_lidar task folder",
+            initialdir=str(self.lidar_stream_capture_root_path()),
+        )
+        if selected:
+            self.lidar2_stream_dir_var.set(str(Path(selected)))
+            self.load_lidar2_analysis_frames()
+
+    def use_latest_lidar2_analysis_folder(self) -> None:
+        latest_dir = self.find_latest_lidar_stream_capture_dir()
+        if latest_dir is None:
+            self.lidar_stream_analysis_status_var.set(f"Lidar2: no lidar stream folders under {self.lidar_stream_capture_root_path()}")
+            return
+        self.lidar2_stream_dir_var.set(str(latest_dir))
+        self.load_lidar2_analysis_frames()
+
+    def export_lidar2_open3d(self) -> None:
+        stream_text = self.lidar2_stream_dir_var.get().strip()
+        if stream_text:
+            self.lidar_analysis_stream_dir_var.set(stream_text)
+        self.export_lidar_analysis_open3d()
+
+    def open_lidar2_yolo_labels_dialog(self) -> None:
+        stream_text = self.lidar2_stream_dir_var.get().strip()
+        if stream_text:
+            self.lidar_analysis_stream_dir_var.set(stream_text)
+        self.open_lidar_yolo_labels_dialog()
+
+    def open_lidar2_open3d_viewer(self) -> None:
+        stream_text = self.lidar2_stream_dir_var.get().strip()
+        if stream_text:
+            self.lidar_analysis_stream_dir_var.set(stream_text)
+        if not stream_text:
+            latest = self.lidar_stream_capture_dir or self.find_latest_lidar_stream_capture_dir()
+            if latest is not None:
+                stream_text = str(latest)
+                self.lidar2_stream_dir_var.set(stream_text)
+                self.lidar_analysis_stream_dir_var.set(stream_text)
+        if not stream_text:
+            self.lidar_stream_analysis_status_var.set(f"Lidar2: no lidar stream folders under {self.lidar_stream_capture_root_path()}")
+            return
+        stream_dir = Path(stream_text)
+        export_dir = stream_dir / "open3d_export"
+        viewer_path = export_dir / "open3d_viewer.py"
+        has_cloud = (
+            (export_dir / "reconstruction_world_standard_m.ply").exists()
+            or (export_dir / "reconstruction_world_standard_m.pcd").exists()
+            or any((export_dir / "frames").glob("*_world_standard_m.ply"))
+        )
+        if not export_dir.exists() or not has_cloud:
+            self.lidar_stream_analysis_status_var.set("Lidar2: export Open3D files before opening viewer")
+            return
+        try:
+            if not self.lidar2_rows and self.lidar2_stream_dir_var.get().strip():
+                self.load_lidar2_analysis_frames()
+            self.apply_lidar2_filters(write_outputs=True)
+            viewer_path.write_text(self.build_lidar_analysis_open3d_viewer_script(), encoding="utf-8")
+        except Exception as exc:
+            self.lidar_stream_analysis_status_var.set(f"Lidar2: failed to prepare filtered Open3D viewer: {exc}")
+            return
+        status = flight.open3d_status()
+        if not status.get("available"):
+            self.lidar_stream_analysis_status_var.set(f"Lidar2: Open3D unavailable: {status.get('error', '')}")
+            return
+        try:
+            import subprocess
+            import sys
+
+            env = os.environ.copy()
+            env["UAV_LIDAR_LABELS_PATH"] = str((stream_dir / "lidar2_analysis" / "filtered_labels.json").resolve())
+            subprocess.Popen([sys.executable, str(viewer_path)], cwd=str(export_dir), env=env)
+            self.lidar_stream_analysis_status_var.set(f"Lidar2: Open3D viewer launched with filtered labels -> {viewer_path}")
+        except Exception as exc:
+            self.lidar_stream_analysis_status_var.set(f"Lidar2: Open3D viewer launch failed: {exc}")
+
+    def load_lidar2_analysis_frames(self) -> None:
+        self.ensure_lidar_analysis_state()
+        stream_text = self.lidar2_stream_dir_var.get().strip()
+        if not stream_text:
+            self.use_latest_lidar2_analysis_folder()
+            stream_text = self.lidar2_stream_dir_var.get().strip()
+        if not stream_text:
+            return
+        stream_dir = Path(stream_text)
+        try:
+            rows = self.scan_lidar_analysis_frames(stream_dir)
+            self.lidar2_semantic_frame_map = self.load_lidar2_semantic_frame_map(stream_dir)
+            self.lidar2_house_regions = self.load_lidar2_house_regions()
+            self.lidar2_labels = self.load_lidar2_semantic_labels(stream_dir)
+        except Exception as exc:
+            self.lidar_stream_analysis_status_var.set(f"Lidar2: load failed: {exc}")
+            return
+        self.lidar2_rows = rows
+        self.lidar2_index = 0
+        self.lidar2_cached_index = -1
+        self.lidar2_cached_cloud = None
+        self.refresh_lidar2_house_choices()
+        self.apply_lidar2_filters(write_outputs=True)
+        self.populate_lidar2_frames(rows)
+        self.populate_lidar2_labels()
+        total_points = int(rows[-1].get("cumulative_point_count", 0) or 0) if rows else 0
+        self.lidar_stream_analysis_status_var.set(
+            f"Lidar2: frames={len(rows)}, labels={len(self.lidar2_labels)}, filtered={len(self.lidar2_filtered_labels)}, "
+            f"points={total_points} -> {stream_dir}"
+        )
+        if rows:
+            self.show_lidar2_row(0)
+        else:
+            self.lidar_stream_analysis_status_var.set(f"Lidar2: no frames found -> {stream_dir}")
+
+    def load_lidar2_semantic_frame_map(self, stream_dir: Path) -> Dict[int, Dict[str, Any]]:
+        summary = self.read_lidar_analysis_json(stream_dir / "open3d_export" / "semantic" / "semantic_projection_summary.json")
+        if not summary:
+            export_summary = self.read_lidar_analysis_json(stream_dir / "open3d_export" / "open3d_export_summary.json")
+            raw_path = export_summary.get("semantic_projection_summary_path", "") if isinstance(export_summary, dict) else ""
+            if raw_path:
+                summary = self.read_lidar_analysis_json(Path(str(raw_path)))
+        rows = summary.get("frames", []) if isinstance(summary, dict) else []
+        frame_map: Dict[int, Dict[str, Any]] = {}
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    frame_map[int(row.get("frame_index", 0) or 0)] = row
+                except Exception:
+                    continue
+        return frame_map
+
+    def load_lidar2_semantic_labels(self, stream_dir: Path) -> List[Dict[str, Any]]:
+        labels_path = stream_dir / "open3d_export" / "semantic" / "semantic_labels.json"
+        payload = self.read_lidar_analysis_json(labels_path)
+        labels = payload.get("labels", []) if isinstance(payload, dict) else []
+        enriched: List[Dict[str, Any]] = []
+        if isinstance(labels, list):
+            for label in labels:
+                if isinstance(label, dict):
+                    enriched.append(self.enrich_lidar2_label(stream_dir, label))
+        return enriched
+
+    def refresh_lidar2_house_choices(self) -> None:
+        combo = getattr(self, "lidar2_house_combo", None)
+        if combo is None:
+            return
+        names = sorted({str(region.get("name", "")) for region in self.lidar2_house_regions if region.get("name")})
+        combo.configure(values=("Auto", "All", *names))
+        current = self.lidar2_house_filter_var.get()
+        if current not in {"Auto", "All"} and current not in names:
+            self.lidar2_house_filter_var.set("Auto")
+
+    def load_lidar2_house_regions(self) -> List[Dict[str, Any]]:
+        config = self.map_config if isinstance(getattr(self, "map_config", None), dict) and self.map_config else {}
+        if not config:
+            for candidate in (
+                PROJECT_ROOT / "assets" / "overhead_map" / "manual_shift_houses_config.json",
+                PROJECT_ROOT / "assets" / "overhead_map" / "houses_config.json",
+            ):
+                if candidate.exists():
+                    config = self.read_lidar_analysis_json(candidate)
+                    if config:
+                        break
+        houses = config.get("houses", []) if isinstance(config, dict) else []
+        calibration = (
+            config.get("overhead_map", {}).get("calibration", {})
+            if isinstance(config.get("overhead_map"), dict)
+            else {}
+        )
+        affine = calibration.get("affine_world_to_image") if isinstance(calibration, dict) else None
+        inverse_affine = self.lidar2_inverse_affine(affine)
+        regions: List[Dict[str, Any]] = []
+        if not isinstance(houses, list):
+            return regions
+        for house in houses:
+            if not isinstance(house, dict):
+                continue
+            name = str(house.get("name") or f"House_{house.get('id', '')}").strip()
+            bbox = house.get("map_bbox_image") if isinstance(house.get("map_bbox_image"), dict) else {}
+            bounds = None
+            if inverse_affine is not None and bbox:
+                try:
+                    corners = [
+                        (float(bbox["x1"]), float(bbox["y1"])),
+                        (float(bbox["x2"]), float(bbox["y1"])),
+                        (float(bbox["x2"]), float(bbox["y2"])),
+                        (float(bbox["x1"]), float(bbox["y2"])),
+                    ]
+                    world = np.array([self.lidar2_image_to_world_cm(inverse_affine, x, y) for x, y in corners], dtype=np.float32)
+                    bounds = {
+                        "min_x": float(np.nanmin(world[:, 0])),
+                        "max_x": float(np.nanmax(world[:, 0])),
+                        "min_y": float(np.nanmin(world[:, 1])),
+                        "max_y": float(np.nanmax(world[:, 1])),
+                    }
+                except Exception:
+                    bounds = None
+            if bounds is None:
+                try:
+                    cx = float(house.get("center_x", 0.0) or 0.0)
+                    cy = float(house.get("center_y", 0.0) or 0.0)
+                    radius = float(house.get("radius_cm", 0.0) or 0.0)
+                    bounds = {"min_x": cx - radius, "max_x": cx + radius, "min_y": cy - radius, "max_y": cy + radius}
+                except Exception:
+                    continue
+            regions.append({"id": str(house.get("id", "")), "name": name, "bounds_cm": bounds})
+        return regions
+
+    def lidar2_inverse_affine(self, affine: Any) -> Optional[np.ndarray]:
+        try:
+            matrix = np.array(affine, dtype=np.float64)
+            if matrix.shape != (2, 3):
+                return None
+            full = np.vstack([matrix, np.array([0.0, 0.0, 1.0])])
+            return np.linalg.inv(full)
+        except Exception:
+            return None
+
+    def lidar2_image_to_world_cm(self, inverse_affine: np.ndarray, image_x: float, image_y: float) -> Tuple[float, float]:
+        world = inverse_affine @ np.array([float(image_x), float(image_y), 1.0], dtype=np.float64)
+        return float(world[0]), float(world[1])
+
+    def enrich_lidar2_label(self, stream_dir: Path, label: Dict[str, Any]) -> Dict[str, Any]:
+        item = dict(label)
+        center_m = item.get("center_world_m", [])
+        center_cm: List[float] = []
+        if isinstance(center_m, list) and len(center_m) >= 3:
+            try:
+                center_cm = [float(center_m[0]) * 100.0, -float(center_m[1]) * 100.0, float(center_m[2]) * 100.0]
+            except Exception:
+                center_cm = []
+        item["center_world_cm"] = center_cm
+        matched = self.match_lidar2_house(center_cm)
+        item["house_id"] = matched.get("id", "") if matched else ""
+        item["house_name"] = matched.get("name", "") if matched else ""
+        item["entry_assessment"] = self.assess_lidar2_label_entry(stream_dir, item)
+        return item
+
+    def match_lidar2_house(self, center_cm: List[float]) -> Dict[str, Any]:
+        if not center_cm or len(center_cm) < 2:
+            return {}
+        x_cm, y_cm = float(center_cm[0]), float(center_cm[1])
+        for region in self.lidar2_house_regions:
+            bounds = region.get("bounds_cm") if isinstance(region.get("bounds_cm"), dict) else {}
+            if (
+                float(bounds.get("min_x", -1e18)) <= x_cm <= float(bounds.get("max_x", 1e18))
+                and float(bounds.get("min_y", -1e18)) <= y_cm <= float(bounds.get("max_y", 1e18))
+            ):
+                return region
+        return {}
+
+    def assess_lidar2_label_entry(self, stream_dir: Path, label: Dict[str, Any]) -> Dict[str, Any]:
+        observation = label.get("representative_observation")
+        if not isinstance(observation, dict):
+            return {"status": "missing_observation", "traversable": False, "crossing_ready": False}
+        class_name = str(observation.get("class_name_normalized") or observation.get("class_name") or label.get("class_name", "")).lower()
+        xyxy = observation.get("xyxy", [])
+        if not isinstance(xyxy, list) or len(xyxy) != 4:
+            return {"status": "missing_bbox", "traversable": False, "crossing_ready": False}
+        frame_name = str(observation.get("frame_name") or f"frame_{int(observation.get('frame_index', 0) or 0):06d}")
+        capture_dir = stream_dir / "frames" / frame_name
+        depth_path = capture_dir / "depth.npy"
+        if depth_path.exists():
+            depth_cm = flight.coerce_depth_planar_image(np.load(depth_path)).astype(np.float32, copy=False)
+        else:
+            depth_png = capture_dir / "depth_cm.png"
+            if not depth_png.exists():
+                return {"status": "missing_depth", "traversable": False, "crossing_ready": False}
+            depth_cm = flight.coerce_depth_planar_image(cv2.imread(str(depth_png), cv2.IMREAD_UNCHANGED)).astype(np.float32, copy=False)
+        camera_info = self.read_lidar_analysis_json(capture_dir / "camera_info.json")
+        rgb_path = capture_dir / "rgb.png"
+        rgb_shape = (int(camera_info.get("image_height", 256) or 256), int(camera_info.get("image_width", 256) or 256))
+        if rgb_path.exists():
+            image = cv2.imread(str(rgb_path), cv2.IMREAD_COLOR)
+            if image is not None:
+                rgb_shape = image.shape[:2]
+        return self.summarize_lidar2_entry_region(
+            depth_cm=depth_cm,
+            rgb_shape=rgb_shape,
+            rgb_bbox_xyxy=[float(v) for v in xyxy],
+            class_name=class_name,
+            hfov_deg=float(camera_info.get("horizontal_fov_deg", 90.0) or 90.0),
+        )
+
+    def summarize_lidar2_entry_region(
+        self,
+        *,
+        depth_cm: np.ndarray,
+        rgb_shape: Tuple[int, int],
+        rgb_bbox_xyxy: List[float],
+        class_name: str,
+        hfov_deg: float = 90.0,
+    ) -> Dict[str, Any]:
+        depth = flight.coerce_depth_planar_image(depth_cm).astype(np.float32, copy=False)
+        depth_h, depth_w = depth.shape[:2]
+        rgb_h, rgb_w = rgb_shape[:2]
+        sx = float(depth_w) / float(max(1, rgb_w))
+        sy = float(depth_h) / float(max(1, rgb_h))
+        dx1 = max(0, min(depth_w - 1, int(math.floor(float(rgb_bbox_xyxy[0]) * sx))))
+        dy1 = max(0, min(depth_h - 1, int(math.floor(float(rgb_bbox_xyxy[1]) * sy))))
+        dx2 = max(dx1 + 1, min(depth_w, int(math.ceil(float(rgb_bbox_xyxy[2]) * sx))))
+        dy2 = max(dy1 + 1, min(depth_h, int(math.ceil(float(rgb_bbox_xyxy[3]) * sy))))
+        if dx2 - dx1 < 4 or dy2 - dy1 < 8:
+            return {"status": "bbox_too_small", "traversable": False, "crossing_ready": False}
+        box_w = dx2 - dx1
+        box_h = dy2 - dy1
+        shrink_x = max(2, int(box_w * 0.12))
+        shrink_y = max(2, int(box_h * 0.08))
+        ix1 = min(dx2 - 1, dx1 + shrink_x)
+        iy1 = min(dy2 - 1, dy1 + shrink_y)
+        ix2 = max(ix1 + 1, dx2 - shrink_x)
+        iy2 = max(iy1 + 1, dy2 - shrink_y)
+        region = depth[iy1:iy2, ix1:ix2]
+        valid_region = region[np.isfinite(region)]
+        valid_region = valid_region[(valid_region >= 20.0) & (valid_region <= 1200.0)]
+        if valid_region.size < 16:
+            return {"status": "not_enough_depth", "traversable": False, "crossing_ready": False}
+        far_percentile = float(np.nanpercentile(valid_region, 72))
+        opening_mask = np.isfinite(region) & (region >= far_percentile) & (region <= 1200.0)
+        opening_values = region[opening_mask]
+        if opening_values.size < 8:
+            opening_values = valid_region
+            opening_mask = np.isfinite(region)
+        if opening_values.size < 8:
+            return {"status": "not_enough_opening_depth", "traversable": False, "crossing_ready": False}
+        pad = max(12, int(max(box_w, box_h) * 0.18))
+        rx1 = max(0, dx1 - pad)
+        ry1 = max(0, dy1 - pad)
+        rx2 = min(depth_w, dx2 + pad)
+        ry2 = min(depth_h, dy2 + pad)
+        ring = depth[ry1:ry2, rx1:rx2].copy()
+        inner_x1 = dx1 - rx1
+        inner_y1 = dy1 - ry1
+        inner_x2 = dx2 - rx1
+        inner_y2 = dy2 - ry1
+        ring[inner_y1:inner_y2, inner_x1:inner_x2] = np.nan
+        surround_values = ring[np.isfinite(ring)]
+        surround_values = surround_values[(surround_values >= 20.0) & (surround_values <= 1200.0)]
+        if surround_values.size < 12:
+            surround_values = valid_region
+        opening_depth_cm = float(np.nanmean(opening_values))
+        surround_depth_cm = float(np.nanmean(surround_values))
+        depth_gain_cm = max(0.0, opening_depth_cm - surround_depth_cm)
+        lower_cut = iy1 + int((iy2 - iy1) * 0.55)
+        lower_values = depth[lower_cut:iy2, ix1:ix2]
+        lower_values = lower_values[np.isfinite(lower_values)]
+        lower_values = lower_values[(lower_values >= 20.0) & (lower_values <= 1200.0)]
+        if lower_values.size < 8:
+            lower_values = opening_values
+        clearance_depth_cm = float(np.nanmean(lower_values))
+        column_support = opening_mask.sum(axis=0)
+        supported_columns = column_support >= max(1, int(opening_mask.shape[0] * 0.18))
+        opening_width_px = int(np.count_nonzero(supported_columns))
+        if opening_width_px <= 0:
+            opening_width_px = max(1, ix2 - ix1)
+        opening_width_ratio = opening_width_px / float(max(1, depth_w))
+        full_view_width_cm = 2.0 * opening_depth_cm * math.tan(math.radians(float(hfov_deg) / 2.0))
+        opening_width_cm = max(0.0, full_view_width_cm * opening_width_ratio)
+        class_name_l = str(class_name or "").lower()
+        semantic_ok = not ("closed" in class_name_l and "open" not in class_name_l)
+        traversable = bool(
+            semantic_ok
+            and opening_width_cm >= 90.0
+            and clearance_depth_cm >= 160.0
+            and depth_gain_cm >= 80.0
+        )
+        crossing_ready = bool(traversable and opening_depth_cm <= 320.0)
+        return {
+            "status": "ok",
+            "rgb_bbox_xyxy": [float(v) for v in rgb_bbox_xyxy],
+            "depth_bbox_xyxy": [int(dx1), int(dy1), int(dx2), int(dy2)],
+            "entry_distance_cm": float(opening_depth_cm),
+            "surrounding_depth_cm": float(surround_depth_cm),
+            "clearance_depth_cm": float(clearance_depth_cm),
+            "depth_gain_cm": float(depth_gain_cm),
+            "opening_width_cm": float(opening_width_cm),
+            "traversable": traversable,
+            "crossing_ready": crossing_ready,
+            "semantic_ok": semantic_ok,
+            "thresholds": {
+                "traversable_min_width_cm": 90.0,
+                "traversable_min_clearance_cm": 160.0,
+                "traversable_min_depth_gain_cm": 80.0,
+                "crossing_ready_max_distance_cm": 320.0,
+            },
+        }
+
+    def selected_lidar2_house_name(self) -> str:
+        selected = str(self.lidar2_house_filter_var.get() or "Auto")
+        if selected != "Auto":
+            return selected
+        stream_text = self.lidar2_stream_dir_var.get().strip()
+        match = re.search(r"search[_ -]*house[_ -]*(\d+)", stream_text, flags=re.IGNORECASE)
+        if not match:
+            return "All"
+        return f"House_{int(match.group(1))}"
+
+    def apply_lidar2_filters_and_refresh(self) -> None:
+        if self.lidar2_window is None or not self.lidar2_window.winfo_exists():
+            return
+        self.apply_lidar2_filters(write_outputs=True)
+        self.populate_lidar2_labels()
+        if self.lidar2_rows:
+            self.show_lidar2_row(self.lidar2_index)
+
+    def apply_lidar2_filters(self, *, write_outputs: bool = False) -> None:
+        selected_house = self.selected_lidar2_house_name()
+        entry_mode = str(self.lidar2_entry_filter_var.get() or "All")
+        filtered: List[Dict[str, Any]] = []
+        for label in self.lidar2_labels:
+            if selected_house not in {"All", ""} and str(label.get("house_name", "")) != selected_house:
+                continue
+            assessment = label.get("entry_assessment") if isinstance(label.get("entry_assessment"), dict) else {}
+            traversable = bool(assessment.get("traversable", False))
+            crossing_ready = bool(assessment.get("crossing_ready", False))
+            if entry_mode == "Enterable Only" and not traversable:
+                continue
+            if entry_mode == "Crossing Ready Only" and not crossing_ready:
+                continue
+            if entry_mode == "Rejected Only" and traversable:
+                continue
+            filtered.append(label)
+        self.lidar2_filtered_labels = filtered
+        if write_outputs and self.lidar2_stream_dir_var.get().strip():
+            self.write_lidar2_filter_outputs(Path(self.lidar2_stream_dir_var.get().strip()))
+
+    def write_lidar2_filter_outputs(self, stream_dir: Path) -> None:
+        out_dir = stream_dir / "lidar2_analysis"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        summary = {
+            "status": "ok",
+            "stream_dir": str(stream_dir),
+            "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+            "house_filter": self.lidar2_house_filter_var.get(),
+            "resolved_house_filter": self.selected_lidar2_house_name(),
+            "entry_filter": self.lidar2_entry_filter_var.get(),
+            "total_label_count": len(self.lidar2_labels),
+            "filtered_label_count": len(self.lidar2_filtered_labels),
+            "thresholds": {
+                "traversable_min_width_cm": 90.0,
+                "traversable_min_clearance_cm": 160.0,
+                "traversable_min_depth_gain_cm": 80.0,
+                "crossing_ready_max_distance_cm": 320.0,
+            },
+        }
+        (out_dir / "filtered_labels.json").write_text(
+            json.dumps({"labels": self.lidar2_filtered_labels, **summary}, indent=2, ensure_ascii=False, default=_json_default),
+            encoding="utf-8",
+        )
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def populate_lidar2_frames(self, rows: List[Dict[str, Any]]) -> None:
+        if self.lidar2_frame_listbox is None:
+            return
+        self.lidar2_frame_listbox.delete(0, "end")
+        for row in rows:
+            self.lidar2_frame_listbox.insert(
+                "end",
+                f"{int(row.get('frame_index', 0)):06d} pts={int(row.get('point_count', 0) or 0)} {row.get('capture_time', '')}",
+            )
+
+    def populate_lidar2_labels(self) -> None:
+        if self.lidar2_label_listbox is None:
+            return
+        self.lidar2_label_listbox.delete(0, "end")
+        for label in self.lidar2_filtered_labels:
+            assessment = label.get("entry_assessment") if isinstance(label.get("entry_assessment"), dict) else {}
+            dist = assessment.get("entry_distance_cm")
+            width = assessment.get("opening_width_cm")
+            dist_text = f"{float(dist):.0f}cm" if dist is not None else "n/a"
+            width_text = f"{float(width):.0f}cm" if width is not None else "n/a"
+            flags = ("C" if assessment.get("crossing_ready") else ("T" if assessment.get("traversable") else "-"))
+            frames = label.get("frame_indices", [])
+            first_frame = int(frames[0]) if isinstance(frames, list) and frames else 0
+            self.lidar2_label_listbox.insert(
+                "end",
+                (
+                    f"{str(label.get('house_name') or 'no_house'):8s} "
+                    f"#{int(label.get('label_id', 0) or 0):03d} "
+                    f"{str(label.get('class_name', 'object')):11s} "
+                    f"conf={float(label.get('best_confidence', 0.0) or 0.0):.2f} "
+                    f"dist={dist_text} width={width_text} {flags} f={first_frame:06d}"
+                ),
+            )
+
+    def on_lidar2_frame_selected(self, _event=None) -> None:
+        if self.lidar2_frame_listbox is None:
+            return
+        selection = self.lidar2_frame_listbox.curselection()
+        if selection:
+            self.show_lidar2_row(int(selection[0]))
+
+    def on_lidar2_label_selected(self, _event=None) -> None:
+        if self.lidar2_label_listbox is None:
+            return
+        selection = self.lidar2_label_listbox.curselection()
+        if not selection:
+            return
+        label = self.lidar2_filtered_labels[int(selection[0])]
+        frames = label.get("frame_indices", [])
+        if not isinstance(frames, list) or not frames:
+            return
+        target_frame = int(frames[0])
+        for idx, row in enumerate(self.lidar2_rows):
+            if int(row.get("frame_index", 0) or 0) == target_frame:
+                self.show_lidar2_row(idx)
+                break
+
+    def lidar2_labels_for_frame(self, frame_index: int) -> List[Dict[str, Any]]:
+        labels: List[Dict[str, Any]] = []
+        for label in self.lidar2_filtered_labels:
+            frames = label.get("frame_indices", [])
+            frame_values = [int(v) for v in frames] if isinstance(frames, list) else []
+            if not frame_values or frame_index in frame_values:
+                labels.append(label)
+        return labels
+
+    def show_lidar2_row(self, index: int) -> None:
+        if not self.lidar2_rows:
+            return
+        index = max(0, min(index, len(self.lidar2_rows) - 1))
+        self.lidar2_index = index
+        if self.lidar2_frame_listbox is not None:
+            self.lidar2_frame_listbox.selection_clear(0, "end")
+            self.lidar2_frame_listbox.selection_set(index)
+            self.lidar2_frame_listbox.see(index)
+        row = self.lidar2_rows[index]
+        frame_index = int(row.get("frame_index", 0) or 0)
+        labels = self.lidar2_labels_for_frame(frame_index)
+        title = (
+            f"Lidar2: frame {frame_index:06d} labels_in_frame={len(labels)} "
+            f"filtered={len(self.lidar2_filtered_labels)} house={self.selected_lidar2_house_name()} "
+            f"entry={self.lidar2_entry_filter_var.get()}"
+        )
+        self.show_lidar2_rgb(row)
+        self.show_lidar2_summary(row, labels)
+        self.show_lidar2_json(row, labels)
+        self.lidar_stream_analysis_status_var.set(title)
+
+    def lidar2_rgb_path_for_row(self, row: Dict[str, Any]) -> Path:
+        frame_index = int(row.get("frame_index", 0) or 0)
+        if self.lidar2_rgb_mode_var.get() == "YOLO Annotated":
+            frame_payload = self.lidar2_semantic_frame_map.get(frame_index, {})
+            annotated = str(frame_payload.get("yolo_annotated_path", "") or "")
+            if annotated and Path(annotated).exists():
+                return Path(annotated)
+        return Path(str(row.get("rgb_path", "")))
+
+    def show_lidar2_rgb(self, row: Dict[str, Any]) -> None:
+        label = getattr(self, "lidar2_rgb_label", None)
+        if label is None:
+            return
+        image_path = self.lidar2_rgb_path_for_row(row)
+        if not image_path.exists():
+            label.configure(text=f"RGB unavailable: {image_path}", image="")
+            self.lidar2_rgb_photo = None
+            return
+        try:
+            image = Image.open(image_path).convert("RGB")
+            image.thumbnail((820, 520), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(image)
+            label.configure(image=photo, text="")
+            self.lidar2_rgb_photo = photo
+        except Exception as exc:
+            label.configure(text=f"RGB load failed: {exc}", image="")
+            self.lidar2_rgb_photo = None
+
+    def show_lidar2_summary(self, row: Dict[str, Any], labels: List[Dict[str, Any]]) -> None:
+        if self.lidar2_summary_text is None:
+            return
+        enterable = sum(1 for label in labels if isinstance(label.get("entry_assessment"), dict) and label["entry_assessment"].get("traversable"))
+        crossing = sum(1 for label in labels if isinstance(label.get("entry_assessment"), dict) and label["entry_assessment"].get("crossing_ready"))
+        lines = [
+            f"Frame: {int(row.get('frame_index', 0)):06d} {row.get('frame_name', '')}",
+            f"House filter: {self.lidar2_house_filter_var.get()} -> {self.selected_lidar2_house_name()}",
+            f"Entry filter: {self.lidar2_entry_filter_var.get()}",
+            f"Filtered labels total: {len(self.lidar2_filtered_labels)}",
+            f"Labels in selected frame: {len(labels)} | enterable={enterable} | crossing_ready={crossing}",
+            f"RGB mode: {self.lidar2_rgb_mode_var.get()}",
+            "Point cloud view: use Open3D Viewer for filtered label overlay.",
+            f"Open3D source: {Path(self.lidar2_stream_dir_var.get().strip()) / 'open3d_export' if self.lidar2_stream_dir_var.get().strip() else ''}",
+        ]
+        self.lidar2_summary_text.delete("1.0", "end")
+        self.lidar2_summary_text.insert("1.0", "\n".join(lines))
+
+    def show_lidar2_json(self, row: Dict[str, Any], labels: List[Dict[str, Any]]) -> None:
+        if self.lidar2_json_text is None:
+            return
+        payload = {
+            "frame": row,
+            "displayed_label_count": len(labels),
+            "displayed_labels": labels[:25],
+            "filters": {
+                "house": self.lidar2_house_filter_var.get(),
+                "resolved_house": self.selected_lidar2_house_name(),
+                "entry": self.lidar2_entry_filter_var.get(),
+            },
+        }
+        self.lidar2_json_text.delete("1.0", "end")
+        self.lidar2_json_text.insert("1.0", json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default))
 
     def open_lidar_analysis_window(self) -> None:
         self.ensure_lidar_analysis_state()
@@ -1099,6 +1881,17 @@ class LidarAnalysisControlMixin:
             f"observations={result.get('semantic_observation_count', 0)} -> {semantic_export_dir}"
         )
         self.status_var.set(f"YOLO semantic Open3D labels saved: {semantic_export_dir}")
+        try:
+            stream_dir = Path(str(result.get("stream_dir", ""))).resolve()
+            if (
+                getattr(self, "lidar2_window", None) is not None
+                and self.lidar2_window.winfo_exists()
+                and self.lidar2_stream_dir_var.get().strip()
+                and Path(self.lidar2_stream_dir_var.get().strip()).resolve() == stream_dir
+            ):
+                self.load_lidar2_analysis_frames()
+        except Exception:
+            pass
 
     def build_lidar_analysis_open3d_readme(self, status: Dict[str, Any]) -> str:
         install_hint = (
@@ -1132,12 +1925,14 @@ If Open3D is missing, install it in the UnrealCV environment:
     def build_lidar_analysis_open3d_viewer_script(self) -> str:
         return r'''from pathlib import Path
 import json
+import os
 
 import numpy as np
 import open3d as o3d
 
 
 ROOT = Path(__file__).resolve().parent
+LABELS_PATH = os.environ.get("UAV_LIDAR_LABELS_PATH", "").strip()
 
 
 def load_json(path):
@@ -1166,23 +1961,41 @@ def load_clouds():
             pcd = load_point_cloud(path)
             if pcd is not None:
                 named.append((path.stem, pcd))
-    semantic = load_point_cloud(ROOT / "semantic" / "semantic_points_standard_m.ply")
-    if semantic is not None:
-        named.append(("semantic_yolo_points", semantic))
+    if not LABELS_PATH:
+        semantic = load_point_cloud(ROOT / "semantic" / "semantic_points_standard_m.ply")
+        if semantic is not None:
+            named.append(("semantic_yolo_points", semantic))
     return named
 
 
 def load_labels():
-    payload = load_json(ROOT / "semantic" / "semantic_labels.json")
-    labels = payload.get("labels", []) if isinstance(payload, dict) else []
-    return [label for label in labels if isinstance(label, dict)]
+    sources = []
+    if LABELS_PATH:
+        sources.append(Path(LABELS_PATH))
+    sources.append(ROOT / "semantic" / "semantic_labels.json")
+    for path in sources:
+        payload = load_json(path)
+        labels = payload.get("labels", []) if isinstance(payload, dict) else []
+        if isinstance(labels, list):
+            return [label for label in labels if isinstance(label, dict)]
+    return []
 
 
 def label_text(label):
+    assessment = label.get("entry_assessment") if isinstance(label.get("entry_assessment"), dict) else {}
+    if assessment.get("crossing_ready"):
+        entry_state = "crossing"
+    elif assessment.get("traversable"):
+        entry_state = "enterable"
+    elif assessment:
+        entry_state = "rejected"
+    else:
+        entry_state = "semantic"
+    house = label.get("house_name") or "no_house"
     return (
         f"{label.get('class_name', 'object')} #{label.get('label_id', '')} "
         f"{float(label.get('best_confidence') or 0.0):.2f} "
-        f"obs={label.get('observation_count', 0)}"
+        f"{house} {entry_state} obs={label.get('observation_count', 0)}"
     )
 
 
@@ -1200,6 +2013,13 @@ def label_center(label):
 
 
 def label_color(label):
+    assessment = label.get("entry_assessment") if isinstance(label.get("entry_assessment"), dict) else {}
+    if assessment.get("crossing_ready"):
+        return [0.1, 1.0, 0.1]
+    if assessment.get("traversable"):
+        return [0.0, 0.9, 1.0]
+    if assessment:
+        return [1.0, 0.1, 0.1]
     color = label.get("color_rgb", [255, 255, 255])
     try:
         return [max(0.0, min(1.0, float(color[i]) / 255.0)) for i in range(3)]

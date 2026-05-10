@@ -445,15 +445,16 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Button(stream, text="Start Lidar Capture", command=self.on_start_lidar_stream_capture).grid(row=2, column=0, padx=6, pady=(0, 6))
         tk.Button(stream, text="Stop Lidar Capture", command=self.on_stop_lidar_stream_capture).grid(row=2, column=1, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Analyze Lidar", command=self.open_lidar_analysis_window).grid(row=2, column=2, sticky="w", padx=6, pady=(0, 6))
-        tk.Button(stream, text="Export Open3D", command=self.export_lidar_analysis_open3d).grid(row=2, column=3, sticky="w", padx=6, pady=(0, 6))
-        tk.Label(stream, text="Lidar mode").grid(row=2, column=4, sticky="e", padx=(12, 2), pady=(0, 6))
+        tk.Button(stream, text="Analyze Lidar 2", command=self.open_lidar2_analysis_window).grid(row=2, column=3, sticky="w", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Export Open3D", command=self.export_lidar_analysis_open3d).grid(row=2, column=4, sticky="w", padx=6, pady=(0, 6))
+        tk.Label(stream, text="Lidar mode").grid(row=2, column=5, sticky="e", padx=(12, 2), pady=(0, 6))
         ttk.Combobox(
             stream,
             textvariable=self.lidar_capture_processing_var,
             values=("smooth", "full"),
             state="readonly",
             width=8,
-        ).grid(row=2, column=5, sticky="w", padx=(0, 8), pady=(0, 6))
+        ).grid(row=2, column=6, sticky="w", padx=(0, 8), pady=(0, 6))
         tk.Label(stream, textvariable=self.stream_status_var, anchor="w").grid(row=3, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
         tk.Label(stream, textvariable=self.lidar_stream_status_var, anchor="w").grid(row=4, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
         tk.Label(stream, textvariable=self.lidar_stream_analysis_status_var, anchor="w").grid(row=5, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
