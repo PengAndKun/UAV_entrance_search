@@ -654,7 +654,12 @@ class OverheadMapWidget:
         if len(canvas_points) >= 2:
             for idx in range(len(canvas_points) - 1):
                 x1, y1, _ = canvas_points[idx]
-                x2, y2, _ = canvas_points[idx + 1]
+                x2, y2, next_point = canvas_points[idx + 1]
+                point = canvas_points[idx][2]
+                point_is_scan = point.get("route_point_type") == "scan_point" or bool(point.get("scan_id"))
+                next_is_scan = next_point.get("route_point_type") == "scan_point" or bool(next_point.get("scan_id"))
+                if point_is_scan and next_is_scan and point.get("facade") != next_point.get("facade"):
+                    continue
                 self.canvas.create_line(
                     x1,
                     y1,
@@ -668,13 +673,16 @@ class OverheadMapWidget:
                 )
         for idx, (cx, cy, point) in enumerate(canvas_points):
             status = str(point.get("status", "") or "")
-            if status in {"visited", "done"}:
+            is_scan_point = point.get("route_point_type") == "scan_point" or bool(point.get("scan_id"))
+            if status in {"visited", "done", "captured"}:
                 color = ROUTE_PLAN_VISITED_COLOR
             elif status == "active":
                 color = ROUTE_PLAN_ACTIVE_COLOR
+            elif is_scan_point:
+                color = "#ffd166"
             else:
                 color = ROUTE_PLAN_COLOR
-            radius = 6 if status == "active" else 5
+            radius = 6 if status == "active" else (4 if is_scan_point else 5)
             self.canvas.create_oval(
                 cx - radius,
                 cy - radius,
@@ -686,6 +694,8 @@ class OverheadMapWidget:
                 tags="dynamic",
             )
             label = str(point.get("label", "") or f"R{idx}")
+            if is_scan_point and status not in {"active", "visited", "done", "captured"}:
+                label = label if idx % 5 == 0 else ""
             if label:
                 self.canvas.create_text(
                     cx + 8,

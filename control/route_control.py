@@ -1645,6 +1645,82 @@ class RouteControlMixin:
             return base[start:] + base[:start]
         return normalize_facade_order([])
 
+    def scan_corridor_standoff_by_facade(self, target_house_id: str, bbox: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        try:
+            min_x = float(bbox["min_x"])
+            max_x = float(bbox["max_x"])
+            min_y = float(bbox["min_y"])
+            max_y = float(bbox["max_y"])
+        except Exception:
+            return {}
+        default_standoff = self.route_scan_standoff_cm()
+        min_standoff = max(float(LLM_ROUTE_MIN_PERIMETER_STANDOFF_CM), float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)))
+        clearance = min(220.0, max(120.0, default_standoff * 0.22))
+        corridor_info: Dict[str, Dict[str, Any]] = {}
+        obstacles = self.route_forbidden_house_bboxes(target_house_id=target_house_id, clearance_cm=0.0)
+
+        def overlap(a_min: float, a_max: float, b_min: float, b_max: float) -> bool:
+            return min(a_max, b_max) >= max(a_min, b_min)
+
+        for facade in ("south", "east", "north", "west"):
+            best_gap: Optional[float] = None
+            best_house_id = ""
+            for obstacle in obstacles:
+                try:
+                    obs_min_x = float(obstacle["min_x"])
+                    obs_max_x = float(obstacle["max_x"])
+                    obs_min_y = float(obstacle["min_y"])
+                    obs_max_y = float(obstacle["max_y"])
+                except Exception:
+                    continue
+                gap: Optional[float] = None
+                if facade == "south" and obs_max_y <= min_y and overlap(min_x, max_x, obs_min_x, obs_max_x):
+                    gap = min_y - obs_max_y
+                elif facade == "north" and obs_min_y >= max_y and overlap(min_x, max_x, obs_min_x, obs_max_x):
+                    gap = obs_min_y - max_y
+                elif facade == "west" and obs_max_x <= min_x and overlap(min_y, max_y, obs_min_y, obs_max_y):
+                    gap = min_x - obs_max_x
+                elif facade == "east" and obs_min_x >= max_x and overlap(min_y, max_y, obs_min_y, obs_max_y):
+                    gap = obs_min_x - max_x
+                if gap is None or gap <= 0.0:
+                    continue
+                if best_gap is None or float(gap) < best_gap:
+                    best_gap = float(gap)
+                    best_house_id = str(obstacle.get("house_id", "") or "")
+            standoff = default_standoff
+            mode = "open_default"
+            margin = None
+            safe = True
+            if best_gap is not None:
+                centerline = max(20.0, best_gap * 0.5)
+                center_margin = max(0.0, min(centerline, best_gap - centerline))
+                if best_gap > (2.0 * default_standoff + clearance):
+                    standoff = default_standoff
+                    mode = "wide_corridor_default_standoff"
+                    margin = best_gap - default_standoff
+                elif best_gap > min_standoff + clearance:
+                    standoff = max(min_standoff, centerline)
+                    mode = "alley_midline"
+                    margin = center_margin
+                else:
+                    standoff = centerline
+                    mode = "tight_alley_midline"
+                    margin = center_margin
+                safe = margin is None or margin >= clearance
+            corridor_info[facade] = {
+                "face_id": facade,
+                "standoff_cm": round(float(standoff), 2),
+                "mode": mode,
+                "gap_cm": round(float(best_gap), 2) if best_gap is not None else None,
+                "side_margin_cm": round(float(margin), 2) if margin is not None else None,
+                "safe": bool(safe),
+                "blocking_house_id": best_house_id,
+                "clearance_cm": round(float(clearance), 2),
+                "default_standoff_cm": round(float(default_standoff), 2),
+                "min_standoff_cm": round(float(min_standoff), 2),
+            }
+        return corridor_info
+
     def build_rule_scan_points_for_route_plan(self, route_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
         hid = str(route_plan.get("target_house_id", "") or self.selected_route_target_house_id()).strip()
         if not hid:
@@ -1652,6 +1728,8 @@ class RouteControlMixin:
         bbox = self.house_world_bbox_for_id(hid)
         if not bbox:
             return []
+        corridor_info = self.scan_corridor_standoff_by_facade(hid, bbox)
+        route_plan["scan_corridor_standoff_by_facade"] = corridor_info
         return generate_rule_scan_points(
             house_id=hid,
             bbox_world=bbox,
@@ -1659,6 +1737,7 @@ class RouteControlMixin:
             standoff_cm=self.route_scan_standoff_cm(),
             scan_spacing_cm=self.route_scan_spacing_cm(),
             altitude_cm=self.target_house_capture_altitude_cm(hid),
+            facade_standoff_info=corridor_info,
             lidar_range_cm=[
                 float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
                 float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
@@ -1719,6 +1798,16 @@ class RouteControlMixin:
                 invalid.append({"scan_id": scan_id, "reason": "inside_target_bbox"})
             if standoff is not None and not (min_range <= float(standoff) <= max_range):
                 invalid.append({"scan_id": scan_id, "reason": "standoff_outside_lidar_range", "standoff_cm": standoff})
+            if point.get("corridor_safe") is False:
+                invalid.append(
+                    {
+                        "scan_id": scan_id,
+                        "reason": "corridor_side_margin_below_clearance",
+                        "corridor_side_margin_cm": point.get("corridor_side_margin_cm"),
+                        "corridor_clearance_cm": point.get("corridor_clearance_cm"),
+                        "blocking_house_id": point.get("corridor_blocking_house_id", ""),
+                    }
+                )
         return {
             "valid": not invalid and bool(scan_points),
             "scan_point_count": len(scan_points),
@@ -1727,22 +1816,89 @@ class RouteControlMixin:
             "invalid": invalid[:16],
         }
 
+    def should_validate_route_segment(self, start: Dict[str, Any], end: Dict[str, Any]) -> bool:
+        start_scan = start.get("route_point_type") == "scan_point" or bool(start.get("scan_id"))
+        end_scan = end.get("route_point_type") == "scan_point" or bool(end.get("scan_id"))
+        if start_scan and end_scan and str(start.get("facade", "") or "") != str(end.get("facade", "") or ""):
+            return False
+        return True
+
+    def route_house_violation_report_for_scan_plan(
+        self,
+        route_points: List[Dict[str, Any]],
+        *,
+        target_house_id: str,
+        current_house_id: str = "",
+        clearance_cm: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        points: List[Dict[str, Any]] = []
+        for point in route_points if isinstance(route_points, list) else []:
+            if not isinstance(point, dict):
+                continue
+            x = self._as_float_or_none(point.get("x", point.get("world_x")))
+            y = self._as_float_or_none(point.get("y", point.get("world_y")))
+            if x is None or y is None:
+                continue
+            item = dict(point)
+            item["x"] = float(x)
+            item["y"] = float(y)
+            points.append(item)
+        obstacles = self.route_forbidden_house_bboxes(
+            target_house_id=target_house_id,
+            current_house_id=current_house_id,
+            clearance_cm=clearance_cm,
+        )
+        violations: List[Dict[str, Any]] = []
+        skipped_segments = 0
+        for segment_index in range(max(0, len(points) - 1)):
+            start = points[segment_index]
+            end = points[segment_index + 1]
+            if not self.should_validate_route_segment(start, end):
+                skipped_segments += 1
+                continue
+            for obstacle in obstacles:
+                if self.segment_intersects_open_bbox(start["x"], start["y"], end["x"], end["y"], obstacle):
+                    violations.append(
+                        {
+                            "segment_index": segment_index,
+                            "house_id": str(obstacle.get("house_id", "") or ""),
+                            "segment_start": {"x": round(float(start["x"]), 2), "y": round(float(start["y"]), 2)},
+                            "segment_end": {"x": round(float(end["x"]), 2), "y": round(float(end["y"]), 2)},
+                        }
+                    )
+        return {
+            "valid": bool(len(points) >= 2 and not violations),
+            "point_count": len(points),
+            "checked_house_count": len(obstacles),
+            "clearance_cm": float(LLM_ROUTE_HOUSE_CLEARANCE_CM if clearance_cm is None else clearance_cm),
+            "skipped_scan_transition_segments": skipped_segments,
+            "violation_count": len(violations),
+            "violations": violations[:12],
+        }
+
     def target_house_route_violation_report(self, target_house_id: str, route_points: List[Dict[str, Any]]) -> Dict[str, Any]:
         bbox = self.house_world_bbox_for_id(target_house_id)
         if not bbox:
             return {"valid": False, "reason": "missing_target_bbox", "violation_count": 0, "violations": []}
-        points: List[Dict[str, float]] = []
+        points: List[Dict[str, Any]] = []
         for point in route_points if isinstance(route_points, list) else []:
             if not isinstance(point, dict):
                 continue
             x = self._as_float_or_none(point.get("x", point.get("world_x")))
             y = self._as_float_or_none(point.get("y", point.get("world_y")))
             if x is not None and y is not None:
-                points.append({"x": float(x), "y": float(y)})
+                item = dict(point)
+                item["x"] = float(x)
+                item["y"] = float(y)
+                points.append(item)
         violations: List[Dict[str, Any]] = []
+        skipped_segments = 0
         for idx in range(max(0, len(points) - 1)):
             start = points[idx]
             end = points[idx + 1]
+            if not self.should_validate_route_segment(start, end):
+                skipped_segments += 1
+                continue
             if self.segment_intersects_open_bbox(start["x"], start["y"], end["x"], end["y"], bbox):
                 violations.append(
                     {
@@ -1754,6 +1910,7 @@ class RouteControlMixin:
         return {
             "valid": bool(len(points) >= 2 and not violations),
             "point_count": len(points),
+            "skipped_scan_transition_segments": skipped_segments,
             "violation_count": len(violations),
             "violations": violations[:12],
         }
@@ -1811,7 +1968,7 @@ class RouteControlMixin:
         scan_route_points = self.scan_points_as_route_points(scan_points)
         route_points = transit_points + scan_route_points
         current_house_id = str(plan.get("current_house_id", "") or "")
-        route_safety_report = self.route_house_violation_report(
+        route_safety_report = self.route_house_violation_report_for_scan_plan(
             route_points,
             target_house_id=target_house_id,
             current_house_id=current_house_id,
@@ -1844,6 +2001,8 @@ class RouteControlMixin:
                 "scan_point_count": len(scan_points),
                 "scan_standoff_cm": self.route_scan_standoff_cm(),
                 "scan_spacing_cm": self.route_scan_spacing_cm(),
+                "scan_corridor_standoff_by_facade": plan.get("scan_corridor_standoff_by_facade", {}),
+                "scan_corridor_policy": "use alley centerline between target and nearest overlapping non-target house; mark unsafe if side margin is below clearance",
                 "capture_count_per_scan_point": self.route_capture_count(),
                 "preferred_facade_order": self.preferred_facade_order_for_route_plan(plan),
                 "route_safety_report": route_safety_report,

@@ -45,6 +45,7 @@ def generate_rule_scan_points(
     scan_spacing_cm: float,
     altitude_cm: float,
     lidar_range_cm: Optional[List[float]] = None,
+    facade_standoff_info: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     min_x = float(bbox_world["min_x"])
     max_x = float(bbox_world["max_x"])
@@ -52,10 +53,11 @@ def generate_rule_scan_points(
     max_y = float(bbox_world["max_y"])
     center_x = float(bbox_world.get("center_x", 0.5 * (min_x + max_x)))
     center_y = float(bbox_world.get("center_y", 0.5 * (min_y + max_y)))
-    standoff = max(20.0, float(standoff_cm))
+    default_standoff = max(20.0, float(standoff_cm))
     spacing = max(1.0, float(scan_spacing_cm))
     altitude = float(altitude_cm)
     lidar_range = list(lidar_range_cm or [20.0, 1200.0])
+    standoff_info_by_facade = facade_standoff_info if isinstance(facade_standoff_info, dict) else {}
     roles = ["front", "side", "back", "other_side"]
 
     points: List[Dict[str, Any]] = []
@@ -65,6 +67,11 @@ def generate_rule_scan_points(
             count = _facade_point_count(max_x - min_x, spacing)
         else:
             count = _facade_point_count(max_y - min_y, spacing)
+        facade_info = standoff_info_by_facade.get(facade, {}) if isinstance(standoff_info_by_facade.get(facade), dict) else {}
+        try:
+            standoff = max(20.0, float(facade_info.get("standoff_cm", default_standoff)))
+        except Exception:
+            standoff = default_standoff
         for idx in range(count):
             if facade == "south":
                 x = _interpolate(min_x, max_x, idx, count)
@@ -98,6 +105,12 @@ def generate_rule_scan_points(
                     "capture_trigger": "arrive_align_hover_capture",
                     "view_type": "face_view",
                     "status": "planned",
+                    "corridor_mode": str(facade_info.get("mode", "default") or "default"),
+                    "corridor_gap_cm": facade_info.get("gap_cm"),
+                    "corridor_side_margin_cm": facade_info.get("side_margin_cm"),
+                    "corridor_blocking_house_id": str(facade_info.get("blocking_house_id", "") or ""),
+                    "corridor_clearance_cm": facade_info.get("clearance_cm"),
+                    "corridor_safe": bool(facade_info.get("safe", True)),
                 }
             )
     return points
