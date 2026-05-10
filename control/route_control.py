@@ -1869,8 +1869,39 @@ class RouteControlMixin:
         self.llm_route_scan_points = scan_points
         self.llm_route_lidar_trajectory = []
         self.llm_route_execution_summary = execution_summary
+        self.llm_route_validation_report = {}
         self.house_search_dir = house_search_dir
         return plan
+
+    def refresh_llm_route_map(self) -> None:
+        widget = getattr(self, "llm_route_map_widget", None)
+        if widget is None:
+            return
+        try:
+            if not self.load_map_resources(force=not bool(self.map_config)):
+                self.llm_route_map_status_var.set("Route Map: map unavailable")
+                return
+            pose = self.latest_state.get("pose", {}) if isinstance(self.latest_state.get("pose"), dict) else {}
+            pose_x = float(pose.get("x", 0.0)) if pose else 0.0
+            pose_y = float(pose.get("y", 0.0)) if pose else 0.0
+            pose_yaw = float(pose.get("task_yaw", pose.get("yaw", 0.0))) if pose else 0.0
+            houses, boxes = self.build_map_display(pose)
+            widget.set_background_image(self.map_image)
+            widget.set_calibration(self.map_calibration.get("affine_world_to_image"), self.map_image_size(), [])
+            widget.set_image_layer_offset(*self.map_display_offset_px)
+            widget.set_house_boxes(boxes)
+            widget.update_houses([])
+            widget.update_uav(pose_x, pose_y, pose_yaw)
+            route_plan = self.llm_route_plan if isinstance(self.llm_route_plan, dict) else {}
+            widget.set_route_plan(route_plan)
+            scan_count = len(self.llm_route_scan_points) if isinstance(self.llm_route_scan_points, list) else 0
+            route_count = len(route_plan.get("route_points", [])) if isinstance(route_plan.get("route_points"), list) else 0
+            self.llm_route_map_status_var.set(f"Route Map: houses={len(houses)} route_points={route_count} scan_points={scan_count}")
+        except tk.TclError:
+            pass
+        except Exception as exc:
+            LOGGER.warning("Refresh LLM route map failed: %s", exc)
+            self.llm_route_map_status_var.set(f"Route Map: failed: {exc}")
 
     def apply_route_plan(self, route_plan: Dict[str, Any], *, status_prefix: str = "LLM Route") -> None:
         self.llm_route_plan = self.prepare_route_plan_with_scan_points(route_plan) if isinstance(route_plan, dict) else {}
@@ -1887,6 +1918,7 @@ class RouteControlMixin:
             message = str(self.llm_route_plan.get("llm_route_error", "") or self.llm_route_plan.get("reason", "") or "")
         suffix = f" | {message}" if message else ""
         self.llm_route_status_var.set(f"{status_prefix}: house={target_house_id or '-'} source={source} points={point_count}{suffix}")
+        self.refresh_llm_route_map()
 
     def refresh_route_preview(self) -> None:
         payload = {
@@ -1894,6 +1926,7 @@ class RouteControlMixin:
             "route_plan": self.llm_route_plan if isinstance(self.llm_route_plan, dict) else {},
             "scan_points": self.llm_route_scan_points if isinstance(self.llm_route_scan_points, list) else [],
             "execution_summary": self.llm_route_execution_summary if isinstance(self.llm_route_execution_summary, dict) else {},
+            "validation_report": self.llm_route_validation_report if isinstance(self.llm_route_validation_report, dict) else {},
         }
         text = json.dumps(payload, indent=2, ensure_ascii=False)
         live_texts: List[tk.Text] = []
@@ -1989,8 +2022,10 @@ class RouteControlMixin:
         self.llm_route_scan_points = []
         self.llm_route_lidar_trajectory = []
         self.llm_route_execution_summary = {}
+        self.llm_route_validation_report = {}
         self.house_search_dir = None
         self.refresh_route_preview()
+        self.refresh_llm_route_map()
         self.refresh_map_once()
         self.llm_route_status_var.set("LLM Route: cleared.")
 
@@ -2038,6 +2073,108 @@ class RouteControlMixin:
     def on_stop_route_follow(self) -> None:
         self.route_stop_event.set()
         self.llm_route_status_var.set("LLM Route: stopping follow...")
+
+    def on_direct_scan_capture_test(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        if self.route_thread is not None and self.route_thread.is_alive():
+            self.llm_route_status_var.set("LLM Route: worker already running.")
+            return
+        if not self.llm_route_scan_points:
+            target_house_id = self.selected_route_target_house_id()
+            if not target_house_id:
+                self.llm_route_status_var.set("LLM Route: no target house selected.")
+                return
+            try:
+                plan = self.fallback_route_plan(target_house_id)
+                plan["planner_source"] = "direct_capture_fallback_no_route"
+                self.apply_route_plan(plan, status_prefix="Direct Capture Setup")
+            except Exception as exc:
+                self.llm_route_status_var.set(f"Direct Capture setup failed: {exc}")
+                return
+        target_house_id = str(self.llm_route_plan.get("target_house_id", "") or self.selected_route_target_house_id())
+        scan_validation = self.scan_point_validation_report(target_house_id, self.llm_route_scan_points)
+        if not bool(scan_validation.get("valid", False)):
+            self.llm_route_status_var.set("Direct Capture: scan point validation failed.")
+            self.llm_route_validation_report = {"scan_point_validation_report": scan_validation, "overall_passed": False}
+            self.refresh_route_preview()
+            return
+        self.sync_capture_options_to_session(session)
+        self.route_stop_event.clear()
+        self.route_thread = threading.Thread(
+            target=lambda: self.direct_scan_capture_worker(session),
+            daemon=True,
+        )
+        self.route_thread.start()
+
+    def direct_scan_capture_worker(self, session: flight.DroneFlightSession) -> None:
+        scan_points = self.scan_points_as_route_points(self.llm_route_scan_points)
+        route_points = self.llm_route_plan.get("route_points", []) if isinstance(self.llm_route_plan.get("route_points"), list) else []
+        index_by_scan_id = {
+            str(point.get("scan_id", "") or ""): idx
+            for idx, point in enumerate(route_points)
+            if isinstance(point, dict) and str(point.get("scan_id", "") or "")
+        }
+        total = len(scan_points)
+        captured_any = False
+        self.root.after(0, lambda: self.llm_route_status_var.set(f"Direct Capture: starting {total} scan points..."))
+        for point_index, point in enumerate(scan_points, start=1):
+            if self.route_stop_event.is_set():
+                self.root.after(0, lambda: self.llm_route_status_var.set("Direct Capture: stopped."))
+                return
+            scan_id = str(point.get("scan_id", "") or "")
+            if scan_id in index_by_scan_id:
+                point["_route_point_index"] = index_by_scan_id[scan_id]
+            capture_entry = self.capture_at_scan_route_point(
+                session,
+                point,
+                point_index=point_index,
+                total=total,
+            )
+            captured_any = captured_any or capture_entry.get("capture_status") == "ok"
+            self.root.after(0, self.refresh_llm_route_map)
+        if self.route_stop_event.is_set():
+            self.root.after(0, lambda: self.llm_route_status_var.set("Direct Capture: stopped."))
+            return
+        if captured_any:
+            try:
+                finalize_result = self.finalize_house_search_outputs()
+                validation = self.validate_house_search_data(finalize_result=finalize_result)
+                self.root.after(
+                    0,
+                    lambda v=validation: self.llm_route_status_var.set(
+                        f"Direct Capture: complete, validation={'PASS' if v.get('overall_passed') else 'CHECK'}"
+                    ),
+                )
+            except Exception as exc:
+                LOGGER.warning("Direct capture finalize/validate failed: %s", exc)
+                self.root.after(0, lambda e=exc: self.llm_route_status_var.set(f"Direct Capture: finalize failed: {e}"))
+        else:
+            self.root.after(0, lambda: self.llm_route_status_var.set("Direct Capture: no captures completed."))
+
+    def on_validate_house_search_data(self) -> None:
+        if self.route_thread is not None and self.route_thread.is_alive():
+            self.llm_route_status_var.set("Validate Data: wait for current worker.")
+            return
+
+        def worker() -> None:
+            self.root.after(0, lambda: self.llm_route_status_var.set("Validate Data: running..."))
+            try:
+                validation = self.validate_house_search_data()
+                self.root.after(
+                    0,
+                    lambda v=validation: self.llm_route_status_var.set(
+                        f"Validate Data: {'PASS' if v.get('overall_passed') else 'CHECK'} -> {v.get('validation_report_path', '')}"
+                    ),
+                )
+                self.root.after(0, self.refresh_route_preview)
+                self.root.after(0, self.refresh_llm_route_map)
+            except Exception as exc:
+                LOGGER.warning("Validate house search data failed: %s", exc)
+                self.root.after(0, lambda e=exc: self.llm_route_status_var.set(f"Validate Data failed: {e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def start_route_follow(self, *, auto: bool) -> None:
         session = self.active_session()
@@ -2446,6 +2583,142 @@ class RouteControlMixin:
             "coverage_report": coverage_report,
             "rescan_plan": rescan_plan,
         }
+
+    def read_jsonl_artifact(self, path: Path) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        if not path.exists():
+            return rows
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                rows.append(payload)
+        return rows
+
+    def validate_house_search_data(self, *, finalize_result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        search_dir = self.house_search_output_dir_for_active_plan()
+        if search_dir is None:
+            raise RuntimeError("missing house search output directory")
+        frames_dir = search_dir / "frames"
+        frame_dirs = sorted(path for path in frames_dir.glob("frame_*") if path.is_dir()) if frames_dir.exists() else []
+        if finalize_result is None and frame_dirs:
+            finalize_result = self.finalize_house_search_outputs()
+        coverage_report = {}
+        rescan_plan = {}
+        if isinstance(finalize_result, dict):
+            coverage_report = finalize_result.get("coverage_report", {}) if isinstance(finalize_result.get("coverage_report"), dict) else {}
+            rescan_plan = finalize_result.get("rescan_plan", {}) if isinstance(finalize_result.get("rescan_plan"), dict) else {}
+        if not coverage_report:
+            coverage_report = flight.read_json_object(search_dir / "coverage_report.json")
+        if not rescan_plan:
+            rescan_plan = flight.read_json_object(search_dir / "rescan_plan.json")
+        scan_points_payload = flight.read_json_object(search_dir / "scan_points.json")
+        file_scan_points = scan_points_payload.get("scan_points", []) if isinstance(scan_points_payload.get("scan_points"), list) else []
+        scan_points = self.llm_route_scan_points if self.llm_route_scan_points else file_scan_points
+        target_house_id = str(
+            coverage_report.get("target_house_id", "")
+            or scan_points_payload.get("target_house_id", "")
+            or self.llm_route_plan.get("target_house_id", "")
+            or self.selected_route_target_house_id()
+        )
+        execution_rows = self.read_jsonl_artifact(search_dir / "scan_execution_log.jsonl")
+        capture_rows = self.read_jsonl_artifact(search_dir / "lidar_capture_log.jsonl")
+        successful_scan_ids = {
+            str(row.get("scan_id", "") or "")
+            for row in execution_rows
+            if str(row.get("capture_status", "") or "") == "ok"
+        }
+        facade_set = {
+            str(point.get("facade", "") or "")
+            for point in scan_points
+            if isinstance(point, dict) and str(point.get("facade", "") or "")
+        }
+        scan_validation = self.scan_point_validation_report(target_house_id, scan_points)
+        planned_count = len(scan_points)
+        capture_success_rate = len(successful_scan_ids) / max(1, planned_count)
+        merged_count = int(coverage_report.get("merged_point_count", 0) or 0)
+        mean_coverage = float(coverage_report.get("mean_facade_coverage", 0.0) or 0.0)
+        rescan_points = rescan_plan.get("rescan_points", []) if isinstance(rescan_plan.get("rescan_points"), list) else []
+        reconstruction_ply = ""
+        if isinstance(self.llm_route_execution_summary, dict):
+            reconstruction_ply = str(self.llm_route_execution_summary.get("merged_point_cloud_world_standard_m_ply_path", "") or "")
+        if not reconstruction_ply:
+            reconstruction_ply = str(
+                coverage_report.get("cloud_path", "") or search_dir / "reconstruction" / "merged_point_cloud_world_standard_m.ply"
+            )
+        checks = [
+            {
+                "name": "scan_points_exist",
+                "passed": planned_count > 0,
+                "detail": f"{planned_count} planned scan points",
+            },
+            {
+                "name": "four_facades_planned",
+                "passed": {"south", "east", "north", "west"}.issubset(facade_set),
+                "detail": ",".join(sorted(facade_set)),
+            },
+            {
+                "name": "scan_point_geometry_valid",
+                "passed": bool(scan_validation.get("valid", False)),
+                "detail": scan_validation,
+            },
+            {
+                "name": "capture_success_rate",
+                "passed": capture_success_rate >= 0.90,
+                "detail": f"{len(successful_scan_ids)}/{planned_count} scan points captured",
+            },
+            {
+                "name": "lidar_capture_rows_exist",
+                "passed": len(capture_rows) > 0,
+                "detail": f"{len(capture_rows)} lidar capture rows",
+            },
+            {
+                "name": "reconstruction_points_exist",
+                "passed": merged_count > 0,
+                "detail": f"merged_point_count={merged_count}",
+            },
+            {
+                "name": "coverage_complete_or_rescan_available",
+                "passed": mean_coverage >= 0.85 or len(rescan_points) > 0,
+                "detail": f"mean_coverage={mean_coverage:.4f}, rescan_points={len(rescan_points)}",
+            },
+        ]
+        validation = {
+            "target_house_id": target_house_id,
+            "house_search_dir": str(search_dir),
+            "overall_passed": all(bool(check.get("passed", False)) for check in checks),
+            "checks": checks,
+            "planned_scan_count": planned_count,
+            "captured_scan_count": len(successful_scan_ids),
+            "capture_success_rate": round(float(capture_success_rate), 4),
+            "lidar_capture_row_count": len(capture_rows),
+            "frame_dir_count": len(frame_dirs),
+            "merged_point_count": merged_count,
+            "mean_facade_coverage": round(mean_coverage, 4),
+            "rescan_point_count": len(rescan_points),
+            "coverage_report_path": str(search_dir / "coverage_report.json"),
+            "rescan_plan_path": str(search_dir / "rescan_plan.json"),
+            "reconstruction_ply_path": reconstruction_ply,
+            "validated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        validation_path = search_dir / "validation_report.json"
+        validation["validation_report_path"] = str(validation_path)
+        self.write_json_artifact(validation_path, validation)
+        self.llm_route_validation_report = validation
+        self.llm_route_execution_summary.update(
+            {
+                "validation_report_path": str(validation_path),
+                "validation_passed": bool(validation["overall_passed"]),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        self.write_json_artifact(search_dir / "execution_summary.json", self.llm_route_execution_summary)
+        return validation
 
     def follow_route_worker(self, session: flight.DroneFlightSession, points: List[Dict[str, Any]], *, auto: bool) -> None:
         step_cm = self.route_step_cm()

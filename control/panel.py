@@ -58,6 +58,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
             value=" ".join(str(value) for value in flight.DEFAULT_CALIBRATION_MARKER_SCALE)
         )
         self.llm_route_status_var = tk.StringVar(value="LLM Route: idle")
+        self.llm_route_map_status_var = tk.StringVar(value="Route Map: idle")
         self.llm_route_target_var = tk.StringVar(value="")
         self.llm_task_text_var = tk.StringVar(value="Search the selected house entrance.")
         self.llm_api_style_var = tk.StringVar(value=normalize_llm_api_style(getattr(args, "llm_api_style", default_llm_api_style())))
@@ -218,8 +219,10 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.llm_route_scan_points: List[Dict[str, Any]] = []
         self.llm_route_lidar_trajectory: List[Dict[str, Any]] = []
         self.llm_route_execution_summary: Dict[str, Any] = {}
+        self.llm_route_validation_report: Dict[str, Any] = {}
         self.house_search_dir: Optional[Path] = None
         self.llm_route_window: Optional[tk.Toplevel] = None
+        self.llm_route_map_widget: Optional[OverheadMapWidget] = None
         self.llm_route_preview_text: Optional[tk.Text] = None
         self.llm_route_preview_texts: List[tk.Text] = []
         self.main_canvas: Optional[tk.Canvas] = None
@@ -597,6 +600,8 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Button(actions, text="Analyze Task", command=self.on_llm_task_analyze).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Plan Route", command=self.on_llm_route_plan).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Fallback Route", command=self.on_fallback_route_plan).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Direct Capture Test", command=self.on_direct_scan_capture_test).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Validate Data", command=self.on_validate_house_search_data).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Follow Next", command=self.on_follow_route_next).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Auto Follow", command=self.on_follow_route_auto).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Stop Route", command=self.on_stop_route_follow).pack(side="left", padx=6, pady=4)
@@ -619,11 +624,22 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
             return
         window = tk.Toplevel(self.root)
         window.title("LLM House Entrance Route")
-        window.geometry("1280x420")
+        window.geometry("1280x920")
         window.grid_columnconfigure(0, weight=1)
-        window.grid_rowconfigure(0, weight=1)
+        window.grid_rowconfigure(1, weight=1)
         route = self._build_llm_route_section(window, include_window_button=False)
-        route.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        route.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        map_frame = tk.LabelFrame(window, text="Map Scan Points")
+        map_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 8))
+        map_frame.grid_columnconfigure(0, weight=1)
+        map_frame.grid_rowconfigure(1, weight=1)
+        map_toolbar = tk.Frame(map_frame)
+        map_toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
+        tk.Label(map_toolbar, textvariable=self.llm_route_map_status_var, anchor="w").pack(side="left", fill="x", expand=True)
+        tk.Button(map_toolbar, text="Refresh Map", command=self.refresh_llm_route_map).pack(side="right", padx=6)
+        self.load_map_resources(force=True)
+        self.llm_route_map_widget = OverheadMapWidget(map_frame, world_bounds=self.map_world_bounds, canvas_w=1200, canvas_h=480)
+        self.llm_route_map_widget.canvas.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
         self.llm_route_window = window
 
         def close_window() -> None:
@@ -632,6 +648,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
                 getattr(route, "_llm_route_preview_text", None),
             )
             self.llm_route_window = None
+            self.llm_route_map_widget = None
             try:
                 window.destroy()
             except tk.TclError:
@@ -640,6 +657,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         window.protocol("WM_DELETE_WINDOW", close_window)
         self.refresh_house_target_choices()
         self.refresh_route_preview()
+        self.refresh_llm_route_map()
 
     def _bind_hotkeys(self) -> None:
         self.root.bind_all("<KeyPress>", self._on_keyboard_press, add="+")
@@ -912,6 +930,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
             except Exception:
                 pass
             self.llm_route_window = None
+            self.llm_route_map_widget = None
         self.stop_stream_player()
         self.stop_stream_analysis()
         self.close_lidar_analysis_window()
