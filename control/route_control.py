@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .common import *
+from .route_scan import generate_rule_scan_points, normalize_facade_order
 
 
 class RouteControlMixin:
@@ -861,12 +862,14 @@ class RouteControlMixin:
             y = self._as_float_or_none(point.get("y", point.get("world_y")))
             if x is None or y is None:
                 continue
-            valid_points.append({
+            point_payload = dict(point)
+            point_payload.update({
                 "x": round(float(x), 2),
                 "y": round(float(y), 2),
                 "label": str(point.get("label", "") or f"wp_{idx}"),
                 "status": str(point.get("status", "") or "planned"),
             })
+            valid_points.append(point_payload)
         if not valid_points:
             return {}
         try:
@@ -1337,6 +1340,11 @@ class RouteControlMixin:
                 for item in (parsed.get("perimeter_search_order", []) if isinstance(parsed.get("perimeter_search_order"), list) else [])
                 if str(item or "").strip()
             ][:16],
+            "preferred_facade_order": normalize_facade_order(
+                parsed.get("preferred_facade_order", [])
+                if isinstance(parsed.get("preferred_facade_order"), list)
+                else []
+            ),
             "avoid_house_ids": [
                 str(item)
                 for item in (parsed.get("avoid_house_ids", []) if isinstance(parsed.get("avoid_house_ids"), list) else [])
@@ -1589,8 +1597,283 @@ class RouteControlMixin:
             boundary=self.target_boundary_context(target_house_id, pose),
         )
 
+    def route_scan_standoff_cm(self) -> float:
+        try:
+            return max(20.0, float(self.llm_route_standoff_cm_var.get().strip()))
+        except Exception:
+            return float(LLM_ROUTE_SCAN_STANDOFF_CM)
+
+    def route_scan_spacing_cm(self) -> float:
+        try:
+            return max(1.0, float(self.llm_route_scan_spacing_cm_var.get().strip()))
+        except Exception:
+            return float(LLM_ROUTE_SCAN_SPACING_CM)
+
+    def route_capture_count(self) -> int:
+        try:
+            return max(1, int(float(self.llm_route_capture_count_var.get().strip())))
+        except Exception:
+            return int(LLM_ROUTE_CAPTURE_COUNT)
+
+    def target_house_capture_altitude_cm(self, house_id: str) -> float:
+        hid = str(house_id or "").strip()
+        if not self.map_config:
+            self.load_map_resources(force=True)
+        for house in self.map_config.get("houses", []) if isinstance(self.map_config.get("houses"), list) else []:
+            if isinstance(house, dict) and str(house.get("id", "") or "").strip() == hid:
+                altitude = self._as_float_or_none(house.get("approach_z"))
+                return max(500.0, float(altitude if altitude is not None else 500.0))
+        return 500.0
+
+    def preferred_facade_order_for_route_plan(self, route_plan: Dict[str, Any]) -> List[str]:
+        if not isinstance(route_plan, dict):
+            return normalize_facade_order([])
+        raw = route_plan.get("preferred_facade_order")
+        if not isinstance(raw, list) or not raw:
+            raw = route_plan.get("facade_order")
+        raw_items = raw if isinstance(raw, list) else []
+        has_explicit_facade = any(str(item or "").strip().lower() in {"south", "east", "north", "west"} for item in raw_items)
+        if has_explicit_facade:
+            return normalize_facade_order(raw_items)
+        face_id = str(route_plan.get("target_face_id", "") or "").strip().lower()
+        if face_id not in {"south", "east", "north", "west"}:
+            waypoint = route_plan.get("target_standoff_waypoint", {}) if isinstance(route_plan.get("target_standoff_waypoint"), dict) else {}
+            face_id = str(waypoint.get("face_id", "") or "").strip().lower()
+        if face_id in {"south", "east", "north", "west"}:
+            base = ["south", "east", "north", "west"]
+            start = base.index(face_id)
+            return base[start:] + base[:start]
+        return normalize_facade_order([])
+
+    def build_rule_scan_points_for_route_plan(self, route_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+        hid = str(route_plan.get("target_house_id", "") or self.selected_route_target_house_id()).strip()
+        if not hid:
+            return []
+        bbox = self.house_world_bbox_for_id(hid)
+        if not bbox:
+            return []
+        return generate_rule_scan_points(
+            house_id=hid,
+            bbox_world=bbox,
+            facade_order=self.preferred_facade_order_for_route_plan(route_plan),
+            standoff_cm=self.route_scan_standoff_cm(),
+            scan_spacing_cm=self.route_scan_spacing_cm(),
+            altitude_cm=self.target_house_capture_altitude_cm(hid),
+            lidar_range_cm=[
+                float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
+                float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+            ],
+        )
+
+    def route_to_standoff_points(self, route_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw_points = route_plan.get("route_points", []) if isinstance(route_plan.get("route_points"), list) else []
+        perimeter = route_plan.get("perimeter_route_points", []) if isinstance(route_plan.get("perimeter_route_points"), list) else []
+        perimeter_labels = {
+            str(point.get("label", "") or "")
+            for point in perimeter
+            if isinstance(point, dict) and str(point.get("label", "") or "")
+        }
+        transit: List[Dict[str, Any]] = []
+        for idx, point in enumerate(raw_points):
+            if not isinstance(point, dict):
+                continue
+            label = str(point.get("label", "") or "")
+            if point.get("route_point_type") == "scan_point" or point.get("scan_id"):
+                continue
+            if label in perimeter_labels or ("_scan_" in label and ":" in label):
+                continue
+            item = dict(point)
+            item["route_point_type"] = str(item.get("route_point_type", "") or "transit")
+            item["label"] = label or f"transit_{idx}"
+            transit.append(item)
+        return transit
+
+    def scan_points_as_route_points(self, scan_points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        route_points: List[Dict[str, Any]] = []
+        for point in scan_points:
+            if not isinstance(point, dict):
+                continue
+            item = dict(point)
+            item["label"] = str(point.get("scan_id", "") or f"scan_{len(route_points):03d}")
+            item["route_point_type"] = "scan_point"
+            item["status"] = str(point.get("status", "") or "planned")
+            route_points.append(item)
+        return route_points
+
+    def scan_point_validation_report(self, target_house_id: str, scan_points: List[Dict[str, Any]]) -> Dict[str, Any]:
+        bbox = self.house_world_bbox_for_id(target_house_id)
+        invalid: List[Dict[str, Any]] = []
+        min_range = float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM))
+        max_range = float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM))
+        for point in scan_points:
+            if not isinstance(point, dict):
+                continue
+            x = self._as_float_or_none(point.get("x"))
+            y = self._as_float_or_none(point.get("y"))
+            standoff = self._as_float_or_none(point.get("standoff_cm"))
+            scan_id = str(point.get("scan_id", "") or "")
+            if x is None or y is None:
+                invalid.append({"scan_id": scan_id, "reason": "missing_xy"})
+                continue
+            if bbox and self.point_inside_open_bbox(float(x), float(y), bbox):
+                invalid.append({"scan_id": scan_id, "reason": "inside_target_bbox"})
+            if standoff is not None and not (min_range <= float(standoff) <= max_range):
+                invalid.append({"scan_id": scan_id, "reason": "standoff_outside_lidar_range", "standoff_cm": standoff})
+        return {
+            "valid": not invalid and bool(scan_points),
+            "scan_point_count": len(scan_points),
+            "lidar_range_cm": [min_range, max_range],
+            "invalid_count": len(invalid),
+            "invalid": invalid[:16],
+        }
+
+    def target_house_route_violation_report(self, target_house_id: str, route_points: List[Dict[str, Any]]) -> Dict[str, Any]:
+        bbox = self.house_world_bbox_for_id(target_house_id)
+        if not bbox:
+            return {"valid": False, "reason": "missing_target_bbox", "violation_count": 0, "violations": []}
+        points: List[Dict[str, float]] = []
+        for point in route_points if isinstance(route_points, list) else []:
+            if not isinstance(point, dict):
+                continue
+            x = self._as_float_or_none(point.get("x", point.get("world_x")))
+            y = self._as_float_or_none(point.get("y", point.get("world_y")))
+            if x is not None and y is not None:
+                points.append({"x": float(x), "y": float(y)})
+        violations: List[Dict[str, Any]] = []
+        for idx in range(max(0, len(points) - 1)):
+            start = points[idx]
+            end = points[idx + 1]
+            if self.segment_intersects_open_bbox(start["x"], start["y"], end["x"], end["y"], bbox):
+                violations.append(
+                    {
+                        "segment_index": idx,
+                        "segment_start": {"x": round(start["x"], 2), "y": round(start["y"], 2)},
+                        "segment_end": {"x": round(end["x"], 2), "y": round(end["y"], 2)},
+                    }
+                )
+        return {
+            "valid": bool(len(points) >= 2 and not violations),
+            "point_count": len(points),
+            "violation_count": len(violations),
+            "violations": violations[:12],
+        }
+
+    def make_house_search_output_dir(self, target_house_id: str) -> Path:
+        session = self.session
+        if session is not None and session.run_dir is not None:
+            root = Path(session.run_dir) / "house_search"
+        else:
+            root = self.resolve_project_path("results/house_search")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        safe_house = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(target_house_id or "unknown")).strip("_") or "unknown"
+        base_name = f"house_{safe_house}_run_{timestamp}"
+        root.mkdir(parents=True, exist_ok=True)
+        candidate = root / base_name
+        suffix = 1
+        while candidate.exists():
+            suffix += 1
+            candidate = root / f"{base_name}_{suffix}"
+        (candidate / "frames").mkdir(parents=True, exist_ok=True)
+        (candidate / "reconstruction").mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def write_json_artifact(self, path: Path, payload: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def build_llm_route_strategy_payload(
+        self,
+        route_plan: Dict[str, Any],
+        scan_points: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        target_house_id = str(route_plan.get("target_house_id", "") or "")
+        return {
+            "target_house_order": [target_house_id] if target_house_id else [],
+            "route_strategy": str(route_plan.get("mode", "") or route_plan.get("route_strategy", "") or "map_visibility_route_to_target_house_standoff"),
+            "preferred_facade_order": self.preferred_facade_order_for_route_plan(route_plan),
+            "scan_strategy": "perimeter_scan_with_optional_rescan",
+            "capture_priority": ["front_face_view", "side_oblique_view", "back_face_view", "coverage_gap_rescan"],
+            "avoid_house_ids": route_plan.get("avoid_house_ids", []),
+            "replan_triggers": route_plan.get("replan_triggers", []),
+            "planner_source": str(route_plan.get("planner_source", "") or "unknown"),
+            "scan_point_count": len(scan_points),
+            "reason": str(route_plan.get("reason", "") or "Rule-generated facade scan route from target house bbox."),
+        }
+
+    def prepare_route_plan_with_scan_points(self, route_plan: Dict[str, Any]) -> Dict[str, Any]:
+        plan = dict(route_plan if isinstance(route_plan, dict) else {})
+        target_house_id = str(plan.get("target_house_id", "") or self.selected_route_target_house_id()).strip()
+        if not target_house_id:
+            return plan
+        plan["target_house_id"] = target_house_id
+        scan_points = self.build_rule_scan_points_for_route_plan(plan)
+        transit_points = self.route_to_standoff_points(plan)
+        scan_route_points = self.scan_points_as_route_points(scan_points)
+        route_points = transit_points + scan_route_points
+        current_house_id = str(plan.get("current_house_id", "") or "")
+        route_safety_report = self.route_house_violation_report(
+            route_points,
+            target_house_id=target_house_id,
+            current_house_id=current_house_id,
+        )
+        target_bbox_report = self.target_house_route_violation_report(target_house_id, route_points)
+        scan_validation = self.scan_point_validation_report(target_house_id, scan_points)
+        blocked = (
+            not bool(route_safety_report.get("valid", False))
+            or not bool(target_bbox_report.get("valid", False))
+            or not bool(scan_validation.get("valid", False))
+        )
+        house_search_dir = self.make_house_search_output_dir(target_house_id)
+        execution_summary = {
+            "house_search_dir": str(house_search_dir),
+            "target_house_id": target_house_id,
+            "planned_scan_count": len(scan_points),
+            "completed_scan_count": 0,
+            "capture_success_count": 0,
+            "capture_failure_count": 0,
+            "merged_point_count": 0,
+            "route_blocked_by_safety": bool(blocked),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        plan.update(
+            {
+                "house_search_dir": str(house_search_dir),
+                "route_to_standoff_points": transit_points,
+                "route_points": route_points,
+                "scan_points": scan_points,
+                "scan_point_count": len(scan_points),
+                "scan_standoff_cm": self.route_scan_standoff_cm(),
+                "scan_spacing_cm": self.route_scan_spacing_cm(),
+                "capture_count_per_scan_point": self.route_capture_count(),
+                "preferred_facade_order": self.preferred_facade_order_for_route_plan(plan),
+                "route_safety_report": route_safety_report,
+                "target_bbox_route_report": target_bbox_report,
+                "scan_point_validation_report": scan_validation,
+                "route_blocked_by_safety": bool(blocked),
+                "active": bool(plan.get("active", True)) and not blocked,
+            }
+        )
+        strategy_payload = self.build_llm_route_strategy_payload(plan, scan_points)
+        self.write_json_artifact(house_search_dir / "llm_route_strategy.json", strategy_payload)
+        self.write_json_artifact(house_search_dir / "normalized_route_plan.json", plan)
+        self.write_json_artifact(
+            house_search_dir / "scan_points.json",
+            {
+                "schema": LLM_ROUTE_SCAN_POINTS_SCHEMA,
+                "target_house_id": target_house_id,
+                "scan_points": scan_points,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        self.write_json_artifact(house_search_dir / "execution_summary.json", execution_summary)
+        self.llm_route_scan_points = scan_points
+        self.llm_route_lidar_trajectory = []
+        self.llm_route_execution_summary = execution_summary
+        self.house_search_dir = house_search_dir
+        return plan
+
     def apply_route_plan(self, route_plan: Dict[str, Any], *, status_prefix: str = "LLM Route") -> None:
-        self.llm_route_plan = route_plan if isinstance(route_plan, dict) else {}
+        self.llm_route_plan = self.prepare_route_plan_with_scan_points(route_plan) if isinstance(route_plan, dict) else {}
         target_house_id = str(self.llm_route_plan.get("target_house_id", "") or "")
         if target_house_id:
             self.set_selected_route_target_house(target_house_id)
@@ -1598,25 +1881,35 @@ class RouteControlMixin:
         self.refresh_map_once()
         point_count = len(self.llm_route_plan.get("route_points", [])) if isinstance(self.llm_route_plan.get("route_points"), list) else 0
         source = str(self.llm_route_plan.get("planner_source", "") or "unknown")
-        message = str(self.llm_route_plan.get("llm_route_error", "") or self.llm_route_plan.get("reason", "") or "")
+        if self.llm_route_plan.get("route_blocked_by_safety"):
+            message = "route blocked by safety validation"
+        else:
+            message = str(self.llm_route_plan.get("llm_route_error", "") or self.llm_route_plan.get("reason", "") or "")
         suffix = f" | {message}" if message else ""
         self.llm_route_status_var.set(f"{status_prefix}: house={target_house_id or '-'} source={source} points={point_count}{suffix}")
 
     def refresh_route_preview(self) -> None:
-        if self.llm_route_preview_text is None:
-            return
         payload = {
             "task_plan": self.llm_task_plan if isinstance(self.llm_task_plan, dict) else {},
             "route_plan": self.llm_route_plan if isinstance(self.llm_route_plan, dict) else {},
+            "scan_points": self.llm_route_scan_points if isinstance(self.llm_route_scan_points, list) else [],
+            "execution_summary": self.llm_route_execution_summary if isinstance(self.llm_route_execution_summary, dict) else {},
         }
         text = json.dumps(payload, indent=2, ensure_ascii=False)
-        try:
-            self.llm_route_preview_text.configure(state="normal")
-            self.llm_route_preview_text.delete("1.0", "end")
-            self.llm_route_preview_text.insert("1.0", text)
-            self.llm_route_preview_text.configure(state="disabled")
-        except tk.TclError:
-            pass
+        live_texts: List[tk.Text] = []
+        for preview_text in list(getattr(self, "llm_route_preview_texts", [])):
+            try:
+                if not preview_text.winfo_exists():
+                    continue
+                preview_text.configure(state="normal")
+                preview_text.delete("1.0", "end")
+                preview_text.insert("1.0", text)
+                preview_text.configure(state="disabled")
+                live_texts.append(preview_text)
+            except tk.TclError:
+                pass
+        self.llm_route_preview_texts = live_texts
+        self.llm_route_preview_text = live_texts[0] if live_texts else None
 
     def on_llm_task_analyze(self) -> None:
         if self.route_thread is not None and self.route_thread.is_alive():
@@ -1693,6 +1986,10 @@ class RouteControlMixin:
         self.route_stop_event.set()
         self.llm_route_plan = {}
         self.llm_task_plan = {}
+        self.llm_route_scan_points = []
+        self.llm_route_lidar_trajectory = []
+        self.llm_route_execution_summary = {}
+        self.house_search_dir = None
         self.refresh_route_preview()
         self.refresh_map_once()
         self.llm_route_status_var.set("LLM Route: cleared.")
@@ -1722,7 +2019,15 @@ class RouteControlMixin:
             return []
         active_index = int(self.llm_route_plan.get("active_waypoint_index", 0) or 0)
         active_index = max(0, min(active_index, len(points) - 1))
-        return list(points[active_index:] if auto else points[active_index:active_index + 1])
+        selected = points[active_index:] if auto else points[active_index:active_index + 1]
+        result: List[Dict[str, Any]] = []
+        for offset, point in enumerate(selected):
+            if not isinstance(point, dict):
+                continue
+            item = dict(point)
+            item["_route_point_index"] = active_index + offset
+            result.append(item)
+        return result
 
     def on_follow_route_next(self) -> None:
         self.start_route_follow(auto=False)
@@ -1743,6 +2048,11 @@ class RouteControlMixin:
         if self.route_thread is not None and self.route_thread.is_alive():
             self.llm_route_status_var.set("LLM Route: follow already running.")
             return
+        if isinstance(self.llm_route_plan, dict) and self.llm_route_plan.get("route_blocked_by_safety"):
+            self.llm_route_status_var.set("LLM Route: blocked by route/scan safety validation.")
+            self.refresh_route_preview()
+            return
+        self.sync_capture_options_to_session(session)
         points = self.route_points_to_follow(auto=auto)
         if not points:
             self.llm_route_status_var.set("LLM Route: no route point to follow.")
@@ -1754,10 +2064,394 @@ class RouteControlMixin:
         )
         self.route_thread.start()
 
+    def is_scan_route_point(self, point: Dict[str, Any]) -> bool:
+        return bool(
+            isinstance(point, dict)
+            and (point.get("route_point_type") == "scan_point" or str(point.get("scan_id", "") or ""))
+        )
+
+    def append_jsonl(self, path: Path, payload: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def house_search_output_dir_for_active_plan(self) -> Optional[Path]:
+        raw = ""
+        if isinstance(self.llm_route_plan, dict):
+            raw = str(self.llm_route_plan.get("house_search_dir", "") or "")
+        if not raw and self.house_search_dir is not None:
+            raw = str(self.house_search_dir)
+        if not raw:
+            target_house_id = self.selected_route_target_house_id()
+            if not target_house_id:
+                return None
+            self.house_search_dir = self.make_house_search_output_dir(target_house_id)
+            raw = str(self.house_search_dir)
+            if isinstance(self.llm_route_plan, dict):
+                self.llm_route_plan["house_search_dir"] = raw
+        path = Path(raw)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "frames").mkdir(parents=True, exist_ok=True)
+        (path / "reconstruction").mkdir(parents=True, exist_ok=True)
+        return path
+
+    def update_route_point_runtime_status(self, point: Dict[str, Any], status: str) -> None:
+        index = point.get("_route_point_index")
+        try:
+            idx = int(index)
+        except Exception:
+            idx = -1
+        if idx >= 0 and isinstance(self.llm_route_plan, dict):
+            points = self.llm_route_plan.get("route_points", [])
+            if isinstance(points, list) and idx < len(points) and isinstance(points[idx], dict):
+                points[idx]["status"] = status
+        scan_id = str(point.get("scan_id", "") or "")
+        if scan_id:
+            for scan_point in self.llm_route_scan_points:
+                if isinstance(scan_point, dict) and str(scan_point.get("scan_id", "") or "") == scan_id:
+                    scan_point["status"] = status
+
+    def write_house_search_lidar_summary(self, search_dir: Path, *, running: bool) -> None:
+        summary = {
+            "capture_kind": "house_search_lidar",
+            "task_title": self.llm_task_text_var.get().strip() or "house_search",
+            "stream_dir": str(search_dir),
+            "frames_dir": str(search_dir / "frames"),
+            "reconstruction_dir": str(search_dir / "reconstruction"),
+            "running": bool(running),
+            "frame_count": len(self.llm_route_lidar_trajectory),
+            "lidar_depth_min_cm": float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
+            "lidar_depth_max_cm": float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+            "lidar_depth_projection": str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
+            "lidar_capture_processing": self.lidar_capture_processing_mode(),
+            "coordinate_frame": "standard_zup",
+            "coordinate_units": "m",
+            "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        (search_dir / "stream_capture_lidar.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        trajectory_payload = dict(summary)
+        trajectory_payload["trajectory"] = self.llm_route_lidar_trajectory
+        (search_dir / "trajectory.json").write_text(json.dumps(trajectory_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def capture_at_scan_route_point(
+        self,
+        session: flight.DroneFlightSession,
+        point: Dict[str, Any],
+        *,
+        point_index: int,
+        total: int,
+    ) -> Dict[str, Any]:
+        search_dir = self.house_search_output_dir_for_active_plan()
+        if search_dir is None:
+            return {"capture_status": "failed", "error": "missing_house_search_dir"}
+        scan_id = str(point.get("scan_id", "") or point.get("label", f"scan_{point_index:03d}"))
+        planned_pose = {
+            "x": float(point.get("x", 0.0)),
+            "y": float(point.get("y", 0.0)),
+            "z": float(point.get("z", self.target_house_capture_altitude_cm(str(point.get("house_id", ""))))),
+            "yaw": float(point.get("yaw_deg", point.get("yaw", 0.0))),
+        }
+        self.root.after(
+            0,
+            lambda i=point_index, t=total, sid=scan_id: self.llm_route_status_var.set(f"LLM Route: align/capture {i}/{t} {sid}"),
+        )
+        set_result = self.safe("Route scan point align", lambda: session.set_pose(planned_pose))
+        if isinstance(set_result, dict):
+            self.root.after(0, lambda r=set_result: self.apply_state(r))
+        if self.route_stop_event.wait(0.3):
+            return {"capture_status": "stopped", "scan_id": scan_id}
+        capture_results: List[Dict[str, Any]] = []
+        capture_count = self.route_capture_count()
+        for capture_index in range(capture_count):
+            if self.route_stop_event.is_set():
+                break
+            frame_index = len(self.llm_route_lidar_trajectory) + 1
+            action_detail = dict(self.build_stream_action_detail())
+            action_detail.update(
+                {
+                    "source": "llm_house_search_route",
+                    "scan_id": scan_id,
+                    "house_id": str(point.get("house_id", "") or self.selected_route_target_house_id()),
+                    "facade": str(point.get("facade", "") or ""),
+                    "capture_index": capture_index + 1,
+                    "capture_count": capture_count,
+                    "planned_pose": planned_pose,
+                }
+            )
+            result = self.safe(
+                "Route scan lidar capture",
+                lambda idx=frame_index, action=action_detail: session.capture_lidar_stream_frame(
+                    search_dir,
+                    idx,
+                    action_detail=action,
+                ),
+            )
+            if not isinstance(result, dict):
+                continue
+            capture_results.append(result)
+            trajectory_entry = {
+                "frame_index": int(result.get("frame_index", frame_index)),
+                "capture_time": result.get("capture_time", ""),
+                "scan_id": scan_id,
+                "house_id": str(point.get("house_id", "") or ""),
+                "facade": str(point.get("facade", "") or ""),
+                "planned_pose": planned_pose,
+                "pose": result.get("pose", {}),
+                "commanded_pose": result.get("commanded_pose", {}),
+                "actual_pose": result.get("actual_pose", {}),
+                "pose_error": result.get("pose_error", {}),
+                "action_detail": action_detail,
+                "capture_dir": result.get("capture_dir", ""),
+                "rgb_path": result.get("rgb_path", ""),
+                "point_cloud_world_standard_m_npy_path": result.get("point_cloud_world_standard_m_npy_path", ""),
+                "point_cloud_world_standard_m_ply_path": result.get("point_cloud_world_standard_m_ply_path", ""),
+                "point_cloud_preview_path": result.get("point_cloud_preview_path", ""),
+                "point_count": int(result.get("point_count", 0) or 0),
+                "raw_capture_only": bool(result.get("raw_capture_only", self.lidar_capture_processing_mode() == "smooth")),
+                "postprocess_status": result.get("postprocess_status", "pending"),
+            }
+            self.llm_route_lidar_trajectory.append(trajectory_entry)
+            self.append_jsonl(search_dir / "lidar_capture_log.jsonl", trajectory_entry)
+            self.write_house_search_lidar_summary(search_dir, running=True)
+            self.root.after(
+                0,
+                lambda sid=scan_id, c=len(self.llm_route_lidar_trajectory): self.llm_route_status_var.set(
+                    f"LLM Route: captured {sid} frames={c}"
+                ),
+            )
+        state = self.safe("Route scan final state", session.get_state)
+        actual_pose = state.get("pose", {}) if isinstance(state, dict) and isinstance(state.get("pose"), dict) else {}
+        ax = self._as_float_or_none(actual_pose.get("x"))
+        ay = self._as_float_or_none(actual_pose.get("y"))
+        ayaw = self._as_float_or_none(actual_pose.get("task_yaw", actual_pose.get("yaw")))
+        position_error = (
+            math.hypot(float(ax) - planned_pose["x"], float(ay) - planned_pose["y"])
+            if ax is not None and ay is not None
+            else None
+        )
+        yaw_error = self._normalize_angle_deg(float(ayaw) - planned_pose["yaw"]) if ayaw is not None else None
+        capture_status = "ok" if capture_results else "failed"
+        execution_entry = {
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            "house_id": str(point.get("house_id", "") or ""),
+            "scan_id": scan_id,
+            "facade": str(point.get("facade", "") or ""),
+            "planned_pose": planned_pose,
+            "actual_pose": actual_pose,
+            "position_error_cm": round(float(position_error), 3) if position_error is not None else None,
+            "yaw_error_deg": round(float(yaw_error), 3) if yaw_error is not None else None,
+            "safety_state": "SAFE",
+            "capture_status": capture_status,
+            "capture_count": len(capture_results),
+            "capture_dirs": [str(item.get("capture_dir", "") or "") for item in capture_results],
+            "point_cloud_paths": [
+                str(item.get("point_cloud_world_standard_m_ply_path", "") or item.get("point_cloud_world_ply_path", "") or "")
+                for item in capture_results
+            ],
+        }
+        self.append_jsonl(search_dir / "scan_execution_log.jsonl", execution_entry)
+        if capture_status == "ok":
+            self.update_route_point_runtime_status(point, "captured")
+        else:
+            self.update_route_point_runtime_status(point, "capture_failed")
+        completed = sum(1 for item in self.llm_route_scan_points if isinstance(item, dict) and item.get("status") in {"captured", "visited"})
+        self.llm_route_execution_summary.update(
+            {
+                "completed_scan_count": int(completed),
+                "capture_success_count": int(self.llm_route_execution_summary.get("capture_success_count", 0) or 0) + (1 if capture_status == "ok" else 0),
+                "capture_failure_count": int(self.llm_route_execution_summary.get("capture_failure_count", 0) or 0) + (0 if capture_status == "ok" else 1),
+                "last_scan_id": scan_id,
+                "last_capture_status": capture_status,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        self.write_json_artifact(search_dir / "execution_summary.json", self.llm_route_execution_summary)
+        self.root.after(0, self.refresh_route_preview)
+        return execution_entry
+
+    def build_house_search_coverage_report(self, postprocess_result: Dict[str, Any]) -> Dict[str, Any]:
+        target_house_id = str(self.llm_route_plan.get("target_house_id", "") or self.selected_route_target_house_id())
+        bbox = self.house_world_bbox_for_id(target_house_id)
+        spacing = self.route_scan_spacing_cm()
+        standoff = self.route_scan_standoff_cm()
+        reconstruction = postprocess_result.get("reconstruction", {}) if isinstance(postprocess_result.get("reconstruction"), dict) else {}
+        merged_count = int(postprocess_result.get("merged_point_count", reconstruction.get("merged_point_count", 0)) or 0)
+        cloud_path = str(
+            reconstruction.get("merged_point_cloud_world_standard_m_npy_path")
+            or postprocess_result.get("merged_point_cloud_world_standard_m_npy_path", "")
+            or ""
+        )
+        facades: Dict[str, Dict[str, Any]] = {}
+        for facade in ("south", "east", "north", "west"):
+            planned = [p for p in self.llm_route_scan_points if isinstance(p, dict) and p.get("facade") == facade]
+            captured = [p for p in planned if p.get("status") in {"captured", "visited"}]
+            facades[facade] = {
+                "planned_scan_count": len(planned),
+                "captured_scan_count": len(captured),
+                "scan_completion_ratio": round(len(captured) / max(1, len(planned)), 4),
+                "point_cloud_coverage": None,
+                "covered_cells": 0,
+                "total_cells": 0,
+            }
+        if bbox and cloud_path and Path(cloud_path).exists():
+            try:
+                cloud = np.load(cloud_path, mmap_mode="r")
+                if getattr(cloud, "ndim", 0) == 2 and cloud.shape[1] >= 3 and cloud.shape[0] > 0:
+                    x_cm = np.asarray(cloud[:, 0], dtype=np.float32) * 100.0
+                    y_cm = -np.asarray(cloud[:, 1], dtype=np.float32) * 100.0
+                    min_x = float(bbox["min_x"])
+                    max_x = float(bbox["max_x"])
+                    min_y = float(bbox["min_y"])
+                    max_y = float(bbox["max_y"])
+                    band_cm = max(250.0, min(float(standoff) * 0.4, 500.0))
+                    facade_specs = {
+                        "south": (x_cm, (x_cm >= min_x) & (x_cm <= max_x) & (y_cm >= min_y - band_cm) & (y_cm <= min_y + band_cm), min_x, max_x),
+                        "north": (x_cm, (x_cm >= min_x) & (x_cm <= max_x) & (y_cm >= max_y - band_cm) & (y_cm <= max_y + band_cm), min_x, max_x),
+                        "west": (y_cm, (y_cm >= min_y) & (y_cm <= max_y) & (x_cm >= min_x - band_cm) & (x_cm <= min_x + band_cm), min_y, max_y),
+                        "east": (y_cm, (y_cm >= min_y) & (y_cm <= max_y) & (x_cm >= max_x - band_cm) & (x_cm <= max_x + band_cm), min_y, max_y),
+                    }
+                    for facade, (axis_values, mask, start, end) in facade_specs.items():
+                        total_cells = max(1, int(math.ceil(abs(float(end) - float(start)) / max(1.0, spacing))))
+                        selected = np.asarray(axis_values[mask], dtype=np.float32)
+                        covered_cells = 0
+                        if selected.size:
+                            cell_indices = np.floor((selected - min(float(start), float(end))) / max(1.0, spacing)).astype(np.int32)
+                            cell_indices = cell_indices[(cell_indices >= 0) & (cell_indices < total_cells)]
+                            covered_cells = int(np.unique(cell_indices).size)
+                        facades[facade].update(
+                            {
+                                "point_cloud_coverage": round(float(covered_cells) / float(total_cells), 4),
+                                "covered_cells": covered_cells,
+                                "total_cells": total_cells,
+                            }
+                        )
+            except Exception as exc:
+                LOGGER.warning("House search coverage estimate failed: %s", exc)
+        coverage_values = [
+            float(item["point_cloud_coverage"])
+            for item in facades.values()
+            if item.get("point_cloud_coverage") is not None
+        ]
+        if not coverage_values:
+            coverage_values = [float(item["scan_completion_ratio"]) for item in facades.values()]
+        mean_coverage = float(sum(coverage_values) / max(1, len(coverage_values)))
+        complete = bool(
+            all(float(item.get("point_cloud_coverage") if item.get("point_cloud_coverage") is not None else item["scan_completion_ratio"]) >= 0.75 for item in facades.values())
+            and mean_coverage >= 0.85
+            and merged_count > 0
+        )
+        return {
+            "target_house_id": target_house_id,
+            "house_search_dir": str(self.house_search_output_dir_for_active_plan() or ""),
+            "facades": facades,
+            "mean_facade_coverage": round(mean_coverage, 4),
+            "merged_point_count": merged_count,
+            "source_frame_count": int(postprocess_result.get("source_frame_count", 0) or 0),
+            "complete": complete,
+            "coverage_mode": "point_cloud_band_grid" if cloud_path and Path(cloud_path).exists() else "scan_completion_fallback",
+            "cloud_path": cloud_path,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def build_house_search_rescan_plan(self, coverage_report: Dict[str, Any]) -> Dict[str, Any]:
+        target_house_id = str(coverage_report.get("target_house_id", "") or "")
+        rescan_points: List[Dict[str, Any]] = []
+        facades = coverage_report.get("facades", {}) if isinstance(coverage_report.get("facades"), dict) else {}
+        for facade, report in facades.items():
+            if not isinstance(report, dict):
+                continue
+            coverage = report.get("point_cloud_coverage")
+            score = float(coverage if coverage is not None else report.get("scan_completion_ratio", 0.0) or 0.0)
+            if score >= 0.75:
+                continue
+            candidates = [
+                point for point in self.llm_route_scan_points
+                if isinstance(point, dict) and str(point.get("facade", "") or "") == str(facade)
+            ]
+            if not candidates:
+                continue
+            point = dict(candidates[len(candidates) // 2])
+            point["scan_id"] = f"{target_house_id}_{facade}_rescan_000"
+            point["status"] = "planned"
+            point["view_type"] = "hole_center_face_view"
+            point["rescan_reason"] = f"{facade} coverage below threshold"
+            rescan_points.append(point)
+        return {
+            "house_id": target_house_id,
+            "rescan_reason": "coverage below threshold" if rescan_points else "",
+            "rescan_points": rescan_points,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def write_house_search_summary_csv(self, search_dir: Path, coverage_report: Dict[str, Any]) -> None:
+        headers = [
+            "target_house_id",
+            "planned_scan_count",
+            "completed_scan_count",
+            "capture_success_count",
+            "capture_failure_count",
+            "merged_point_count",
+            "mean_facade_coverage",
+            "complete",
+        ]
+        row = {
+            "target_house_id": str(coverage_report.get("target_house_id", "") or ""),
+            "planned_scan_count": str(self.llm_route_execution_summary.get("planned_scan_count", 0)),
+            "completed_scan_count": str(self.llm_route_execution_summary.get("completed_scan_count", 0)),
+            "capture_success_count": str(self.llm_route_execution_summary.get("capture_success_count", 0)),
+            "capture_failure_count": str(self.llm_route_execution_summary.get("capture_failure_count", 0)),
+            "merged_point_count": str(coverage_report.get("merged_point_count", 0)),
+            "mean_facade_coverage": str(coverage_report.get("mean_facade_coverage", 0.0)),
+            "complete": str(bool(coverage_report.get("complete", False))),
+        }
+        lines = [",".join(headers), ",".join(row.get(header, "") for header in headers)]
+        (search_dir / "house_search_summary.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def finalize_house_search_outputs(self) -> Dict[str, Any]:
+        search_dir = self.house_search_output_dir_for_active_plan()
+        if search_dir is None:
+            return {}
+        self.write_house_search_lidar_summary(search_dir, running=False)
+        postprocess_result = flight.postprocess_lidar_stream_capture(
+            search_dir,
+            lidar_depth_projection=str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
+            min_depth_cm=float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
+            max_depth_cm=float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+            voxel_cm=flight.DEFAULT_LIDAR_RECON_VOXEL_CM,
+            max_points=flight.DEFAULT_LIDAR_RECON_MAX_POINTS,
+        )
+        coverage_report = self.build_house_search_coverage_report(postprocess_result)
+        rescan_plan = self.build_house_search_rescan_plan(coverage_report)
+        self.write_json_artifact(search_dir / "coverage_report.json", coverage_report)
+        self.write_json_artifact(search_dir / "rescan_plan.json", rescan_plan)
+        self.write_house_search_summary_csv(search_dir, coverage_report)
+        reconstruction = postprocess_result.get("reconstruction", {}) if isinstance(postprocess_result.get("reconstruction"), dict) else {}
+        self.llm_route_execution_summary.update(
+            {
+                "merged_point_count": int(coverage_report.get("merged_point_count", 0) or 0),
+                "mean_facade_coverage": coverage_report.get("mean_facade_coverage", 0.0),
+                "complete": bool(coverage_report.get("complete", False)),
+                "coverage_report_path": str(search_dir / "coverage_report.json"),
+                "rescan_plan_path": str(search_dir / "rescan_plan.json"),
+                "merged_point_cloud_world_standard_m_ply_path": str(
+                    reconstruction.get("merged_point_cloud_world_standard_m_ply_path", "")
+                ),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        self.write_json_artifact(search_dir / "execution_summary.json", self.llm_route_execution_summary)
+        self.root.after(0, self.refresh_route_preview)
+        return {
+            "postprocess_result": postprocess_result,
+            "coverage_report": coverage_report,
+            "rescan_plan": rescan_plan,
+        }
+
     def follow_route_worker(self, session: flight.DroneFlightSession, points: List[Dict[str, Any]], *, auto: bool) -> None:
         step_cm = self.route_step_cm()
         delay_s = self.route_delay_s()
         total = len(points)
+        captured_any = False
         for point_index, point in enumerate(points, start=1):
             if self.route_stop_event.is_set():
                 self.root.after(0, lambda: self.llm_route_status_var.set("LLM Route: follow stopped."))
@@ -1766,6 +2460,8 @@ class RouteControlMixin:
             ty = self._as_float_or_none(point.get("y"))
             if tx is None or ty is None:
                 continue
+            is_scan_point = self.is_scan_route_point(point)
+            target_z = self._as_float_or_none(point.get("z")) if is_scan_point else None
             label = str(point.get("label", f"wp{point_index}") or f"wp{point_index}")
             while not self.route_stop_event.is_set():
                 state = self.safe("Route follow state", session.get_state)
@@ -1798,17 +2494,41 @@ class RouteControlMixin:
                 )
                 response = self.safe(
                     "Route follow set pose",
-                    lambda nx=nx, ny=ny, pz=pz, yaw=yaw: session.set_pose({"x": nx, "y": ny, "z": float(pz if pz is not None else 100.0), "yaw": yaw}),
+                    lambda nx=nx, ny=ny, pz=pz, yaw=yaw, target_z=target_z: session.set_pose(
+                        {"x": nx, "y": ny, "z": float(target_z if target_z is not None else (pz if pz is not None else 100.0)), "yaw": yaw}
+                    ),
                 )
                 if isinstance(response, dict):
                     self.root.after(0, lambda r=response: self.apply_state(r))
                 else:
                     return
                 time.sleep(delay_s)
+            if is_scan_point and not self.route_stop_event.is_set():
+                capture_entry = self.capture_at_scan_route_point(
+                    session,
+                    point,
+                    point_index=point_index,
+                    total=total,
+                )
+                captured_any = captured_any or capture_entry.get("capture_status") == "ok"
             if not auto:
                 break
         if self.route_stop_event.is_set():
             self.root.after(0, lambda: self.llm_route_status_var.set("LLM Route: follow stopped."))
         else:
-            self.root.after(0, lambda: self.llm_route_status_var.set("LLM Route: follow complete."))
+            if captured_any:
+                try:
+                    finalize_result = self.finalize_house_search_outputs()
+                    coverage = finalize_result.get("coverage_report", {}) if isinstance(finalize_result, dict) else {}
+                    self.root.after(
+                        0,
+                        lambda c=coverage: self.llm_route_status_var.set(
+                            f"LLM Route: follow complete, coverage={float(c.get('mean_facade_coverage', 0.0) or 0.0):.2f}"
+                        ),
+                    )
+                except Exception as exc:
+                    LOGGER.warning("House search finalize failed: %s", exc)
+                    self.root.after(0, lambda e=exc: self.llm_route_status_var.set(f"LLM Route: finalize failed: {e}"))
+            else:
+                self.root.after(0, lambda: self.llm_route_status_var.set("LLM Route: follow complete."))
 

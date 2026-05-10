@@ -67,6 +67,9 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.llm_timeout_s_var = tk.StringVar(value=str(getattr(args, "llm_route_timeout_s", 60.0)))
         self.route_step_cm_var = tk.StringVar(value=str(getattr(args, "route_step_cm", 120.0)))
         self.route_delay_ms_var = tk.StringVar(value=str(getattr(args, "route_delay_ms", 100.0)))
+        self.llm_route_standoff_cm_var = tk.StringVar(value=str(LLM_ROUTE_SCAN_STANDOFF_CM))
+        self.llm_route_scan_spacing_cm_var = tk.StringVar(value=str(LLM_ROUTE_SCAN_SPACING_CM))
+        self.llm_route_capture_count_var = tk.StringVar(value=str(LLM_ROUTE_CAPTURE_COUNT))
 
         self.env_platform_var = tk.StringVar(value=args.env_platform)
         self.env_root_var = tk.StringVar(value=args.env_root or "UnrealEnv")
@@ -207,11 +210,18 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.map_touch_poll_inflight = False
         self.map_touch_auto_saved = False
         self.house_target_combo: Optional[ttk.Combobox] = None
+        self.house_target_combos: List[ttk.Combobox] = []
         self.house_choice_map: Dict[str, str] = {}
         self.house_display_by_id: Dict[str, str] = {}
         self.llm_task_plan: Dict[str, Any] = {}
         self.llm_route_plan: Dict[str, Any] = {}
+        self.llm_route_scan_points: List[Dict[str, Any]] = []
+        self.llm_route_lidar_trajectory: List[Dict[str, Any]] = []
+        self.llm_route_execution_summary: Dict[str, Any] = {}
+        self.house_search_dir: Optional[Path] = None
+        self.llm_route_window: Optional[tk.Toplevel] = None
         self.llm_route_preview_text: Optional[tk.Text] = None
+        self.llm_route_preview_texts: List[tk.Text] = []
         self.main_canvas: Optional[tk.Canvas] = None
         self.content_frame: Optional[tk.Frame] = None
         self.content_window: Optional[int] = None
@@ -490,19 +500,62 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Entry(map_frame, textvariable=self.marker_scale_var, width=7).grid(row=3, column=3, padx=(0, 8), pady=(0, 6))
         tk.Label(map_frame, textvariable=self.map_calibration_var, anchor="w").grid(row=3, column=4, columnspan=7, sticky="ew", padx=6, pady=(0, 6))
 
-        route = tk.LabelFrame(outer, text="LLM House Entrance Route")
+        route = self._build_llm_route_section(outer, include_window_button=True)
         route.grid(row=8, column=0, sticky="ew", padx=8, pady=4)
+
+        orbit = tk.LabelFrame(outer, text="Orbit Plan")
+        orbit.grid(row=9, column=0, sticky="ew", padx=8, pady=(4, 8))
+        for label, var, width in (
+            ("Center X", self.orbit_center_x_var, 10),
+            ("Center Y", self.orbit_center_y_var, 10),
+            ("Radius", self.orbit_radius_var, 8),
+            ("Altitude", self.orbit_altitude_var, 8),
+            ("Steps", self.orbit_steps_var, 6),
+            ("Start Angle", self.orbit_start_angle_var, 8),
+        ):
+            tk.Label(orbit, text=label).pack(side="left", padx=(6, 2), pady=6)
+            tk.Entry(orbit, textvariable=var, width=width).pack(side="left", padx=(0, 6), pady=6)
+        tk.Checkbutton(orbit, text="Clockwise", variable=self.orbit_clockwise_var).pack(side="left", padx=6)
+        tk.Button(orbit, text="Run Orbit", command=self.on_run_orbit).pack(side="left", padx=6)
+        tk.Button(orbit, text="Run Scripted Smoke", command=self.on_run_scripted).pack(side="left", padx=6)
+
+    def _register_llm_route_widgets(self, combo: ttk.Combobox, preview_text: tk.Text) -> None:
+        if self.house_target_combo is None:
+            self.house_target_combo = combo
+        if combo not in self.house_target_combos:
+            self.house_target_combos.append(combo)
+        if self.llm_route_preview_text is None:
+            self.llm_route_preview_text = preview_text
+        if preview_text not in self.llm_route_preview_texts:
+            self.llm_route_preview_texts.append(preview_text)
+        try:
+            combo["values"] = list(self.house_choice_map.keys())
+        except tk.TclError:
+            pass
+
+    def _unregister_llm_route_widgets(self, combo: Optional[ttk.Combobox], preview_text: Optional[tk.Text]) -> None:
+        if combo is not None and combo in self.house_target_combos:
+            self.house_target_combos.remove(combo)
+        if preview_text is not None and preview_text in self.llm_route_preview_texts:
+            self.llm_route_preview_texts.remove(preview_text)
+        if self.house_target_combo is combo:
+            self.house_target_combo = self.house_target_combos[0] if self.house_target_combos else None
+        if self.llm_route_preview_text is preview_text:
+            self.llm_route_preview_text = self.llm_route_preview_texts[0] if self.llm_route_preview_texts else None
+
+    def _build_llm_route_section(self, parent: tk.Misc, *, include_window_button: bool) -> tk.LabelFrame:
+        route = tk.LabelFrame(parent, text="LLM House Entrance Route")
         for col in (1, 3, 5):
             route.grid_columnconfigure(col, weight=1)
         tk.Label(route, text="Target House").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        self.house_target_combo = ttk.Combobox(
+        combo = ttk.Combobox(
             route,
             textvariable=self.llm_route_target_var,
-            values=(),
+            values=list(self.house_choice_map.keys()),
             state="readonly",
             width=20,
         )
-        self.house_target_combo.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
+        combo.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
         tk.Label(route, text="Task").grid(row=0, column=2, sticky="w", padx=6, pady=6)
         tk.Entry(route, textvariable=self.llm_task_text_var).grid(row=0, column=3, columnspan=3, sticky="ew", padx=6, pady=6)
 
@@ -528,8 +581,19 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Label(route, text="Step cm").grid(row=2, column=4, sticky="w", padx=6, pady=6)
         tk.Entry(route, textvariable=self.route_step_cm_var, width=8).grid(row=2, column=5, sticky="w", padx=6, pady=6)
 
+        scan = tk.Frame(route)
+        scan.grid(row=3, column=0, columnspan=6, sticky="ew", padx=0, pady=(0, 2))
+        tk.Label(scan, text="Standoff cm").pack(side="left", padx=(6, 2), pady=4)
+        tk.Entry(scan, textvariable=self.llm_route_standoff_cm_var, width=8).pack(side="left", padx=(0, 8), pady=4)
+        tk.Label(scan, text="Scan spacing cm").pack(side="left", padx=(6, 2), pady=4)
+        tk.Entry(scan, textvariable=self.llm_route_scan_spacing_cm_var, width=8).pack(side="left", padx=(0, 8), pady=4)
+        tk.Label(scan, text="Capture frames").pack(side="left", padx=(6, 2), pady=4)
+        tk.Entry(scan, textvariable=self.llm_route_capture_count_var, width=6).pack(side="left", padx=(0, 8), pady=4)
+        if include_window_button:
+            tk.Button(scan, text="Open LLM Route Window", command=self.open_llm_route_window).pack(side="left", padx=(18, 6), pady=4)
+
         actions = tk.Frame(route)
-        actions.grid(row=3, column=0, columnspan=6, sticky="ew", padx=0, pady=(0, 4))
+        actions.grid(row=4, column=0, columnspan=6, sticky="ew", padx=0, pady=(0, 4))
         tk.Button(actions, text="Analyze Task", command=self.on_llm_task_analyze).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Plan Route", command=self.on_llm_route_plan).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Fallback Route", command=self.on_fallback_route_plan).pack(side="left", padx=6, pady=4)
@@ -539,26 +603,43 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Button(actions, text="Clear Route", command=self.on_clear_route_plan).pack(side="left", padx=6, pady=4)
         tk.Label(actions, text="Delay ms").pack(side="left", padx=(18, 2), pady=4)
         tk.Entry(actions, textvariable=self.route_delay_ms_var, width=7).pack(side="left", padx=(0, 6), pady=4)
-        tk.Label(route, textvariable=self.llm_route_status_var, anchor="w").grid(row=4, column=0, columnspan=6, sticky="ew", padx=6, pady=(0, 4))
-        self.llm_route_preview_text = tk.Text(route, height=5, wrap="none", font=("Consolas", 9))
-        self.llm_route_preview_text.grid(row=5, column=0, columnspan=6, sticky="ew", padx=6, pady=(0, 6))
-        self.llm_route_preview_text.configure(state="disabled")
+        tk.Label(route, textvariable=self.llm_route_status_var, anchor="w").grid(row=5, column=0, columnspan=6, sticky="ew", padx=6, pady=(0, 4))
+        preview_text = tk.Text(route, height=8, wrap="none", font=("Consolas", 9))
+        preview_text.grid(row=6, column=0, columnspan=6, sticky="ew", padx=6, pady=(0, 6))
+        preview_text.configure(state="disabled")
+        self._register_llm_route_widgets(combo, preview_text)
+        setattr(route, "_llm_route_combo", combo)
+        setattr(route, "_llm_route_preview_text", preview_text)
+        return route
 
-        orbit = tk.LabelFrame(outer, text="Orbit Plan")
-        orbit.grid(row=9, column=0, sticky="ew", padx=8, pady=(4, 8))
-        for label, var, width in (
-            ("Center X", self.orbit_center_x_var, 10),
-            ("Center Y", self.orbit_center_y_var, 10),
-            ("Radius", self.orbit_radius_var, 8),
-            ("Altitude", self.orbit_altitude_var, 8),
-            ("Steps", self.orbit_steps_var, 6),
-            ("Start Angle", self.orbit_start_angle_var, 8),
-        ):
-            tk.Label(orbit, text=label).pack(side="left", padx=(6, 2), pady=6)
-            tk.Entry(orbit, textvariable=var, width=width).pack(side="left", padx=(0, 6), pady=6)
-        tk.Checkbutton(orbit, text="Clockwise", variable=self.orbit_clockwise_var).pack(side="left", padx=6)
-        tk.Button(orbit, text="Run Orbit", command=self.on_run_orbit).pack(side="left", padx=6)
-        tk.Button(orbit, text="Run Scripted Smoke", command=self.on_run_scripted).pack(side="left", padx=6)
+    def open_llm_route_window(self) -> None:
+        if self.llm_route_window is not None and self.llm_route_window.winfo_exists():
+            self.llm_route_window.lift()
+            self.llm_route_window.focus_force()
+            return
+        window = tk.Toplevel(self.root)
+        window.title("LLM House Entrance Route")
+        window.geometry("1280x420")
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(0, weight=1)
+        route = self._build_llm_route_section(window, include_window_button=False)
+        route.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self.llm_route_window = window
+
+        def close_window() -> None:
+            self._unregister_llm_route_widgets(
+                getattr(route, "_llm_route_combo", None),
+                getattr(route, "_llm_route_preview_text", None),
+            )
+            self.llm_route_window = None
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+
+        window.protocol("WM_DELETE_WINDOW", close_window)
+        self.refresh_house_target_choices()
+        self.refresh_route_preview()
 
     def _bind_hotkeys(self) -> None:
         self.root.bind_all("<KeyPress>", self._on_keyboard_press, add="+")
@@ -825,6 +906,12 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
 
     def on_close(self) -> None:
         self.stop_keyboard_control(send_hold=False)
+        if self.llm_route_window is not None:
+            try:
+                self.llm_route_window.destroy()
+            except Exception:
+                pass
+            self.llm_route_window = None
         self.stop_stream_player()
         self.stop_stream_analysis()
         self.close_lidar_analysis_window()

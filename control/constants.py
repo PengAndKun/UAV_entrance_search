@@ -17,6 +17,29 @@ LLM_ROUTE_MIN_PERIMETER_STANDOFF_CM = 120.0
 LLM_ROUTE_FACE_STANDOFF_BUFFER_CM = 10.0
 LLM_ROUTE_ALIGN_TOLERANCE_DEG = 12.0
 LLM_ROUTE_DEFAULT_REPEAT_CAP = 6
+LLM_ROUTE_SCAN_STANDOFF_CM = 850.0
+LLM_ROUTE_SCAN_SPACING_CM = 150.0
+LLM_ROUTE_CAPTURE_COUNT = 1
+LLM_ROUTE_SCAN_POINTS_SCHEMA: Dict[str, Any] = {
+    "scan_points": [
+        {
+            "scan_id": "001_south_000",
+            "house_id": "001",
+            "facade": "south",
+            "face_role": "front",
+            "x": 0.0,
+            "y": 0.0,
+            "z": 600.0,
+            "yaw_deg": 90.0,
+            "standoff_cm": LLM_ROUTE_SCAN_STANDOFF_CM,
+            "scan_spacing_cm": LLM_ROUTE_SCAN_SPACING_CM,
+            "expected_lidar_range_cm": [20.0, 1200.0],
+            "capture_trigger": "arrive_align_hover_capture",
+            "view_type": "face_view",
+            "status": "planned",
+        }
+    ]
+}
 LLM_ROUTE_OUTPUT_SCHEMA: Dict[str, Any] = {
     "target_house_id": "002",
     "route_name": "safe_route_to_house_002",
@@ -26,6 +49,7 @@ LLM_ROUTE_OUTPUT_SCHEMA: Dict[str, Any] = {
         {"label": "target_standoff", "x": 900.0, "y": 300.0, "status": "planned"},
     ],
     "perimeter_search_order": ["front", "side", "back", "other_side"],
+    "preferred_facade_order": ["south", "east", "north", "west"],
     "avoid_house_ids": ["001", "003"],
     "replan_triggers": ["depth_blocked", "off_route", "target_switch"],
     "reason": "Short map-level route planning rationale.",

@@ -116,8 +116,22 @@ class MapControlMixin:
         self.house_choice_map = choice_map
         self.house_display_by_id = display_by_id
         values = list(choice_map.keys())
-        if self.house_target_combo is not None:
-            self.house_target_combo["values"] = values
+        live_combos: List[ttk.Combobox] = []
+        for combo in list(getattr(self, "house_target_combos", [])):
+            try:
+                if combo.winfo_exists():
+                    combo["values"] = values
+                    live_combos.append(combo)
+            except tk.TclError:
+                pass
+        self.house_target_combos = live_combos
+        if self.house_target_combo is not None and self.house_target_combo not in live_combos:
+            self.house_target_combo = live_combos[0] if live_combos else None
+        if self.house_target_combo is not None and not live_combos:
+            try:
+                self.house_target_combo["values"] = values
+            except tk.TclError:
+                self.house_target_combo = None
         current_display = self.llm_route_target_var.get().strip()
         current_id = choice_map.get(current_display, "")
         preferred_id = (
