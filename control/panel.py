@@ -71,6 +71,23 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.llm_route_standoff_cm_var = tk.StringVar(value=str(LLM_ROUTE_SCAN_STANDOFF_CM))
         self.llm_route_scan_spacing_cm_var = tk.StringVar(value=str(LLM_ROUTE_SCAN_SPACING_CM))
         self.llm_route_capture_count_var = tk.StringVar(value=str(LLM_ROUTE_CAPTURE_COUNT))
+        self.route_capture_interval_s_var = tk.StringVar(
+            value=str(getattr(args, "route_capture_interval_s", LLM_ROUTE_PATH_CAPTURE_INTERVAL_S))
+        )
+        self.llm_route2_status_var = tk.StringVar(value="LLM Route V2: idle")
+        self.llm_route2_map_status_var = tk.StringVar(value="Route V2 Map: idle")
+        self.llm_route2_facade_var = tk.StringVar(value="Facade: n/a")
+        self.llm_route2_selected_facade_var = tk.StringVar(value="auto")
+        self.llm_route2_facade_status_var = tk.StringVar(value="Processed: no facade")
+        self.llm_route2_rgb_status_var = tk.StringVar(value="Facade RGB: none")
+        self.llm_route2_progress_text_var = tk.StringVar(value="Explore: 0%")
+        self.llm_route2_progress_var = tk.DoubleVar(value=0.0)
+        self.llm_route2_auto_refresh_var = tk.BooleanVar(value=False)
+        self.llm_route2_floor_height_m_var = tk.StringVar(value=str(LLM_ROUTE2_DEFAULT_FLOOR_HEIGHT_M))
+        self.llm_route2_default_floors_var = tk.StringVar(value=str(LLM_ROUTE2_DEFAULT_FLOORS))
+        self.llm_route2_low_z_cm_var = tk.StringVar(value=str(LLM_ROUTE2_LOW_Z_CM))
+        self.llm_route2_z_step_cm_var = tk.StringVar(value=str(LLM_ROUTE2_Z_STEP_CM))
+        self.llm_route2_density_mode_var = tk.StringVar(value="auto")
 
         self.env_platform_var = tk.StringVar(value=args.env_platform)
         self.env_root_var = tk.StringVar(value=args.env_root or "UnrealEnv")
@@ -222,7 +239,22 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.llm_route_validation_report: Dict[str, Any] = {}
         self.house_search_dir: Optional[Path] = None
         self.llm_route_window: Optional[tk.Toplevel] = None
+        self.llm_route_window_canvas: Optional[tk.Canvas] = None
+        self.llm_route_window_content: Optional[tk.Frame] = None
+        self.llm_route_window_content_window: Optional[int] = None
         self.llm_route_map_widget: Optional[OverheadMapWidget] = None
+        self.llm_route2_window: Optional[tk.Toplevel] = None
+        self.llm_route2_window_canvas: Optional[tk.Canvas] = None
+        self.llm_route2_window_content: Optional[tk.Frame] = None
+        self.llm_route2_window_content_window: Optional[int] = None
+        self.llm_route2_map_widget: Optional[OverheadMapWidget] = None
+        self.llm_route2_preview_text: Optional[tk.Text] = None
+        self.llm_route2_analysis_text: Optional[tk.Text] = None
+        self.llm_route2_rgb_label: Optional[tk.Widget] = None
+        self.llm_route2_rgb_photo: Optional[ImageTk.PhotoImage] = None
+        self.llm_route2_auto_refresh_job: Optional[str] = None
+        self.llm_route2_state: Dict[str, Any] = {}
+        self.llm_route2_completed_facades: set[str] = set()
         self.llm_route_preview_text: Optional[tk.Text] = None
         self.llm_route_preview_texts: List[tk.Text] = []
         self.main_canvas: Optional[tk.Canvas] = None
@@ -265,6 +297,94 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
             return
         direction = -1 if int(getattr(event, "num", 0)) == 4 else 1
         self.main_canvas.yview_scroll(direction, "units")
+
+    def _on_llm_route_window_content_configure(self, _event: tk.Event) -> None:
+        if self.llm_route_window_canvas is None:
+            return
+        self.llm_route_window_canvas.configure(scrollregion=self.llm_route_window_canvas.bbox("all"))
+
+    def _on_llm_route_window_canvas_configure(self, event: tk.Event) -> None:
+        if (
+            self.llm_route_window_canvas is None
+            or self.llm_route_window_content is None
+            or self.llm_route_window_content_window is None
+        ):
+            return
+        requested_width = max(self.llm_route_window_content.winfo_reqwidth(), int(event.width))
+        self.llm_route_window_canvas.itemconfigure(self.llm_route_window_content_window, width=requested_width)
+        self.llm_route_window_canvas.configure(scrollregion=self.llm_route_window_canvas.bbox("all"))
+
+    def _on_llm_route_window_mousewheel(self, event: tk.Event):
+        if self.llm_route_window_canvas is None:
+            return "break"
+        delta = -1 if int(getattr(event, "delta", 0)) > 0 else 1
+        if int(getattr(event, "state", 0)) & 0x0001:
+            self.llm_route_window_canvas.xview_scroll(delta, "units")
+        else:
+            self.llm_route_window_canvas.yview_scroll(delta, "units")
+        return "break"
+
+    def _on_llm_route_window_mousewheel_linux(self, event: tk.Event):
+        if self.llm_route_window_canvas is None:
+            return "break"
+        direction = -1 if int(getattr(event, "num", 0)) == 4 else 1
+        self.llm_route_window_canvas.yview_scroll(direction, "units")
+        return "break"
+
+    def _bind_llm_route_window_mousewheel_tree(self, widget: tk.Widget) -> None:
+        try:
+            widget.bind("<MouseWheel>", self._on_llm_route_window_mousewheel, add="+")
+            widget.bind("<Button-4>", self._on_llm_route_window_mousewheel_linux, add="+")
+            widget.bind("<Button-5>", self._on_llm_route_window_mousewheel_linux, add="+")
+            children = widget.winfo_children()
+        except tk.TclError:
+            return
+        for child in children:
+            self._bind_llm_route_window_mousewheel_tree(child)
+
+    def _on_llm_route2_window_content_configure(self, _event: tk.Event) -> None:
+        if self.llm_route2_window_canvas is None:
+            return
+        self.llm_route2_window_canvas.configure(scrollregion=self.llm_route2_window_canvas.bbox("all"))
+
+    def _on_llm_route2_window_canvas_configure(self, event: tk.Event) -> None:
+        if (
+            self.llm_route2_window_canvas is None
+            or self.llm_route2_window_content is None
+            or self.llm_route2_window_content_window is None
+        ):
+            return
+        requested_width = max(self.llm_route2_window_content.winfo_reqwidth(), int(event.width))
+        self.llm_route2_window_canvas.itemconfigure(self.llm_route2_window_content_window, width=requested_width)
+        self.llm_route2_window_canvas.configure(scrollregion=self.llm_route2_window_canvas.bbox("all"))
+
+    def _on_llm_route2_window_mousewheel(self, event: tk.Event):
+        if self.llm_route2_window_canvas is None:
+            return "break"
+        delta = -1 if int(getattr(event, "delta", 0)) > 0 else 1
+        if int(getattr(event, "state", 0)) & 0x0001:
+            self.llm_route2_window_canvas.xview_scroll(delta, "units")
+        else:
+            self.llm_route2_window_canvas.yview_scroll(delta, "units")
+        return "break"
+
+    def _on_llm_route2_window_mousewheel_linux(self, event: tk.Event):
+        if self.llm_route2_window_canvas is None:
+            return "break"
+        direction = -1 if int(getattr(event, "num", 0)) == 4 else 1
+        self.llm_route2_window_canvas.yview_scroll(direction, "units")
+        return "break"
+
+    def _bind_llm_route2_window_mousewheel_tree(self, widget: tk.Widget) -> None:
+        try:
+            widget.bind("<MouseWheel>", self._on_llm_route2_window_mousewheel, add="+")
+            widget.bind("<Button-4>", self._on_llm_route2_window_mousewheel_linux, add="+")
+            widget.bind("<Button-5>", self._on_llm_route2_window_mousewheel_linux, add="+")
+            children = widget.winfo_children()
+        except tk.TclError:
+            return
+        for child in children:
+            self._bind_llm_route2_window_mousewheel_tree(child)
 
     def _on_pose_text_mousewheel(self, event: tk.Event):
         if not hasattr(self, "pose_text"):
@@ -478,10 +598,11 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         map_frame.grid_columnconfigure(11, weight=1)
         tk.Button(map_frame, text="Open Map", command=self.toggle_map_window).grid(row=0, column=0, padx=6, pady=6)
         tk.Button(map_frame, text="Refresh Map", command=lambda: self.refresh_map_once(force_reload=True)).grid(row=0, column=1, padx=6, pady=6)
-        tk.Checkbutton(map_frame, text="Show Houses", variable=self.show_houses_var, command=self.refresh_map_once).grid(row=0, column=2, padx=6, pady=6)
-        tk.Checkbutton(map_frame, text="Show Trajectory", variable=self.show_trajectory_var, command=self.refresh_map_once).grid(row=0, column=3, padx=6, pady=6)
-        tk.Checkbutton(map_frame, text="Show P Points", variable=self.show_calibration_points_var, command=self.refresh_map_once).grid(row=0, column=4, padx=6, pady=6)
-        tk.Label(map_frame, textvariable=self.map_status_var, anchor="w").grid(row=0, column=5, columnspan=7, sticky="ew", padx=6, pady=6)
+        tk.Button(map_frame, text="Setting Map", command=self.open_setting_map_window).grid(row=0, column=2, padx=6, pady=6)
+        tk.Checkbutton(map_frame, text="Show Houses", variable=self.show_houses_var, command=self.refresh_map_once).grid(row=0, column=3, padx=6, pady=6)
+        tk.Checkbutton(map_frame, text="Show Trajectory", variable=self.show_trajectory_var, command=self.refresh_map_once).grid(row=0, column=4, padx=6, pady=6)
+        tk.Checkbutton(map_frame, text="Show P Points", variable=self.show_calibration_points_var, command=self.refresh_map_once).grid(row=0, column=5, padx=6, pady=6)
+        tk.Label(map_frame, textvariable=self.map_status_var, anchor="w").grid(row=0, column=6, columnspan=6, sticky="ew", padx=6, pady=6)
         tk.Label(map_frame, textvariable=self.map_pose_var, anchor="w").grid(row=1, column=0, columnspan=12, sticky="ew", padx=6, pady=(0, 4))
         tk.Button(map_frame, text="Start P Calibration", command=self.on_start_map_touch_calibration).grid(row=2, column=0, padx=6, pady=6)
         tk.Button(map_frame, text="Stop/Clear", command=self.on_stop_map_touch_calibration).grid(row=2, column=1, padx=6, pady=6)
@@ -592,8 +713,11 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Entry(scan, textvariable=self.llm_route_scan_spacing_cm_var, width=8).pack(side="left", padx=(0, 8), pady=4)
         tk.Label(scan, text="Capture frames").pack(side="left", padx=(6, 2), pady=4)
         tk.Entry(scan, textvariable=self.llm_route_capture_count_var, width=6).pack(side="left", padx=(0, 8), pady=4)
+        tk.Label(scan, text="Path capture s").pack(side="left", padx=(6, 2), pady=4)
+        tk.Entry(scan, textvariable=self.route_capture_interval_s_var, width=6).pack(side="left", padx=(0, 8), pady=4)
         if include_window_button:
             tk.Button(scan, text="Open LLM Route Window", command=self.open_llm_route_window).pack(side="left", padx=(18, 6), pady=4)
+            tk.Button(scan, text="Open LLM Route Window 2", command=self.open_llm_route_window2).pack(side="left", padx=6, pady=4)
 
         actions = tk.Frame(route)
         actions.grid(row=4, column=0, columnspan=6, sticky="ew", padx=0, pady=(0, 4))
@@ -601,6 +725,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Button(actions, text="Plan Route", command=self.on_llm_route_plan).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Fallback Route", command=self.on_fallback_route_plan).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Direct Capture Test", command=self.on_direct_scan_capture_test).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Route Capture Lidar", command=self.on_route_lidar_capture).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Validate Data", command=self.on_validate_house_search_data).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Follow Next", command=self.on_follow_route_next).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Auto Follow", command=self.on_follow_route_auto).pack(side="left", padx=6, pady=4)
@@ -626,10 +751,29 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         window.title("LLM House Entrance Route")
         window.geometry("1280x920")
         window.grid_columnconfigure(0, weight=1)
-        window.grid_rowconfigure(1, weight=1)
-        route = self._build_llm_route_section(window, include_window_button=False)
+        window.grid_rowconfigure(0, weight=1)
+        window_canvas = tk.Canvas(window, highlightthickness=0)
+        v_scrollbar = tk.Scrollbar(window, orient="vertical", command=window_canvas.yview)
+        h_scrollbar = tk.Scrollbar(window, orient="horizontal", command=window_canvas.xview)
+        window_canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+        window_canvas.grid(row=0, column=0, sticky="nsew")
+        v_scrollbar.grid(row=0, column=1, sticky="ns")
+        h_scrollbar.grid(row=1, column=0, sticky="ew")
+        content = tk.Frame(window_canvas)
+        content.grid_columnconfigure(0, weight=1)
+        content_window = window_canvas.create_window((0, 0), window=content, anchor="nw")
+        self.llm_route_window_canvas = window_canvas
+        self.llm_route_window_content = content
+        self.llm_route_window_content_window = content_window
+        content.bind("<Configure>", self._on_llm_route_window_content_configure)
+        window_canvas.bind("<Configure>", self._on_llm_route_window_canvas_configure)
+        window.bind("<MouseWheel>", self._on_llm_route_window_mousewheel, add="+")
+        window.bind("<Button-4>", self._on_llm_route_window_mousewheel_linux, add="+")
+        window.bind("<Button-5>", self._on_llm_route_window_mousewheel_linux, add="+")
+
+        route = self._build_llm_route_section(content, include_window_button=False)
         route.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        map_frame = tk.LabelFrame(window, text="Map Scan Points")
+        map_frame = tk.LabelFrame(content, text="Map Scan Points")
         map_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 8))
         map_frame.grid_columnconfigure(0, weight=1)
         map_frame.grid_rowconfigure(1, weight=1)
@@ -641,6 +785,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.llm_route_map_widget = OverheadMapWidget(map_frame, world_bounds=self.map_world_bounds, canvas_w=1200, canvas_h=480)
         self.llm_route_map_widget.canvas.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
         self.llm_route_window = window
+        self._bind_llm_route_window_mousewheel_tree(content)
 
         def close_window() -> None:
             self._unregister_llm_route_widgets(
@@ -648,6 +793,9 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
                 getattr(route, "_llm_route_preview_text", None),
             )
             self.llm_route_window = None
+            self.llm_route_window_canvas = None
+            self.llm_route_window_content = None
+            self.llm_route_window_content_window = None
             self.llm_route_map_widget = None
             try:
                 window.destroy()
@@ -658,6 +806,232 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.refresh_house_target_choices()
         self.refresh_route_preview()
         self.refresh_llm_route_map()
+
+    def _build_llm_route2_section(self, parent: tk.Misc) -> tk.LabelFrame:
+        route = tk.LabelFrame(parent, text="LLM House Entrance Route V2")
+        for col in (1, 3, 5):
+            route.grid_columnconfigure(col, weight=1)
+        route.grid_rowconfigure(6, weight=1)
+        tk.Label(route, text="Target House").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        combo = ttk.Combobox(
+            route,
+            textvariable=self.llm_route_target_var,
+            values=list(self.house_choice_map.keys()),
+            state="readonly",
+            width=22,
+        )
+        combo.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
+        if combo not in self.house_target_combos:
+            self.house_target_combos.append(combo)
+        if self.house_target_combo is None:
+            self.house_target_combo = combo
+        tk.Label(route, text="Task").grid(row=0, column=2, sticky="w", padx=6, pady=6)
+        tk.Entry(route, textvariable=self.llm_task_text_var).grid(row=0, column=3, columnspan=3, sticky="ew", padx=6, pady=6)
+
+        tk.Label(route, text="API").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        api_combo = ttk.Combobox(
+            route,
+            textvariable=self.llm_api_style_var,
+            values=LLM_API_STYLE_OPTIONS,
+            state="readonly",
+            width=17,
+        )
+        api_combo.grid(row=1, column=1, sticky="ew", padx=6, pady=6)
+        api_combo.bind("<<ComboboxSelected>>", lambda _event: self.apply_llm_api_defaults(force=False))
+        tk.Label(route, text="Base URL").grid(row=1, column=2, sticky="w", padx=6, pady=6)
+        tk.Entry(route, textvariable=self.llm_base_url_var).grid(row=1, column=3, sticky="ew", padx=6, pady=6)
+        tk.Label(route, text="Model").grid(row=1, column=4, sticky="w", padx=6, pady=6)
+        tk.Entry(route, textvariable=self.llm_model_var, width=18).grid(row=1, column=5, sticky="ew", padx=6, pady=6)
+
+        tk.Label(route, text="API Key").grid(row=2, column=0, sticky="w", padx=6, pady=6)
+        tk.Entry(route, textvariable=self.llm_api_key_var, show="*").grid(row=2, column=1, sticky="ew", padx=6, pady=6)
+        tk.Label(route, text="Timeout s").grid(row=2, column=2, sticky="w", padx=6, pady=6)
+        tk.Entry(route, textvariable=self.llm_timeout_s_var, width=8).grid(row=2, column=3, sticky="w", padx=6, pady=6)
+        facade_controls = tk.Frame(route)
+        facade_controls.grid(row=2, column=4, columnspan=2, sticky="ew", padx=6, pady=4)
+        tk.Label(facade_controls, textvariable=self.llm_route2_facade_var, anchor="w").pack(side="left", padx=(0, 8))
+        tk.Label(facade_controls, text="Select").pack(side="left", padx=(0, 2))
+        ttk.Combobox(
+            facade_controls,
+            textvariable=self.llm_route2_selected_facade_var,
+            values=LLM_ROUTE2_FACADE_OPTIONS,
+            state="readonly",
+            width=7,
+        ).pack(side="left", padx=(0, 6))
+        tk.Button(
+            facade_controls,
+            text="Plan Selected Facade",
+            command=self.on_route2_plan_selected_facade,
+        ).pack(side="left", padx=(0, 8))
+        tk.Label(facade_controls, textvariable=self.llm_route2_facade_status_var, anchor="w").pack(side="left")
+
+        config = tk.Frame(route)
+        config.grid(row=3, column=0, columnspan=6, sticky="ew", padx=0, pady=(0, 2))
+        tk.Label(config, text="Floor height m").pack(side="left", padx=(6, 2), pady=4)
+        tk.Entry(config, textvariable=self.llm_route2_floor_height_m_var, width=6).pack(side="left", padx=(0, 8), pady=4)
+        tk.Label(config, text="Default floors").pack(side="left", padx=(6, 2), pady=4)
+        tk.Entry(config, textvariable=self.llm_route2_default_floors_var, width=5).pack(side="left", padx=(0, 8), pady=4)
+        tk.Label(config, text="Low Z cm").pack(side="left", padx=(6, 2), pady=4)
+        tk.Entry(config, textvariable=self.llm_route2_low_z_cm_var, width=7).pack(side="left", padx=(0, 8), pady=4)
+        tk.Label(config, text="Z step cm").pack(side="left", padx=(6, 2), pady=4)
+        tk.Entry(config, textvariable=self.llm_route2_z_step_cm_var, width=7).pack(side="left", padx=(0, 8), pady=4)
+        tk.Label(config, text="Density mode").pack(side="left", padx=(6, 2), pady=4)
+        ttk.Combobox(
+            config,
+            textvariable=self.llm_route2_density_mode_var,
+            values=("auto", "high", "medium", "low"),
+            state="readonly",
+            width=8,
+        ).pack(side="left", padx=(0, 8), pady=4)
+
+        actions = tk.Frame(route)
+        actions.grid(row=4, column=0, columnspan=6, sticky="ew", padx=0, pady=(0, 4))
+        tk.Button(actions, text="Plan 4 Facades", command=self.on_route2_plan_nearest_facade).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Move To Obs Point", command=self.on_route2_move_to_observation).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Capture Facade RGB", command=self.on_route2_capture_facade_rgb).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Analyze Facade VLM", command=self.on_route2_analyze_facade_vlm).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Plan Facade Scan", command=self.on_route2_plan_facade_scan).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Capture Facade Scan", command=self.on_route2_capture_facade_scan).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Validate Facade", command=self.on_route2_validate_facade).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Stop", command=self.on_route2_stop).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Clear", command=self.on_route2_clear).pack(side="left", padx=6, pady=4)
+        tk.Label(route, textvariable=self.llm_route2_status_var, anchor="w").grid(row=5, column=0, columnspan=6, sticky="ew", padx=6, pady=(0, 4))
+        preview_frame = tk.Frame(route)
+        preview_frame.grid(row=6, column=0, columnspan=6, sticky="nsew", padx=6, pady=(0, 6))
+        preview_frame.grid_columnconfigure(0, weight=1)
+        preview_frame.grid_rowconfigure(0, weight=1)
+        preview_text = tk.Text(preview_frame, height=6, width=96, wrap="none", font=("Consolas", 9))
+        preview_y = tk.Scrollbar(preview_frame, orient="vertical", command=preview_text.yview)
+        preview_x = tk.Scrollbar(preview_frame, orient="horizontal", command=preview_text.xview)
+        preview_text.configure(yscrollcommand=preview_y.set, xscrollcommand=preview_x.set)
+        preview_text.grid(row=0, column=0, sticky="nsew")
+        preview_y.grid(row=0, column=1, sticky="ns")
+        preview_x.grid(row=1, column=0, sticky="ew")
+        preview_text.configure(state="disabled")
+        self.llm_route2_preview_text = preview_text
+        setattr(route, "_llm_route2_combo", combo)
+        return route
+
+    def open_llm_route_window2(self) -> None:
+        if self.llm_route2_window is not None and self.llm_route2_window.winfo_exists():
+            self.llm_route2_window.lift()
+            self.llm_route2_window.focus_force()
+            return
+        window = tk.Toplevel(self.root)
+        window.title("LLM House Entrance Route V2")
+        window.geometry("760x560")
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(0, weight=1)
+        window_canvas = tk.Canvas(window, highlightthickness=0)
+        v_scrollbar = tk.Scrollbar(window, orient="vertical", command=window_canvas.yview)
+        h_scrollbar = tk.Scrollbar(window, orient="horizontal", command=window_canvas.xview)
+        window_canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+        window_canvas.grid(row=0, column=0, sticky="nsew")
+        v_scrollbar.grid(row=0, column=1, sticky="ns")
+        h_scrollbar.grid(row=1, column=0, sticky="ew")
+        content = tk.Frame(window_canvas)
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(2, weight=1)
+        content_window = window_canvas.create_window((0, 0), window=content, anchor="nw")
+        self.llm_route2_window_canvas = window_canvas
+        self.llm_route2_window_content = content
+        self.llm_route2_window_content_window = content_window
+        content.bind("<Configure>", self._on_llm_route2_window_content_configure)
+        window_canvas.bind("<Configure>", self._on_llm_route2_window_canvas_configure)
+        window.bind("<MouseWheel>", self._on_llm_route2_window_mousewheel, add="+")
+        window.bind("<Button-4>", self._on_llm_route2_window_mousewheel_linux, add="+")
+        window.bind("<Button-5>", self._on_llm_route2_window_mousewheel_linux, add="+")
+
+        route = self._build_llm_route2_section(content)
+        route.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+
+        facade_panel = tk.Frame(content)
+        facade_panel.grid(row=1, column=0, sticky="ew", padx=8, pady=(4, 4))
+        facade_panel.grid_columnconfigure(0, weight=0)
+        facade_panel.grid_columnconfigure(1, weight=1)
+
+        rgb_frame = tk.LabelFrame(facade_panel, text="Facade RGB")
+        rgb_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=0)
+        rgb_frame.grid_columnconfigure(0, weight=1)
+        rgb_frame.grid_rowconfigure(1, weight=1)
+        tk.Label(rgb_frame, textvariable=self.llm_route2_rgb_status_var, anchor="w").grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 2))
+        self.llm_route2_rgb_label = tk.Canvas(
+            rgb_frame,
+            width=330,
+            height=230,
+            bg="#202020",
+            highlightthickness=0,
+        )
+        self.llm_route2_rgb_label.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        self.llm_route2_rgb_label.bind("<Configure>", lambda _event: self.refresh_route2_rgb_display(), add="+")
+
+        analysis_frame = tk.LabelFrame(facade_panel, text="Facade Analysis")
+        analysis_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=0)
+        analysis_frame.grid_columnconfigure(0, weight=1)
+        analysis_frame.grid_rowconfigure(0, weight=1)
+        analysis_text = tk.Text(analysis_frame, height=11, width=58, wrap="none", font=("Consolas", 9))
+        analysis_y = tk.Scrollbar(analysis_frame, orient="vertical", command=analysis_text.yview)
+        analysis_x = tk.Scrollbar(analysis_frame, orient="horizontal", command=analysis_text.xview)
+        analysis_text.configure(yscrollcommand=analysis_y.set, xscrollcommand=analysis_x.set)
+        analysis_text.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=(6, 0))
+        analysis_y.grid(row=0, column=1, sticky="ns", pady=(6, 0))
+        analysis_x.grid(row=1, column=0, sticky="ew", padx=(6, 0), pady=(0, 6))
+        analysis_text.configure(state="disabled")
+        self.llm_route2_analysis_text = analysis_text
+
+        map_frame = tk.LabelFrame(content, text="Map Facade V2 Points")
+        map_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(4, 8))
+        map_frame.grid_columnconfigure(0, weight=1)
+        map_frame.grid_rowconfigure(1, weight=1)
+        map_toolbar = tk.Frame(map_frame)
+        map_toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
+        tk.Label(map_toolbar, textvariable=self.llm_route2_map_status_var, anchor="w").pack(side="left", fill="x", expand=True)
+        tk.Label(map_toolbar, textvariable=self.llm_route2_progress_text_var, anchor="e").pack(side="left", padx=(8, 2))
+        ttk.Progressbar(
+            map_toolbar,
+            variable=self.llm_route2_progress_var,
+            maximum=100.0,
+            length=150,
+            mode="determinate",
+        ).pack(side="left", padx=(0, 8))
+        tk.Button(map_toolbar, text="Refresh Map", command=self.refresh_llm_route2_map).pack(side="right", padx=6)
+        tk.Checkbutton(
+            map_toolbar,
+            text="Auto Refresh",
+            variable=self.llm_route2_auto_refresh_var,
+            command=self.on_route2_auto_refresh_toggle,
+        ).pack(side="right", padx=6)
+        self.load_map_resources(force=True)
+        self.llm_route2_map_widget = OverheadMapWidget(map_frame, world_bounds=self.map_world_bounds, canvas_w=610, canvas_h=260)
+        self.llm_route2_map_widget.canvas.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+        self.llm_route2_window = window
+        self._bind_llm_route2_window_mousewheel_tree(content)
+
+        def close_window() -> None:
+            combo = getattr(route, "_llm_route2_combo", None)
+            if combo is not None and combo in self.house_target_combos:
+                self.house_target_combos.remove(combo)
+            if self.house_target_combo is combo:
+                self.house_target_combo = self.house_target_combos[0] if self.house_target_combos else None
+            self.llm_route2_window = None
+            self.llm_route2_window_canvas = None
+            self.llm_route2_window_content = None
+            self.llm_route2_window_content_window = None
+            self.llm_route2_map_widget = None
+            self.llm_route2_preview_text = None
+            self.llm_route2_analysis_text = None
+            self.llm_route2_rgb_label = None
+            self.llm_route2_rgb_photo = None
+            self.cancel_route2_auto_refresh()
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+
+        window.protocol("WM_DELETE_WINDOW", close_window)
+        self.refresh_house_target_choices()
+        self.refresh_route2_preview()
+        self.refresh_llm_route2_map()
 
     def _bind_hotkeys(self) -> None:
         self.root.bind_all("<KeyPress>", self._on_keyboard_press, add="+")
@@ -930,7 +1304,25 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
             except Exception:
                 pass
             self.llm_route_window = None
+            self.llm_route_window_canvas = None
+            self.llm_route_window_content = None
+            self.llm_route_window_content_window = None
             self.llm_route_map_widget = None
+        if self.llm_route2_window is not None:
+            try:
+                self.llm_route2_window.destroy()
+            except Exception:
+                pass
+            self.llm_route2_window = None
+            self.llm_route2_window_canvas = None
+            self.llm_route2_window_content = None
+            self.llm_route2_window_content_window = None
+            self.llm_route2_map_widget = None
+            self.llm_route2_preview_text = None
+            self.llm_route2_analysis_text = None
+            self.llm_route2_rgb_label = None
+            self.llm_route2_rgb_photo = None
+            self.cancel_route2_auto_refresh()
         self.stop_stream_player()
         self.stop_stream_analysis()
         self.close_lidar_analysis_window()

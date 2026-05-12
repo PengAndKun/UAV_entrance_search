@@ -56,11 +56,8 @@ class RouteControlMixin:
             return 60.0
 
     def image_to_world_point(self, image_x: float, image_y: float) -> Optional[Tuple[float, float]]:
-        affine = self.map_calibration.get("affine_world_to_image")
-        if not isinstance(affine, list) or len(affine) != 2:
-            return None
         try:
-            return image_to_world_with_affine(float(image_x), float(image_y), affine)
+            return image_to_world_with_calibration(float(image_x), float(image_y), self.map_calibration)
         except Exception:
             return None
 
@@ -1615,6 +1612,13 @@ class RouteControlMixin:
         except Exception:
             return int(LLM_ROUTE_CAPTURE_COUNT)
 
+    def route_capture_interval_s(self) -> float:
+        try:
+            value = float(self.route_capture_interval_s_var.get().strip())
+        except Exception:
+            value = float(LLM_ROUTE_PATH_CAPTURE_INTERVAL_S)
+        return max(0.05, min(10.0, float(value)))
+
     def target_house_capture_altitude_cm(self, house_id: str) -> float:
         hid = str(house_id or "").strip()
         if not self.map_config:
@@ -1721,6 +1725,89 @@ class RouteControlMixin:
             }
         return corridor_info
 
+    def scan_safe_intervals_by_facade(
+        self,
+        target_house_id: str,
+        bbox: Dict[str, Any],
+        corridor_info: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        try:
+            min_x = float(bbox["min_x"])
+            max_x = float(bbox["max_x"])
+            min_y = float(bbox["min_y"])
+            max_y = float(bbox["max_y"])
+        except Exception:
+            return {}
+        spacing = self.route_scan_spacing_cm()
+        min_segment_len = max(60.0, min(180.0, float(spacing) * 0.5))
+        obstacles = self.route_forbidden_house_bboxes(
+            target_house_id=target_house_id,
+            clearance_cm=float(LLM_ROUTE_HOUSE_CLEARANCE_CM),
+        )
+
+        def standoff_for_facade(facade: str) -> float:
+            info = corridor_info.get(facade, {}) if isinstance(corridor_info.get(facade), dict) else {}
+            try:
+                return max(20.0, float(info.get("standoff_cm", self.route_scan_standoff_cm())))
+            except Exception:
+                return self.route_scan_standoff_cm()
+
+        def subtract_interval(intervals: List[Tuple[float, float]], cut_min: float, cut_max: float) -> List[Tuple[float, float]]:
+            lo = float(min(cut_min, cut_max))
+            hi = float(max(cut_min, cut_max))
+            remaining: List[Tuple[float, float]] = []
+            for start, end in intervals:
+                start = float(start)
+                end = float(end)
+                if hi <= start or lo >= end:
+                    remaining.append((start, end))
+                    continue
+                if lo > start:
+                    remaining.append((start, max(start, lo)))
+                if hi < end:
+                    remaining.append((min(end, hi), end))
+            return [(start, end) for start, end in remaining if end - start >= min_segment_len]
+
+        safe: Dict[str, List[Dict[str, Any]]] = {}
+        for facade in ("south", "east", "north", "west"):
+            if facade in {"south", "north"}:
+                intervals: List[Tuple[float, float]] = [(min_x, max_x)]
+                line_value = min_y - standoff_for_facade(facade) if facade == "south" else max_y + standoff_for_facade(facade)
+                for obstacle in obstacles:
+                    try:
+                        obs_min_y = float(obstacle["min_y"])
+                        obs_max_y = float(obstacle["max_y"])
+                        obs_min_x = float(obstacle["min_x"])
+                        obs_max_x = float(obstacle["max_x"])
+                    except Exception:
+                        continue
+                    if obs_min_y <= line_value <= obs_max_y:
+                        intervals = subtract_interval(intervals, obs_min_x, obs_max_x)
+            else:
+                intervals = [(min_y, max_y)]
+                line_value = max_x + standoff_for_facade(facade) if facade == "east" else min_x - standoff_for_facade(facade)
+                for obstacle in obstacles:
+                    try:
+                        obs_min_x = float(obstacle["min_x"])
+                        obs_max_x = float(obstacle["max_x"])
+                        obs_min_y = float(obstacle["min_y"])
+                        obs_max_y = float(obstacle["max_y"])
+                    except Exception:
+                        continue
+                    if obs_min_x <= line_value <= obs_max_x:
+                        intervals = subtract_interval(intervals, obs_min_y, obs_max_y)
+            safe[facade] = [
+                {
+                    "index": idx,
+                    "min": round(float(start), 2),
+                    "max": round(float(end), 2),
+                    "source": "bbox_clearance_clipped",
+                    "min_segment_len_cm": round(float(min_segment_len), 2),
+                }
+                for idx, (start, end) in enumerate(intervals)
+            ]
+        return safe
+
     def build_rule_scan_points_for_route_plan(self, route_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
         hid = str(route_plan.get("target_house_id", "") or self.selected_route_target_house_id()).strip()
         if not hid:
@@ -1730,6 +1817,8 @@ class RouteControlMixin:
             return []
         corridor_info = self.scan_corridor_standoff_by_facade(hid, bbox)
         route_plan["scan_corridor_standoff_by_facade"] = corridor_info
+        safe_intervals = self.scan_safe_intervals_by_facade(hid, bbox, corridor_info)
+        route_plan["scan_safe_intervals_by_facade"] = safe_intervals
         return generate_rule_scan_points(
             house_id=hid,
             bbox_world=bbox,
@@ -1738,6 +1827,7 @@ class RouteControlMixin:
             scan_spacing_cm=self.route_scan_spacing_cm(),
             altitude_cm=self.target_house_capture_altitude_cm(hid),
             facade_standoff_info=corridor_info,
+            facade_axis_intervals=safe_intervals,
             lidar_range_cm=[
                 float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
                 float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
@@ -1784,6 +1874,11 @@ class RouteControlMixin:
         invalid: List[Dict[str, Any]] = []
         min_range = float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM))
         max_range = float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM))
+        raw_obstacles = self.route_forbidden_house_bboxes(target_house_id=target_house_id, clearance_cm=0.0)
+        clearance_obstacles = self.route_forbidden_house_bboxes(
+            target_house_id=target_house_id,
+            clearance_cm=float(LLM_ROUTE_HOUSE_CLEARANCE_CM),
+        )
         for point in scan_points:
             if not isinstance(point, dict):
                 continue
@@ -1796,6 +1891,27 @@ class RouteControlMixin:
                 continue
             if bbox and self.point_inside_open_bbox(float(x), float(y), bbox):
                 invalid.append({"scan_id": scan_id, "reason": "inside_target_bbox"})
+            for obstacle in raw_obstacles:
+                if self.point_inside_open_bbox(float(x), float(y), obstacle):
+                    invalid.append(
+                        {
+                            "scan_id": scan_id,
+                            "reason": "inside_non_target_bbox",
+                            "house_id": str(obstacle.get("house_id", "") or ""),
+                        }
+                    )
+                    break
+            for obstacle in clearance_obstacles:
+                if self.point_inside_open_bbox(float(x), float(y), obstacle):
+                    invalid.append(
+                        {
+                            "scan_id": scan_id,
+                            "reason": "inside_non_target_clearance",
+                            "house_id": str(obstacle.get("house_id", "") or ""),
+                            "clearance_cm": obstacle.get("clearance_cm", LLM_ROUTE_HOUSE_CLEARANCE_CM),
+                        }
+                    )
+                    break
             if standoff is not None and not (min_range <= float(standoff) <= max_range):
                 invalid.append({"scan_id": scan_id, "reason": "standoff_outside_lidar_range", "standoff_cm": standoff})
             if point.get("corridor_safe") is False:
@@ -1821,6 +1937,11 @@ class RouteControlMixin:
         end_scan = end.get("route_point_type") == "scan_point" or bool(end.get("scan_id"))
         if start_scan and end_scan and str(start.get("facade", "") or "") != str(end.get("facade", "") or ""):
             return False
+        if start_scan and end_scan and str(start.get("facade", "") or "") == str(end.get("facade", "") or ""):
+            start_interval = start.get("safe_interval_index")
+            end_interval = end.get("safe_interval_index")
+            if start_interval is not None and end_interval is not None and str(start_interval) != str(end_interval):
+                return False
         return True
 
     def route_house_violation_report_for_scan_plan(
@@ -1934,6 +2055,124 @@ class RouteControlMixin:
         (candidate / "reconstruction").mkdir(parents=True, exist_ok=True)
         return candidate
 
+    def make_route_capture_output_dir(self, target_house_id: str) -> Path:
+        root = self.resolve_project_path("route_capture_lidar")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        safe_house = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(target_house_id or "unknown")).strip("_") or "unknown"
+        base_name = f"house_{safe_house}_run_{timestamp}"
+        root.mkdir(parents=True, exist_ok=True)
+        candidate = root / base_name
+        suffix = 1
+        while candidate.exists():
+            suffix += 1
+            candidate = root / f"{base_name}_{suffix}"
+        (candidate / "frames").mkdir(parents=True, exist_ok=True)
+        (candidate / "reconstruction").mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def make_route2_facade_output_dir(self, target_house_id: str) -> Path:
+        root = self.resolve_project_path("route_capture_lidar")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        safe_house = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(target_house_id or "unknown")).strip("_") or "unknown"
+        base_name = f"house_{safe_house}_facade_v2_{timestamp}"
+        root.mkdir(parents=True, exist_ok=True)
+        candidate = root / base_name
+        suffix = 1
+        while candidate.exists():
+            suffix += 1
+            candidate = root / f"{base_name}_{suffix}"
+        (candidate / "frames").mkdir(parents=True, exist_ok=True)
+        (candidate / "reconstruction").mkdir(parents=True, exist_ok=True)
+        (candidate / "facade_observations").mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def route2_floor_height_m(self) -> float:
+        try:
+            return max(1.0, min(8.0, float(self.llm_route2_floor_height_m_var.get().strip())))
+        except Exception:
+            return float(LLM_ROUTE2_DEFAULT_FLOOR_HEIGHT_M)
+
+    def route2_default_floors(self) -> int:
+        try:
+            return max(1, min(int(LLM_ROUTE2_MAX_FLOORS), int(float(self.llm_route2_default_floors_var.get().strip()))))
+        except Exception:
+            return int(LLM_ROUTE2_DEFAULT_FLOORS)
+
+    def route2_low_z_cm(self) -> float:
+        try:
+            return max(50.0, min(1500.0, float(self.llm_route2_low_z_cm_var.get().strip())))
+        except Exception:
+            return float(LLM_ROUTE2_LOW_Z_CM)
+
+    def route2_z_step_cm(self) -> float:
+        try:
+            return max(100.0, min(800.0, float(self.llm_route2_z_step_cm_var.get().strip())))
+        except Exception:
+            return float(LLM_ROUTE2_Z_STEP_CM)
+
+    def route2_density_mode(self) -> str:
+        value = str(self.llm_route2_density_mode_var.get() or "auto").strip().lower()
+        return value if value in {"auto", "high", "medium", "low"} else "auto"
+
+    def route2_facade_dir(self, output_dir: Path, house_id: str, facade: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{house_id}_{facade}").strip("_")
+        path = output_dir / "facade_observations" / safe
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def route2_state_output_dir(self) -> Optional[Path]:
+        raw = ""
+        state = self.llm_route2_state if isinstance(getattr(self, "llm_route2_state", None), dict) else {}
+        raw = str(state.get("output_dir", "") or "")
+        if not raw:
+            return None
+        path = Path(raw)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "frames").mkdir(parents=True, exist_ok=True)
+        (path / "reconstruction").mkdir(parents=True, exist_ok=True)
+        (path / "facade_observations").mkdir(parents=True, exist_ok=True)
+        return path
+
+    def route2_facade_id(self, house_id: str, facade: str) -> str:
+        return f"{str(house_id or '').strip()}_{str(facade or '').strip()}"
+
+    def prepare_active_plan_for_route_capture(self, target_house_id: str, output_dir: Path) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "frames").mkdir(parents=True, exist_ok=True)
+        (output_dir / "reconstruction").mkdir(parents=True, exist_ok=True)
+        self.house_search_dir = output_dir
+        if isinstance(self.llm_route_plan, dict):
+            self.llm_route_plan["house_search_dir"] = str(output_dir)
+            self.llm_route_plan["route_capture_lidar_dir"] = str(output_dir)
+            self.llm_route_plan["route_capture_mode"] = "scan_point_path_lidar_qe_yaw"
+            self.llm_route_plan["route_capture_interval_s"] = self.route_capture_interval_s()
+        self.llm_route_lidar_trajectory = []
+        self.llm_route_execution_summary.update(
+            {
+                "house_search_dir": str(output_dir),
+                "route_capture_lidar_dir": str(output_dir),
+                "route_capture_mode": "scan_point_path_lidar_qe_yaw",
+                "route_capture_interval_s": self.route_capture_interval_s(),
+                "target_house_id": target_house_id,
+                "planned_scan_count": len(self.llm_route_scan_points),
+                "completed_scan_count": 0,
+                "capture_success_count": 0,
+                "capture_failure_count": 0,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        self.write_json_artifact(output_dir / "normalized_route_plan.json", self.llm_route_plan if isinstance(self.llm_route_plan, dict) else {})
+        self.write_json_artifact(
+            output_dir / "scan_points.json",
+            {
+                "schema": LLM_ROUTE_SCAN_POINTS_SCHEMA,
+                "target_house_id": target_house_id,
+                "scan_points": self.llm_route_scan_points,
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        self.write_json_artifact(output_dir / "execution_summary.json", self.llm_route_execution_summary)
+
     def write_json_artifact(self, path: Path, payload: Dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -2002,6 +2241,7 @@ class RouteControlMixin:
                 "scan_standoff_cm": self.route_scan_standoff_cm(),
                 "scan_spacing_cm": self.route_scan_spacing_cm(),
                 "scan_corridor_standoff_by_facade": plan.get("scan_corridor_standoff_by_facade", {}),
+                "scan_safe_intervals_by_facade": plan.get("scan_safe_intervals_by_facade", {}),
                 "scan_corridor_policy": "use alley centerline between target and nearest overlapping non-target house; mark unsafe if side margin is below clearance",
                 "capture_count_per_scan_point": self.route_capture_count(),
                 "preferred_facade_order": self.preferred_facade_order_for_route_plan(plan),
@@ -2046,7 +2286,12 @@ class RouteControlMixin:
             pose_yaw = float(pose.get("task_yaw", pose.get("yaw", 0.0))) if pose else 0.0
             houses, boxes = self.build_map_display(pose)
             widget.set_background_image(self.map_image)
-            widget.set_calibration(self.map_calibration.get("affine_world_to_image"), self.map_image_size(), [])
+            widget.set_calibration(
+                self.map_calibration.get("affine_world_to_image"),
+                self.map_image_size(),
+                [],
+                self.map_calibration.get("homography_world_to_image"),
+            )
             widget.set_image_layer_offset(*self.map_display_offset_px)
             widget.set_house_boxes(boxes)
             widget.update_houses([])
@@ -2102,6 +2347,2521 @@ class RouteControlMixin:
                 pass
         self.llm_route_preview_texts = live_texts
         self.llm_route_preview_text = live_texts[0] if live_texts else None
+
+    def refresh_route2_preview(self) -> None:
+        preview_text = getattr(self, "llm_route2_preview_text", None)
+        payload = self.llm_route2_state if isinstance(getattr(self, "llm_route2_state", None), dict) else {}
+        if preview_text is not None:
+            try:
+                if not preview_text.winfo_exists():
+                    self.llm_route2_preview_text = None
+                else:
+                    preview_text.configure(state="normal")
+                    preview_text.delete("1.0", "end")
+                    preview_text.insert("1.0", json.dumps(payload, indent=2, ensure_ascii=False))
+                    preview_text.configure(state="disabled")
+            except tk.TclError:
+                self.llm_route2_preview_text = None
+        self.refresh_route2_support_views()
+
+    def refresh_route2_support_views(self) -> None:
+        self.refresh_route2_progress()
+        self.refresh_route2_facade_status()
+        self.refresh_route2_analysis_view()
+        self.refresh_route2_rgb_display()
+
+    def refresh_route2_facade_status(self) -> None:
+        status_var = getattr(self, "llm_route2_facade_status_var", None)
+        if status_var is None:
+            return
+        state = self.route2_selected_state()
+        facade = str(state.get("facade", "") or "")
+        if not facade:
+            status = "Processed: no facade"
+        else:
+            validation = state.get("validation_report", {}) if isinstance(state.get("validation_report"), dict) else {}
+            points = state.get("facade_scan_points", []) if isinstance(state.get("facade_scan_points"), list) else []
+            captured = sum(1 for point in points if isinstance(point, dict) and str(point.get("status", "") or "") == "captured")
+            if validation:
+                status = f"Processed: validated {'PASS' if validation.get('overall_passed') else 'CHECK'}"
+            elif points and captured >= len(points):
+                status = f"Processed: captured {captured}/{len(points)}"
+            elif points:
+                status = f"Processed: in progress {captured}/{len(points)}"
+            elif state.get("coarse_rgb_path") or state.get("coarse_capture"):
+                status = "Processed: RGB captured"
+            elif state.get("observation_point"):
+                status = "Processed: planned"
+            else:
+                status = "Processed: no"
+        try:
+            status_var.set(status)
+        except tk.TclError:
+            pass
+
+    def refresh_route2_progress(self) -> None:
+        progress_var = getattr(self, "llm_route2_progress_var", None)
+        progress_text_var = getattr(self, "llm_route2_progress_text_var", None)
+        if progress_var is None or progress_text_var is None:
+            return
+        state = self.route2_selected_state()
+        points = state.get("facade_scan_points", []) if isinstance(state.get("facade_scan_points"), list) else []
+        captured_ids = {
+            str(row.get("scan_id", "") or "")
+            for row in state.get("facade_capture_rows", [])
+            if isinstance(row, dict) and str(row.get("scan_id", "") or "")
+        } if isinstance(state.get("facade_capture_rows"), list) else set()
+        captured_count = 0
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            if point.get("status") == "captured" or str(point.get("scan_id", "") or "") in captured_ids:
+                captured_count += 1
+        if points:
+            value = 100.0 * float(captured_count) / float(max(1, len(points)))
+            text = f"Explore: {captured_count}/{len(points)}"
+        else:
+            stage_count = 0
+            if isinstance(state.get("observation_point"), dict) and state.get("observation_point"):
+                stage_count += 1
+            if state.get("coarse_rgb_path") or state.get("coarse_capture"):
+                stage_count += 1
+            if isinstance(state.get("facade_analysis"), dict) and state.get("facade_analysis"):
+                stage_count += 1
+            value = 100.0 * float(stage_count) / 3.0
+            text = f"Explore: stage {stage_count}/3"
+        try:
+            progress_var.set(max(0.0, min(100.0, float(value))))
+            progress_text_var.set(text)
+        except tk.TclError:
+            pass
+
+    def refresh_route2_analysis_view(self) -> None:
+        analysis_text = getattr(self, "llm_route2_analysis_text", None)
+        if analysis_text is None:
+            return
+        state = self.route2_selected_state()
+        analysis = state.get("facade_analysis", {}) if isinstance(state.get("facade_analysis"), dict) else {}
+        if not analysis:
+            payload: Dict[str, Any] = {
+                "facade": state.get("facade", ""),
+                "status": "No facade analysis yet.",
+            }
+        else:
+            payload = analysis
+        try:
+            if not analysis_text.winfo_exists():
+                self.llm_route2_analysis_text = None
+                return
+            analysis_text.configure(state="normal")
+            analysis_text.delete("1.0", "end")
+            analysis_text.insert("1.0", json.dumps(payload, indent=2, ensure_ascii=False))
+            analysis_text.configure(state="disabled")
+        except tk.TclError:
+            self.llm_route2_analysis_text = None
+
+    def refresh_route2_rgb_display(self) -> None:
+        widget = getattr(self, "llm_route2_rgb_label", None)
+        if widget is None:
+            return
+        image_path = self.route2_current_rgb_path()
+        if image_path is None:
+            try:
+                self.route2_draw_rgb_preview_message(widget, "No facade RGB")
+                self.llm_route2_rgb_photo = None
+                self.llm_route2_rgb_status_var.set("Facade RGB: none")
+            except tk.TclError:
+                self.llm_route2_rgb_label = None
+            return
+        try:
+            image = Image.open(image_path).convert("RGB")
+            photo = ImageTk.PhotoImage(self.route2_rgb_preview_image(image, widget))
+            self.route2_draw_rgb_preview_photo(widget, photo)
+            self.llm_route2_rgb_photo = photo
+            self.llm_route2_rgb_status_var.set(f"Facade RGB: {image_path.name}")
+        except Exception as exc:
+            LOGGER.warning("Refresh route v2 facade RGB failed: %s", exc)
+            try:
+                self.route2_draw_rgb_preview_message(widget, f"RGB load failed:\n{exc}")
+                self.llm_route2_rgb_photo = None
+                self.llm_route2_rgb_status_var.set("Facade RGB: load failed")
+            except tk.TclError:
+                self.llm_route2_rgb_label = None
+
+    def route2_draw_rgb_preview_message(self, widget: tk.Widget, message: str) -> None:
+        if isinstance(widget, tk.Canvas):
+            widget.delete("all")
+            try:
+                w = max(1, int(widget.winfo_width()))
+                h = max(1, int(widget.winfo_height()))
+            except Exception:
+                w, h = 330, 230
+            widget.create_rectangle(0, 0, w, h, fill="#202020", outline="")
+            widget.create_text(
+                w / 2,
+                h / 2,
+                text=str(message),
+                fill="#dddddd",
+                font=("Consolas", 9),
+                justify="center",
+                width=max(120, w - 24),
+            )
+        else:
+            widget.configure(image="", text=str(message))
+
+    def route2_draw_rgb_preview_photo(self, widget: tk.Widget, photo: ImageTk.PhotoImage) -> None:
+        if isinstance(widget, tk.Canvas):
+            widget.delete("all")
+            try:
+                w = max(1, int(widget.winfo_width()))
+                h = max(1, int(widget.winfo_height()))
+            except Exception:
+                w, h = 330, 230
+            widget.create_rectangle(0, 0, w, h, fill="#202020", outline="")
+            widget.create_image(w / 2, h / 2, image=photo, anchor="center")
+        else:
+            widget.configure(image=photo, text="")
+
+    def route2_rgb_preview_image(self, image: Image.Image, widget: tk.Widget) -> Image.Image:
+        try:
+            target_w = int(widget.winfo_width())
+            target_h = int(widget.winfo_height())
+        except Exception:
+            target_w, target_h = 330, 230
+        if target_w <= 8:
+            try:
+                target_w = int(float(widget.cget("width")))
+            except Exception:
+                target_w = 330
+        if target_h <= 8:
+            try:
+                target_h = int(float(widget.cget("height")))
+            except Exception:
+                target_h = 230
+        target_w = min(520, max(240, target_w))
+        target_h = min(360, max(180, target_h))
+        source_w, source_h = image.size
+        if source_w <= 0 or source_h <= 0:
+            return Image.new("RGB", (target_w, target_h), (32, 32, 32))
+        scale = min(float(target_w) / float(source_w), float(target_h) / float(source_h))
+        resize_w = max(1, int(round(float(source_w) * scale)))
+        resize_h = max(1, int(round(float(source_h) * scale)))
+        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+        resized = image.resize((resize_w, resize_h), resample)
+        preview = Image.new("RGB", (target_w, target_h), (32, 32, 32))
+        left = max(0, (target_w - resize_w) // 2)
+        top = max(0, (target_h - resize_h) // 2)
+        preview.paste(resized, (left, top))
+        return preview
+
+    def route2_candidate_path(self, raw: Any) -> Optional[Path]:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        path = Path(text)
+        if not path.is_absolute():
+            path = self.resolve_project_path(text)
+        try:
+            path = path.resolve()
+        except Exception:
+            pass
+        return path
+
+    def route2_current_rgb_path(self) -> Optional[Path]:
+        state = self.route2_selected_state()
+        candidates: List[Any] = [state.get("coarse_rgb_path")]
+        coarse_capture = state.get("coarse_capture", {}) if isinstance(state.get("coarse_capture"), dict) else {}
+        candidates.append(coarse_capture.get("coarse_rgb_path"))
+        capture_result = coarse_capture.get("capture_result", {}) if isinstance(coarse_capture.get("capture_result"), dict) else {}
+        candidates.append(capture_result.get("rgb_path"))
+        capture_dir = self.route2_candidate_path(capture_result.get("capture_dir"))
+        if capture_dir is not None:
+            candidates.append(capture_dir / "rgb.png")
+        _, facade_dir, _, _ = self.route2_facade_paths()
+        if facade_dir is not None:
+            candidates.append(facade_dir / "coarse_rgb.png")
+        for candidate in candidates:
+            path = candidate if isinstance(candidate, Path) else self.route2_candidate_path(candidate)
+            if path is not None and path.exists() and path.is_file():
+                return path
+        return None
+
+    def cancel_route2_auto_refresh(self) -> None:
+        job = getattr(self, "llm_route2_auto_refresh_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self.llm_route2_auto_refresh_job = None
+
+    def on_route2_auto_refresh_toggle(self) -> None:
+        auto_var = getattr(self, "llm_route2_auto_refresh_var", None)
+        enabled = bool(auto_var.get()) if auto_var is not None else False
+        if enabled:
+            self.route2_auto_refresh_tick()
+        else:
+            self.cancel_route2_auto_refresh()
+
+    def route2_auto_refresh_tick(self) -> None:
+        self.cancel_route2_auto_refresh()
+        try:
+            if not bool(self.llm_route2_auto_refresh_var.get()):
+                return
+        except tk.TclError:
+            return
+        self.refresh_llm_route2_map()
+        self.refresh_route2_preview()
+        self.llm_route2_auto_refresh_job = self.root.after(1500, self.route2_auto_refresh_tick)
+
+    def refresh_llm_route2_map(self) -> None:
+        widget = getattr(self, "llm_route2_map_widget", None)
+        if widget is None:
+            return
+        try:
+            if not self.load_map_resources(force=not bool(self.map_config)):
+                self.llm_route2_map_status_var.set("Route V2 Map: map unavailable")
+                return
+            pose = self.latest_state.get("pose", {}) if isinstance(self.latest_state.get("pose"), dict) else {}
+            pose_x = float(pose.get("x", 0.0)) if pose else 0.0
+            pose_y = float(pose.get("y", 0.0)) if pose else 0.0
+            pose_yaw = float(pose.get("task_yaw", pose.get("yaw", 0.0))) if pose else 0.0
+            houses, boxes = self.build_map_display(pose)
+            widget.set_background_image(self.map_image)
+            widget.set_calibration(
+                self.map_calibration.get("affine_world_to_image"),
+                self.map_image_size(),
+                [],
+                self.map_calibration.get("homography_world_to_image"),
+            )
+            widget.set_image_layer_offset(*self.map_display_offset_px)
+            widget.set_house_boxes(boxes)
+            widget.update_houses([])
+            widget.update_uav(pose_x, pose_y, pose_yaw)
+            state = self.llm_route2_state if isinstance(getattr(self, "llm_route2_state", None), dict) else {}
+            route_points: List[Dict[str, Any]] = []
+            observation = state.get("observation_point", {}) if isinstance(state.get("observation_point"), dict) else {}
+            candidates = state.get("candidate_observation_points", [])
+            current_facade = str(observation.get("facade", "") or "")
+            current_label = str(observation.get("label", "") or "")
+            rendered_candidate_keys: set[Tuple[str, str]] = set()
+            if isinstance(candidates, list) and candidates:
+                for candidate in candidates:
+                    if not isinstance(candidate, dict):
+                        continue
+                    item = dict(candidate)
+                    label = str(item.get("label", "") or f"{item.get('house_id', '')}_{item.get('facade', '')}_obs")
+                    facade = str(item.get("facade", "") or "")
+                    item["label"] = label
+                    item["route_point_type"] = "observation_point" if (
+                        facade == current_facade or label == current_label
+                    ) else "observation_candidate"
+                    route_points.append(item)
+                    rendered_candidate_keys.add((facade, label))
+            if observation and (current_facade, current_label) not in rendered_candidate_keys:
+                item = dict(observation)
+                item["label"] = str(item.get("label", "") or f"{item.get('facade', '')}_obs")
+                item["route_point_type"] = "observation_point"
+                route_points.append(item)
+            for point in state.get("facade_scan_points", []) if isinstance(state.get("facade_scan_points"), list) else []:
+                if not isinstance(point, dict):
+                    continue
+                item = dict(point)
+                band = str(item.get("height_band", "") or "")
+                item["label"] = str(item.get("scan_id", "") or band or f"v2_{len(route_points)}")
+                item["route_point_type"] = "scan_point"
+                route_points.append(item)
+            widget.set_route_plan({"route_points": route_points})
+            self.llm_route2_map_status_var.set(
+                f"Route V2 Map: houses={len(houses)} facade={state.get('facade', '-')} points={len(route_points)}"
+            )
+            self.refresh_route2_progress()
+        except tk.TclError:
+            pass
+        except Exception as exc:
+            LOGGER.warning("Refresh LLM route v2 map failed: %s", exc)
+            self.llm_route2_map_status_var.set(f"Route V2 Map: failed: {exc}")
+
+    def route2_facade_axis_range(self, bbox: Dict[str, Any], facade: str) -> Tuple[float, float]:
+        facade = str(facade or "").strip().lower()
+        if facade in {"south", "north"}:
+            return float(bbox["min_x"]), float(bbox["max_x"])
+        return float(bbox["min_y"]), float(bbox["max_y"])
+
+    def route2_facade_pose_from_axis(
+        self,
+        bbox: Dict[str, Any],
+        facade: str,
+        axis_value: float,
+        standoff_cm: float,
+        z_cm: float,
+    ) -> Dict[str, float]:
+        facade = str(facade or "").strip().lower()
+        min_x = float(bbox["min_x"])
+        max_x = float(bbox["max_x"])
+        min_y = float(bbox["min_y"])
+        max_y = float(bbox["max_y"])
+        center_x = float(bbox.get("center_x", 0.5 * (min_x + max_x)))
+        center_y = float(bbox.get("center_y", 0.5 * (min_y + max_y)))
+        standoff = max(20.0, float(standoff_cm))
+        axis = float(axis_value)
+        if facade == "south":
+            x = axis
+            y = min_y - standoff
+            target_x, target_y = axis, min_y
+        elif facade == "north":
+            x = axis
+            y = max_y + standoff
+            target_x, target_y = axis, max_y
+        elif facade == "east":
+            x = max_x + standoff
+            y = axis
+            target_x, target_y = max_x, axis
+        else:
+            x = min_x - standoff
+            y = axis
+            target_x, target_y = min_x, axis
+        yaw = math.degrees(math.atan2(float(target_y) - float(y), float(target_x) - float(x)))
+        return {
+            "x": round(float(x), 2),
+            "y": round(float(y), 2),
+            "z": round(float(z_cm), 2),
+            "yaw_deg": round(float(yaw), 2),
+            "target_x": round(float(target_x), 2),
+            "target_y": round(float(target_y), 2),
+        }
+
+    def route2_facade_center_axis(self, bbox: Dict[str, Any], facade: str) -> float:
+        facade = str(facade or "").strip().lower()
+        if facade in {"south", "north"}:
+            return float(bbox.get("center_x", 0.5 * (float(bbox["min_x"]) + float(bbox["max_x"]))))
+        return float(bbox.get("center_y", 0.5 * (float(bbox["min_y"]) + float(bbox["max_y"]))))
+
+    def route2_observation_blocking_house_id(
+        self,
+        target_house_id: str,
+        x: float,
+        y: float,
+        *,
+        clearance_cm: Optional[float] = None,
+    ) -> str:
+        for obstacle in self.route_forbidden_house_bboxes(
+            target_house_id=str(target_house_id or "").strip(),
+            clearance_cm=float(LLM_ROUTE_HOUSE_CLEARANCE_CM if clearance_cm is None else clearance_cm),
+        ):
+            if self.point_inside_open_bbox(float(x), float(y), obstacle):
+                return str(obstacle.get("house_id", "") or "")
+        return ""
+
+    def route2_observation_blocking_house(
+        self,
+        target_house_id: str,
+        x: float,
+        y: float,
+        *,
+        clearance_cm: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        for obstacle in self.route_forbidden_house_bboxes(
+            target_house_id=str(target_house_id or "").strip(),
+            clearance_cm=float(LLM_ROUTE_HOUSE_CLEARANCE_CM if clearance_cm is None else clearance_cm),
+        ):
+            if self.point_inside_open_bbox(float(x), float(y), obstacle):
+                return dict(obstacle)
+        return {}
+
+    def route2_adjust_observation_to_blocking_boundary(
+        self,
+        bbox: Dict[str, Any],
+        facade: str,
+        axis_value: float,
+        z_cm: float,
+        original_standoff_cm: float,
+        blocking_obstacle: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        facade = str(facade or "").strip().lower()
+        if facade not in {"south", "east", "north", "west"} or not blocking_obstacle:
+            return {}
+        boundary_gap = 2.0
+        try:
+            if facade == "east":
+                new_standoff = float(blocking_obstacle["min_x"]) - boundary_gap - float(bbox["max_x"])
+            elif facade == "west":
+                new_standoff = float(bbox["min_x"]) - (float(blocking_obstacle["max_x"]) + boundary_gap)
+            elif facade == "north":
+                new_standoff = float(blocking_obstacle["min_y"]) - boundary_gap - float(bbox["max_y"])
+            else:
+                new_standoff = float(bbox["min_y"]) - (float(blocking_obstacle["max_y"]) + boundary_gap)
+        except Exception:
+            return {}
+        if new_standoff <= 20.0:
+            return {}
+        pose = self.route2_facade_pose_from_axis(bbox, facade, axis_value, new_standoff, z_cm)
+        return {
+            "pose": pose,
+            "standoff_cm": float(new_standoff),
+            "adjustment": {
+                "source": "blocking_house_clearance_boundary",
+                "blocking_house_id": str(blocking_obstacle.get("house_id", "") or ""),
+                "blocking_clearance_cm": blocking_obstacle.get("clearance_cm", LLM_ROUTE_HOUSE_CLEARANCE_CM),
+                "original_standoff_cm": round(float(original_standoff_cm), 2),
+                "adjusted_standoff_cm": round(float(new_standoff), 2),
+                "boundary_gap_cm": boundary_gap,
+            },
+        }
+
+    def route2_observation_map_bounds_report(self, x: float, y: float) -> Dict[str, Any]:
+        calibration = self.map_calibration if isinstance(getattr(self, "map_calibration", None), dict) else {}
+        image_w = calibration.get("image_width")
+        image_h = calibration.get("image_height")
+        if (image_w is None or image_h is None) and getattr(self, "map_image", None) is not None:
+            try:
+                image_h, image_w = self.map_image.shape[:2]
+            except Exception:
+                image_w = image_h = None
+        if image_w is not None and image_h is not None:
+            try:
+                image_x, image_y = world_to_image_with_calibration(float(x), float(y), calibration)
+                margin_px = 2.0
+                in_bounds = (
+                    margin_px <= float(image_x) <= float(image_w) - margin_px
+                    and margin_px <= float(image_y) <= float(image_h) - margin_px
+                )
+                return {
+                    "in_bounds": bool(in_bounds),
+                    "source": f"{calibration.get('transform_mode', 'calibration')}_image_bounds",
+                    "image_x": round(float(image_x), 2),
+                    "image_y": round(float(image_y), 2),
+                    "image_width": int(float(image_w)),
+                    "image_height": int(float(image_h)),
+                }
+            except Exception:
+                pass
+        bounds = getattr(self, "map_world_bounds", None)
+        if isinstance(bounds, tuple) and len(bounds) == 4:
+            try:
+                min_x, min_y, max_x, max_y = [float(value) for value in bounds]
+                return {
+                    "in_bounds": bool(min_x <= float(x) <= max_x and min_y <= float(y) <= max_y),
+                    "source": "world_bounds",
+                    "min_x": round(min_x, 2),
+                    "min_y": round(min_y, 2),
+                    "max_x": round(max_x, 2),
+                    "max_y": round(max_y, 2),
+                }
+            except Exception:
+                pass
+        return {"in_bounds": True, "source": "unavailable"}
+
+    def route2_observation_standoff_options(
+        self,
+        desired_standoff_cm: float,
+        facade_info: Dict[str, Any],
+        observation_meta: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        clearance = self._as_float_or_none(observation_meta.get("observation_clearance_cm"))
+        clearance = float(clearance if clearance is not None else LLM_ROUTE_HOUSE_CLEARANCE_CM)
+        min_standoff = self._as_float_or_none(facade_info.get("min_standoff_cm"))
+        min_standoff = float(min_standoff if min_standoff is not None else LLM_ROUTE_MIN_PERIMETER_STANDOFF_CM)
+        gap = self._as_float_or_none(facade_info.get("gap_cm"))
+        blocking_house_id = str(facade_info.get("blocking_house_id", "") or "")
+        options: List[Dict[str, Any]] = []
+        seen: set[float] = set()
+
+        def add(value: Any, source: str) -> None:
+            numeric = self._as_float_or_none(value)
+            if numeric is None:
+                return
+            value_f = max(20.0, float(numeric))
+            key = round(value_f, 2)
+            if key in seen:
+                return
+            seen.add(key)
+            options.append({"standoff_cm": value_f, "source": source})
+
+        if gap is not None and float(gap) > 0.0 and blocking_house_id:
+            max_before_neighbor_clearance = float(gap) - clearance - 2.0
+            if max_before_neighbor_clearance > 20.0:
+                add(max_before_neighbor_clearance, "neighbor_clearance_clamped")
+            add(float(gap) * 0.5, "alley_midline")
+            add(float(gap) - clearance * 0.5, "neighbor_soft_clearance_clamped")
+        add(desired_standoff_cm, "facade_panorama_desired")
+        add(facade_info.get("standoff_cm"), "corridor_scan_standoff")
+        add(self.route_scan_standoff_cm(), "scan_default_standoff")
+        add(min_standoff, "minimum_perimeter_standoff")
+        return options
+
+    def route2_observation_meta_for_standoff(
+        self,
+        base_meta: Dict[str, Any],
+        facade_info: Dict[str, Any],
+        standoff_cm: float,
+        source: str,
+    ) -> Dict[str, Any]:
+        meta = dict(base_meta)
+        desired = self._as_float_or_none(meta.get("observation_required_standoff_cm"))
+        desired = float(desired if desired is not None else standoff_cm)
+        gap = self._as_float_or_none(facade_info.get("gap_cm"))
+        clearance = self._as_float_or_none(meta.get("observation_clearance_cm"))
+        clearance = float(clearance if clearance is not None else LLM_ROUTE_HOUSE_CLEARANCE_CM)
+        standoff = float(standoff_cm)
+        meta["observation_standoff_mode"] = str(source or meta.get("observation_standoff_mode", "candidate"))
+        meta["observation_panorama_coverage_ratio"] = round(max(0.0, min(1.0, standoff / max(1.0, desired))), 3)
+        meta["observation_actual_standoff_cm"] = round(standoff, 2)
+        if gap is not None:
+            neighbor_margin = max(0.0, float(gap) - standoff)
+            meta["observation_neighbor_gap_cm"] = round(float(gap), 2)
+            meta["observation_neighbor_margin_cm"] = round(float(neighbor_margin), 2)
+            meta["observation_neighbor_clearance_ok"] = bool(neighbor_margin >= clearance)
+        return meta
+
+    def route2_projected_observation_choice(
+        self,
+        target_house_id: str,
+        bbox: Dict[str, Any],
+        facade: str,
+        axis_value: float,
+        z_cm: float,
+        desired_standoff_cm: float,
+        observation_meta: Dict[str, Any],
+        facade_info: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        standoff = float(desired_standoff_cm)
+        meta = self.route2_observation_meta_for_standoff(
+            observation_meta,
+            facade_info,
+            standoff,
+            "facade_center_projection",
+        )
+        pose_payload = self.route2_facade_pose_from_axis(bbox, facade, axis_value, standoff, z_cm)
+        boundary_adjustment: Dict[str, Any] = {}
+        blocking_obstacle = self.route2_observation_blocking_house(
+            target_house_id,
+            float(pose_payload["x"]),
+            float(pose_payload["y"]),
+        )
+        if blocking_obstacle:
+            adjusted = self.route2_adjust_observation_to_blocking_boundary(
+                bbox,
+                facade,
+                axis_value,
+                z_cm,
+                standoff,
+                blocking_obstacle,
+            )
+            if not adjusted:
+                return {}
+            pose_payload = adjusted["pose"] if isinstance(adjusted.get("pose"), dict) else {}
+            standoff = float(adjusted.get("standoff_cm", standoff))
+            meta = self.route2_observation_meta_for_standoff(
+                observation_meta,
+                facade_info,
+                standoff,
+                "facade_center_projection_boundary_adjusted",
+            )
+            boundary_adjustment = adjusted.get("adjustment", {}) if isinstance(adjusted.get("adjustment"), dict) else {}
+            blocking_obstacle = self.route2_observation_blocking_house(
+                target_house_id,
+                float(pose_payload.get("x", 0.0)),
+                float(pose_payload.get("y", 0.0)),
+            )
+            if blocking_obstacle:
+                return {}
+        bounds_report = self.route2_observation_map_bounds_report(
+            float(pose_payload["x"]),
+            float(pose_payload["y"]),
+        )
+        if not bool(bounds_report.get("in_bounds", True)):
+            return {}
+        return {
+            "pose": pose_payload,
+            "axis_value": float(axis_value),
+            "standoff_cm": float(standoff),
+            "meta": meta,
+            "bounds_report": bounds_report,
+            "boundary_adjustment": boundary_adjustment,
+        }
+
+    def route2_observation_standoff_cm(
+        self,
+        *,
+        facade_length_cm: float,
+        facade_depth_cm: float,
+        facade_info: Dict[str, Any],
+    ) -> Tuple[float, Dict[str, Any]]:
+        base_scan_standoff = self._as_float_or_none(facade_info.get("standoff_cm"))
+        base_scan_standoff = float(base_scan_standoff if base_scan_standoff is not None else self.route_scan_standoff_cm())
+        panorama_span = min(abs(float(facade_length_cm)), abs(float(facade_depth_cm)))
+        desired = max(
+            float(LLM_ROUTE2_OBSERVATION_MIN_STANDOFF_CM),
+            float(panorama_span) * float(LLM_ROUTE2_OBSERVATION_DEPTH_FACTOR),
+            base_scan_standoff,
+        )
+        desired = min(float(LLM_ROUTE2_OBSERVATION_MAX_STANDOFF_CM), desired)
+        clearance = self._as_float_or_none(facade_info.get("clearance_cm"))
+        clearance = float(clearance if clearance is not None else LLM_ROUTE_HOUSE_CLEARANCE_CM)
+        standoff = desired
+        mode = "facade_short_side_panorama_standoff"
+        coverage_ratio = max(0.0, min(1.0, float(standoff) / max(1.0, float(desired))))
+        return (
+            float(standoff),
+            {
+                "observation_required_standoff_cm": round(float(desired), 2),
+                "observation_standoff_mode": mode,
+                "observation_panorama_coverage_ratio": round(float(coverage_ratio), 3),
+                "observation_available_side_margin_cm": None,
+                "observation_clearance_cm": round(float(clearance), 2),
+                "observation_facade_length_cm": round(float(facade_length_cm), 2),
+                "observation_facade_depth_cm": round(float(facade_depth_cm), 2),
+                "observation_panorama_span_cm": round(float(panorama_span), 2),
+                "observation_depth_factor": float(LLM_ROUTE2_OBSERVATION_DEPTH_FACTOR),
+                "observation_length_factor": float(LLM_ROUTE2_OBSERVATION_LENGTH_FACTOR),
+            },
+        )
+
+    def route2_safe_observation_candidates(
+        self,
+        target_house_id: str,
+        *,
+        skip_completed: bool = True,
+        facade_filter: str = "",
+    ) -> List[Dict[str, Any]]:
+        hid = str(target_house_id or "").strip()
+        if not hid:
+            return []
+        selected_facade = str(facade_filter or "").strip().lower()
+        if selected_facade == "auto":
+            selected_facade = ""
+        if selected_facade and selected_facade not in {"south", "east", "north", "west"}:
+            return []
+        if not self.load_map_resources(force=not bool(self.map_config)):
+            return []
+        bbox = self.house_world_bbox_for_id(hid)
+        if not bbox:
+            return []
+        pose = self.current_route_pose()
+        px = self._as_float_or_none(pose.get("x")) if pose else None
+        py = self._as_float_or_none(pose.get("y")) if pose else None
+        pose_yaw = self._as_float_or_none(pose.get("yaw")) if pose else None
+        corridor_info = self.scan_corridor_standoff_by_facade(hid, bbox)
+        completed = set(getattr(self, "llm_route2_completed_facades", set()) or set()) if skip_completed else set()
+        pose_z = self._as_float_or_none(pose.get("z")) if pose else None
+        if pose_z is not None and 80.0 <= float(pose_z) <= 900.0:
+            z_cm = float(pose_z)
+        else:
+            z_cm = min(max(self.route2_low_z_cm(), 150.0), 300.0)
+        candidates: List[Dict[str, Any]] = []
+        for facade in ("south", "east", "north", "west"):
+            if selected_facade and facade != selected_facade:
+                continue
+            if facade in completed:
+                continue
+            facade_info = corridor_info.get(facade, {}) if isinstance(corridor_info.get(facade), dict) else {}
+            axis_min, axis_max = self.route2_facade_axis_range(bbox, facade)
+            facade_length = abs(float(axis_max) - float(axis_min))
+            facade_depth = abs(float(bbox["max_y"]) - float(bbox["min_y"])) if facade in {"south", "north"} else abs(float(bbox["max_x"]) - float(bbox["min_x"]))
+            desired_standoff, observation_meta = self.route2_observation_standoff_cm(
+                facade_length_cm=facade_length,
+                facade_depth_cm=facade_depth,
+                facade_info=facade_info,
+            )
+            facade_center_axis = self.route2_facade_center_axis(bbox, facade)
+            projected_choice = self.route2_projected_observation_choice(
+                hid,
+                bbox,
+                facade,
+                facade_center_axis,
+                z_cm,
+                desired_standoff,
+                observation_meta,
+                facade_info,
+            )
+            if projected_choice:
+                pose_payload = dict(projected_choice.get("pose", {}))
+                if pose_yaw is not None:
+                    yaw_delta = abs(self._normalize_angle_deg(float(pose_yaw) - float(pose_payload.get("yaw_deg", 0.0))))
+                    if yaw_delta <= 15.0:
+                        pose_payload["yaw_deg"] = round(float(pose_yaw), 2)
+                if px is not None and py is not None:
+                    distance = math.hypot(float(pose_payload["x"]) - float(px), float(pose_payload["y"]) - float(py))
+                else:
+                    distance = 0.0
+                projected_meta = projected_choice.get("meta", {}) if isinstance(projected_choice.get("meta"), dict) else {}
+                candidates.append(
+                    {
+                        **pose_payload,
+                        "label": f"{hid}_{facade}_obs",
+                        "route_point_type": "observation_point",
+                        "house_id": hid,
+                        "facade": facade,
+                        "facade_id": self.route2_facade_id(hid, facade),
+                        "axis_value": round(float(projected_choice.get("axis_value", facade_center_axis)), 2),
+                        "axis_center_cm": round(float(facade_center_axis), 2),
+                        "axis_center_error_cm": round(abs(float(projected_choice.get("axis_value", facade_center_axis)) - float(facade_center_axis)), 2),
+                        "standoff_cm": round(float(projected_choice.get("standoff_cm", desired_standoff)), 2),
+                        **projected_meta,
+                        "observation_fallback_used": bool(projected_choice.get("boundary_adjustment")),
+                        "safe_interval_index": -1,
+                        "safe_interval_count": 0,
+                        "safe_axis_min": round(float(axis_min), 2),
+                        "safe_axis_max": round(float(axis_max), 2),
+                        "safe_interval_source": "facade_center_projection",
+                        "corridor_mode": str(facade_info.get("mode", "default") or "default"),
+                        "corridor_gap_cm": facade_info.get("gap_cm"),
+                        "corridor_side_margin_cm": facade_info.get("side_margin_cm"),
+                        "corridor_blocking_house_id": str(facade_info.get("blocking_house_id", "") or ""),
+                        "corridor_clearance_cm": facade_info.get("clearance_cm"),
+                        "observation_blocking_house_id": "",
+                        "observation_map_bounds": projected_choice.get("bounds_report", {}),
+                        "observation_boundary_adjustment": projected_choice.get("boundary_adjustment", {}),
+                        "status": "planned",
+                        "distance_to_uav_cm": round(float(distance), 2),
+                        "observation_selection_score": round(float(distance), 2),
+                    }
+                )
+                continue
+            best_interval: Optional[Dict[str, Any]] = None
+            best_axis: Optional[float] = None
+            best_distance: Optional[float] = None
+            best_score: Optional[float] = None
+            best_standoff: Optional[float] = None
+            best_meta: Dict[str, Any] = {}
+            best_bounds_report: Dict[str, Any] = {}
+            best_interval_count = 0
+            best_boundary_adjustment: Dict[str, Any] = {}
+            for standoff_option in self.route2_observation_standoff_options(desired_standoff, facade_info, observation_meta):
+                if not isinstance(standoff_option, dict):
+                    continue
+                standoff = self._as_float_or_none(standoff_option.get("standoff_cm"))
+                if standoff is None:
+                    continue
+                option_source = str(standoff_option.get("source", "") or "candidate")
+                option_meta = self.route2_observation_meta_for_standoff(
+                    observation_meta,
+                    facade_info,
+                    float(standoff),
+                    option_source,
+                )
+                observation_corridor_info = dict(corridor_info)
+                observation_corridor_info[facade] = {**facade_info, "standoff_cm": float(standoff)}
+                safe_intervals = self.scan_safe_intervals_by_facade(hid, bbox, observation_corridor_info)
+                intervals = safe_intervals.get(facade, []) if isinstance(safe_intervals.get(facade), list) else []
+                projection_interval = {
+                    "index": -1,
+                    "min": float(axis_min),
+                    "max": float(axis_max),
+                    "source": "facade_center_projection",
+                    "min_segment_len_cm": 0.0,
+                }
+                candidate_intervals = [projection_interval] + intervals
+                for interval in candidate_intervals:
+                    if not isinstance(interval, dict):
+                        continue
+                    lo = self._as_float_or_none(interval.get("min", interval.get("axis_min")))
+                    hi = self._as_float_or_none(interval.get("max", interval.get("axis_max")))
+                    if lo is None or hi is None:
+                        continue
+                    lo = max(float(axis_min), min(float(lo), float(hi)))
+                    hi = min(float(axis_max), max(float(lo), float(hi)))
+                    if hi < lo:
+                        continue
+                    axis_value = min(max(float(facade_center_axis), lo), hi)
+                    candidate_standoff = float(standoff)
+                    candidate_meta = dict(option_meta)
+                    boundary_adjustment: Dict[str, Any] = {}
+                    pose_payload = self.route2_facade_pose_from_axis(bbox, facade, axis_value, candidate_standoff, z_cm)
+                    blocking_obstacle = self.route2_observation_blocking_house(
+                        hid,
+                        float(pose_payload["x"]),
+                        float(pose_payload["y"]),
+                    )
+                    if blocking_obstacle:
+                        adjusted = self.route2_adjust_observation_to_blocking_boundary(
+                            bbox,
+                            facade,
+                            axis_value,
+                            z_cm,
+                            candidate_standoff,
+                            blocking_obstacle,
+                        )
+                        if not adjusted:
+                            continue
+                        pose_payload = adjusted["pose"] if isinstance(adjusted.get("pose"), dict) else {}
+                        candidate_standoff = float(adjusted.get("standoff_cm", candidate_standoff))
+                        candidate_meta = self.route2_observation_meta_for_standoff(
+                            observation_meta,
+                            facade_info,
+                            candidate_standoff,
+                            f"{option_source}_boundary_adjusted",
+                        )
+                        boundary_adjustment = adjusted.get("adjustment", {}) if isinstance(adjusted.get("adjustment"), dict) else {}
+                        blocking_obstacle = self.route2_observation_blocking_house(
+                            hid,
+                            float(pose_payload.get("x", 0.0)),
+                            float(pose_payload.get("y", 0.0)),
+                        )
+                        if blocking_obstacle:
+                            continue
+                    bounds_report = self.route2_observation_map_bounds_report(
+                        float(pose_payload["x"]),
+                        float(pose_payload["y"]),
+                    )
+                    if not bool(bounds_report.get("in_bounds", True)):
+                        continue
+                    if px is not None and py is not None:
+                        distance = math.hypot(float(pose_payload["x"]) - float(px), float(pose_payload["y"]) - float(py))
+                    else:
+                        distance = 0.0
+                    center_error = abs(float(axis_value) - float(facade_center_axis))
+                    coverage_penalty = (1.0 - float(candidate_meta["observation_panorama_coverage_ratio"])) * 1500.0
+                    standoff_penalty = abs(float(candidate_standoff) - float(desired_standoff)) * 0.05
+                    neighbor_penalty = 0.0
+                    gap = self._as_float_or_none(facade_info.get("gap_cm"))
+                    blocking_neighbor = str(facade_info.get("blocking_house_id", "") or "")
+                    clearance = self._as_float_or_none(candidate_meta.get("observation_clearance_cm"))
+                    clearance = float(clearance if clearance is not None else LLM_ROUTE_HOUSE_CLEARANCE_CM)
+                    if gap is not None and blocking_neighbor:
+                        max_corridor_standoff = max(20.0, float(gap) - clearance - 2.0)
+                        if float(candidate_standoff) > max_corridor_standoff:
+                            neighbor_penalty += 5000.0
+                    projection_bonus = -250.0 if str(interval.get("source", "") or "") == "facade_center_projection" else 0.0
+                    score = float(distance) + center_error * 0.35 + coverage_penalty + standoff_penalty + neighbor_penalty + projection_bonus
+                    if best_score is None or score < best_score:
+                        best_interval = interval
+                        best_axis = axis_value
+                        best_distance = distance
+                        best_score = score
+                        best_standoff = float(candidate_standoff)
+                        best_meta = dict(candidate_meta)
+                        best_bounds_report = dict(bounds_report)
+                        best_interval_count = len(intervals)
+                        best_boundary_adjustment = dict(boundary_adjustment)
+            if best_interval is None or best_axis is None or best_standoff is None:
+                continue
+            pose_payload = self.route2_facade_pose_from_axis(bbox, facade, best_axis, best_standoff, z_cm)
+            if pose_yaw is not None:
+                yaw_delta = abs(self._normalize_angle_deg(float(pose_yaw) - float(pose_payload.get("yaw_deg", 0.0))))
+                if yaw_delta <= 15.0:
+                    pose_payload["yaw_deg"] = round(float(pose_yaw), 2)
+            candidates.append(
+                {
+                    **pose_payload,
+                    "label": f"{hid}_{facade}_obs",
+                    "route_point_type": "observation_point",
+                    "house_id": hid,
+                    "facade": facade,
+                    "facade_id": self.route2_facade_id(hid, facade),
+                    "axis_value": round(float(best_axis), 2),
+                    "axis_center_cm": round(float(facade_center_axis), 2),
+                    "axis_center_error_cm": round(abs(float(best_axis) - float(facade_center_axis)), 2),
+                    "standoff_cm": round(float(best_standoff), 2),
+                    **best_meta,
+                    "observation_fallback_used": str(best_meta.get("observation_standoff_mode", "")) != "facade_panorama_desired",
+                    "safe_interval_index": best_interval.get("index", 0),
+                    "safe_interval_count": best_interval_count,
+                    "safe_axis_min": round(float(best_interval.get("min", best_interval.get("axis_min", axis_min))), 2),
+                    "safe_axis_max": round(float(best_interval.get("max", best_interval.get("axis_max", axis_max))), 2),
+                    "safe_interval_source": str(best_interval.get("source", "") or ""),
+                    "corridor_mode": str(facade_info.get("mode", "default") or "default"),
+                    "corridor_gap_cm": facade_info.get("gap_cm"),
+                    "corridor_side_margin_cm": facade_info.get("side_margin_cm"),
+                    "corridor_blocking_house_id": str(facade_info.get("blocking_house_id", "") or ""),
+                    "corridor_clearance_cm": facade_info.get("clearance_cm"),
+                    "observation_blocking_house_id": "",
+                    "observation_map_bounds": best_bounds_report,
+                    "observation_boundary_adjustment": best_boundary_adjustment,
+                    "status": "planned",
+                    "distance_to_uav_cm": round(float(best_distance or 0.0), 2),
+                    "observation_selection_score": round(float(best_score or 0.0), 2),
+                }
+            )
+        candidates.sort(key=lambda item: float(item.get("observation_selection_score", item.get("distance_to_uav_cm", 0.0))))
+        return candidates
+
+    def route2_direct_observation_candidate_for_facade(self, target_house_id: str, facade: str) -> Dict[str, Any]:
+        hid = str(target_house_id or "").strip()
+        facade = str(facade or "").strip().lower()
+        if not hid or facade not in {"south", "east", "north", "west"}:
+            return {}
+        bbox = self.house_world_bbox_for_id(hid)
+        if not bbox:
+            return {}
+        pose = self.current_route_pose()
+        px = self._as_float_or_none(pose.get("x")) if pose else None
+        py = self._as_float_or_none(pose.get("y")) if pose else None
+        pose_z = self._as_float_or_none(pose.get("z")) if pose else None
+        if pose_z is not None and 80.0 <= float(pose_z) <= 900.0:
+            z_cm = float(pose_z)
+        else:
+            z_cm = min(max(self.route2_low_z_cm(), 150.0), 300.0)
+        axis_min, axis_max = self.route2_facade_axis_range(bbox, facade)
+        axis_value = self.route2_facade_center_axis(bbox, facade)
+        facade_length = abs(float(axis_max) - float(axis_min))
+        facade_depth = (
+            abs(float(bbox["max_y"]) - float(bbox["min_y"]))
+            if facade in {"south", "north"}
+            else abs(float(bbox["max_x"]) - float(bbox["min_x"]))
+        )
+        corridor_info = self.scan_corridor_standoff_by_facade(hid, bbox)
+        facade_info = corridor_info.get(facade, {}) if isinstance(corridor_info.get(facade), dict) else {}
+        desired_standoff, observation_meta = self.route2_observation_standoff_cm(
+            facade_length_cm=facade_length,
+            facade_depth_cm=facade_depth,
+            facade_info=facade_info,
+        )
+        selected_standoff = float(desired_standoff)
+        selected_meta = dict(observation_meta)
+        pose_payload: Dict[str, Any] = {}
+        blocking_house_id = ""
+        bounds_report: Dict[str, Any] = {}
+        boundary_adjustment: Dict[str, Any] = {}
+        projected_choice = self.route2_projected_observation_choice(
+            hid,
+            bbox,
+            facade,
+            axis_value,
+            z_cm,
+            desired_standoff,
+            observation_meta,
+            facade_info,
+        )
+        if projected_choice:
+            pose_payload = dict(projected_choice.get("pose", {}))
+            selected_standoff = float(projected_choice.get("standoff_cm", selected_standoff))
+            selected_meta = projected_choice.get("meta", {}) if isinstance(projected_choice.get("meta"), dict) else selected_meta
+            bounds_report = projected_choice.get("bounds_report", {}) if isinstance(projected_choice.get("bounds_report"), dict) else {}
+            boundary_adjustment = projected_choice.get("boundary_adjustment", {}) if isinstance(projected_choice.get("boundary_adjustment"), dict) else {}
+        for standoff_option in self.route2_observation_standoff_options(desired_standoff, facade_info, observation_meta):
+            if pose_payload:
+                break
+            standoff = self._as_float_or_none(standoff_option.get("standoff_cm"))
+            if standoff is None:
+                continue
+            option_meta = self.route2_observation_meta_for_standoff(
+                observation_meta,
+                facade_info,
+                float(standoff),
+                str(standoff_option.get("source", "") or "candidate"),
+            )
+            option_pose = self.route2_facade_pose_from_axis(bbox, facade, axis_value, float(standoff), z_cm)
+            option_blocking_obstacle = self.route2_observation_blocking_house(
+                hid,
+                float(option_pose["x"]),
+                float(option_pose["y"]),
+            )
+            option_blocking_house_id = str(option_blocking_obstacle.get("house_id", "") or "")
+            option_standoff = float(standoff)
+            option_adjustment: Dict[str, Any] = {}
+            if option_blocking_obstacle:
+                adjusted = self.route2_adjust_observation_to_blocking_boundary(
+                    bbox,
+                    facade,
+                    axis_value,
+                    z_cm,
+                    option_standoff,
+                    option_blocking_obstacle,
+                )
+                if adjusted:
+                    option_pose = adjusted["pose"] if isinstance(adjusted.get("pose"), dict) else option_pose
+                    option_standoff = float(adjusted.get("standoff_cm", option_standoff))
+                    option_meta = self.route2_observation_meta_for_standoff(
+                        observation_meta,
+                        facade_info,
+                        option_standoff,
+                        f"{standoff_option.get('source', '') or 'candidate'}_boundary_adjusted",
+                    )
+                    option_adjustment = adjusted.get("adjustment", {}) if isinstance(adjusted.get("adjustment"), dict) else {}
+                    option_blocking_obstacle = self.route2_observation_blocking_house(
+                        hid,
+                        float(option_pose["x"]),
+                        float(option_pose["y"]),
+                    )
+                    option_blocking_house_id = str(option_blocking_obstacle.get("house_id", "") or "")
+            option_bounds = self.route2_observation_map_bounds_report(float(option_pose["x"]), float(option_pose["y"]))
+            if not pose_payload:
+                selected_standoff = float(option_standoff)
+                selected_meta = dict(option_meta)
+                pose_payload = dict(option_pose)
+                blocking_house_id = option_blocking_house_id
+                bounds_report = dict(option_bounds)
+                boundary_adjustment = dict(option_adjustment)
+            if not option_blocking_house_id and bool(option_bounds.get("in_bounds", True)):
+                selected_standoff = float(option_standoff)
+                selected_meta = dict(option_meta)
+                pose_payload = dict(option_pose)
+                blocking_house_id = ""
+                bounds_report = dict(option_bounds)
+                boundary_adjustment = dict(option_adjustment)
+                break
+        if not pose_payload:
+            pose_payload = self.route2_facade_pose_from_axis(bbox, facade, axis_value, desired_standoff, z_cm)
+            blocking_house_id = self.route2_observation_blocking_house_id(
+                hid,
+                float(pose_payload["x"]),
+                float(pose_payload["y"]),
+            )
+            bounds_report = self.route2_observation_map_bounds_report(float(pose_payload["x"]), float(pose_payload["y"]))
+        status = "planned" if not blocking_house_id and bool(bounds_report.get("in_bounds", True)) else "blocked"
+        if px is not None and py is not None:
+            distance = math.hypot(float(pose_payload["x"]) - float(px), float(pose_payload["y"]) - float(py))
+        else:
+            distance = 0.0
+        return {
+            **pose_payload,
+            "label": f"{hid}_{facade}_obs",
+            "route_point_type": "observation_candidate",
+            "house_id": hid,
+            "facade": facade,
+            "facade_id": self.route2_facade_id(hid, facade),
+            "axis_value": round(float(axis_value), 2),
+            "axis_center_cm": round(float(axis_value), 2),
+            "axis_center_error_cm": 0.0,
+            "standoff_cm": round(float(selected_standoff), 2),
+            **selected_meta,
+            "observation_fallback_used": str(selected_meta.get("observation_standoff_mode", "")) != "facade_panorama_desired",
+            "observation_candidate_source": "direct_facade_center_fallback",
+            "safe_interval_index": 0,
+            "safe_interval_count": 0,
+            "safe_axis_min": round(float(axis_min), 2),
+            "safe_axis_max": round(float(axis_max), 2),
+            "safe_interval_source": "direct_bbox_center_no_safe_interval",
+            "corridor_mode": str(facade_info.get("mode", "default") or "default"),
+            "corridor_gap_cm": facade_info.get("gap_cm"),
+            "corridor_side_margin_cm": facade_info.get("side_margin_cm"),
+            "corridor_blocking_house_id": str(facade_info.get("blocking_house_id", "") or ""),
+            "corridor_clearance_cm": facade_info.get("clearance_cm"),
+            "observation_blocking_house_id": blocking_house_id,
+            "observation_map_bounds": bounds_report,
+            "observation_boundary_adjustment": boundary_adjustment,
+            "observation_block_reason": "non_target_house" if blocking_house_id else ("" if bounds_report.get("in_bounds", True) else "map_boundary"),
+            "status": status,
+            "distance_to_uav_cm": round(float(distance), 2),
+            "observation_selection_score": round(float(distance) + (20000.0 if status == "blocked" else 0.0), 2),
+        }
+
+    def route2_all_facade_observation_candidates(
+        self,
+        target_house_id: str,
+        *,
+        skip_completed: bool = False,
+    ) -> List[Dict[str, Any]]:
+        raw_candidates = self.route2_safe_observation_candidates(
+            target_house_id,
+            skip_completed=skip_completed,
+            facade_filter="auto",
+        )
+        by_facade: Dict[str, Dict[str, Any]] = {}
+        for candidate in raw_candidates:
+            if not isinstance(candidate, dict):
+                continue
+            facade = str(candidate.get("facade", "") or "").strip().lower()
+            if facade in {"south", "east", "north", "west"} and facade not in by_facade:
+                by_facade[facade] = candidate
+        for facade in ("south", "east", "north", "west"):
+            if facade in by_facade:
+                continue
+            fallback = self.route2_direct_observation_candidate_for_facade(target_house_id, facade)
+            if fallback:
+                by_facade[facade] = fallback
+        candidates = [by_facade[facade] for facade in ("south", "east", "north", "west") if facade in by_facade]
+        candidates.sort(key=lambda item: float(item.get("observation_selection_score", item.get("distance_to_uav_cm", 0.0))))
+        return candidates
+
+    def route2_selected_state(self) -> Dict[str, Any]:
+        state = self.llm_route2_state if isinstance(getattr(self, "llm_route2_state", None), dict) else {}
+        return state
+
+    def route2_update_state(self, **updates: Any) -> Dict[str, Any]:
+        state = dict(self.route2_selected_state())
+        state.update(updates)
+        state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self.llm_route2_state = state
+        return state
+
+    def route2_write_state_artifact(self) -> None:
+        output_dir = self.route2_state_output_dir()
+        if output_dir is None:
+            return
+        self.write_json_artifact(output_dir / "facade_v2_state.json", self.route2_selected_state())
+
+    def apply_route2_observation_plan(
+        self,
+        target_house_id: str,
+        observation: Dict[str, Any],
+        candidates: List[Dict[str, Any]],
+        *,
+        status_label: str,
+    ) -> None:
+        previous_state = self.route2_selected_state()
+        previous_target = str(previous_state.get("target_house_id", "") or "")
+        current_output_dir = self.route2_state_output_dir() if previous_target == str(target_house_id or "") else None
+        output_dir = current_output_dir or self.make_route2_facade_output_dir(target_house_id)
+        facade = str(observation.get("facade", "") or "")
+        facade_dir = self.route2_facade_dir(output_dir, target_house_id, facade)
+        state = {
+            "mode": "facade_by_facade_vlm_v2",
+            "target_house_id": target_house_id,
+            "output_dir": str(output_dir),
+            "facade": facade,
+            "facade_id": self.route2_facade_id(target_house_id, facade),
+            "floor_height_m": self.route2_floor_height_m(),
+            "default_floors": self.route2_default_floors(),
+            "low_z_cm": self.route2_low_z_cm(),
+            "z_step_cm": self.route2_z_step_cm(),
+            "density_mode": self.route2_density_mode(),
+            "observation_point": observation,
+            "candidate_observation_points": candidates,
+            "facade_analysis": {},
+            "facade_search_plan": {},
+            "facade_scan_points": [],
+            "facade_capture_rows": [],
+            "validation_report": {},
+            "completed_facades": sorted(getattr(self, "llm_route2_completed_facades", set()) or []),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.llm_route2_state = state
+        self.llm_route2_facade_var.set(f"Facade: {facade or 'n/a'}")
+        selected_var = getattr(self, "llm_route2_selected_facade_var", None)
+        if selected_var is not None and facade:
+            try:
+                selected_var.set(facade)
+            except tk.TclError:
+                pass
+        self.write_json_artifact(facade_dir / "facade_observation_point.json", observation)
+        self.route2_write_state_artifact()
+        self.llm_route2_status_var.set(
+            f"LLM Route V2: {status_label} facade={facade} obs=({observation.get('x')},{observation.get('y')},{observation.get('z')})"
+        )
+        self.refresh_route2_preview()
+        self.refresh_llm_route2_map()
+
+    def on_route2_plan_nearest_facade(self) -> None:
+        target_house_id = self.selected_route_target_house_id()
+        if not target_house_id:
+            self.llm_route2_status_var.set("LLM Route V2: select a target house first.")
+            return
+        candidates = self.route2_all_facade_observation_candidates(target_house_id, skip_completed=False)
+        if not candidates:
+            self.llm_route2_status_var.set("LLM Route V2: no safe facade observation point.")
+            return
+        movable_candidates = [
+            candidate for candidate in candidates
+            if (
+                isinstance(candidate, dict)
+                and str(candidate.get("status", "") or "") != "blocked"
+                and not str(candidate.get("observation_blocking_house_id", "") or "")
+            )
+        ]
+        if not movable_candidates:
+            self.route2_update_state(
+                mode="facade_by_facade_vlm_v2",
+                target_house_id=target_house_id,
+                candidate_observation_points=candidates,
+                facade="",
+                observation_point={},
+            )
+            self.llm_route2_status_var.set("LLM Route V2: all facade observation points are blocked by house safety validation.")
+            self.refresh_route2_preview()
+            self.refresh_llm_route2_map()
+            return
+        selected_observation = dict(movable_candidates[0] if movable_candidates else candidates[0])
+        self.apply_route2_observation_plan(
+            target_house_id,
+            selected_observation,
+            candidates,
+            status_label=f"4-facade candidates={len(candidates)} nearest",
+        )
+
+    def on_route2_plan_selected_facade(self) -> None:
+        target_house_id = self.selected_route_target_house_id()
+        if not target_house_id:
+            self.llm_route2_status_var.set("LLM Route V2: select a target house first.")
+            return
+        selected_var = getattr(self, "llm_route2_selected_facade_var", None)
+        selected = str(selected_var.get() if selected_var is not None else "").strip().lower()
+        if not selected or selected == "auto":
+            self.on_route2_plan_nearest_facade()
+            return
+        all_candidates = self.route2_all_facade_observation_candidates(target_house_id, skip_completed=False)
+        selected_candidates = [
+            candidate for candidate in all_candidates
+            if isinstance(candidate, dict) and str(candidate.get("facade", "") or "").strip().lower() == selected
+        ]
+        if not selected_candidates:
+            self.llm_route2_status_var.set(f"LLM Route V2: no safe observation point for {selected}.")
+            return
+        selected_observation = dict(selected_candidates[0])
+        blocking_house_id = str(selected_observation.get("observation_blocking_house_id", "") or "")
+        if str(selected_observation.get("status", "") or "") == "blocked" or blocking_house_id:
+            self.route2_update_state(
+                mode="facade_by_facade_vlm_v2",
+                target_house_id=target_house_id,
+                candidate_observation_points=all_candidates,
+                facade=selected,
+                observation_point={},
+            )
+            blocked_by = f" by {blocking_house_id}" if blocking_house_id else ""
+            self.llm_route2_status_var.set(f"LLM Route V2: {selected} observation blocked{blocked_by}; not selected.")
+            self.refresh_route2_preview()
+            self.refresh_llm_route2_map()
+            return
+        self.apply_route2_observation_plan(
+            target_house_id,
+            selected_observation,
+            all_candidates,
+            status_label="selected",
+        )
+
+    def on_route2_clear(self) -> None:
+        self.llm_route2_state = {}
+        self.llm_route2_completed_facades = set()
+        self.llm_route2_facade_var.set("Facade: n/a")
+        selected_var = getattr(self, "llm_route2_selected_facade_var", None)
+        if selected_var is not None:
+            try:
+                selected_var.set("auto")
+            except tk.TclError:
+                pass
+        self.llm_route2_facade_status_var.set("Processed: no facade")
+        self.llm_route2_status_var.set("LLM Route V2: cleared.")
+        self.refresh_route2_preview()
+        self.refresh_llm_route2_map()
+
+    def on_route2_stop(self) -> None:
+        self.route_stop_event.set()
+        self.llm_route2_status_var.set("LLM Route V2: stop requested.")
+
+    def on_route2_next_facade(self) -> None:
+        state = self.route2_selected_state()
+        facade = str(state.get("facade", "") or "")
+        if facade:
+            self.llm_route2_completed_facades.add(facade)
+        self.on_route2_plan_nearest_facade()
+
+    def route2_read_image_b64(self, image_path: Path) -> str:
+        if not image_path.exists():
+            return ""
+        return base64.b64encode(image_path.read_bytes()).decode("ascii")
+
+    def route2_fallback_facade_analysis(self, reason: str = "") -> Dict[str, Any]:
+        state = self.route2_selected_state()
+        facade = str(state.get("facade", "") or "")
+        floors = self.route2_default_floors()
+        bands = ["single_300cm"] if floors <= 2 else ["low_ground_250cm", "upper_floor_600cm"]
+        return {
+            "facade_id": str(state.get("facade_id", "") or ""),
+            "house_id": str(state.get("target_house_id", "") or ""),
+            "facade": facade,
+            "floor_count_estimate": floors,
+            "semantic_complexity": "medium",
+            "terrace_or_awning_risk": "unknown",
+            "target_score": "medium",
+            "detected_cues": [],
+            "recommended_translation_span": "medium",
+            "recommended_scan_density": "medium",
+            "recommended_height_bands": bands,
+            "reason": reason or "Fallback facade analysis: no usable VLM result.",
+            "planner_source": "fallback_no_or_failed_vlm",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def route2_normalize_target_score(self, value: Any, fallback: str = "medium") -> str:
+        number = self._as_float_or_none(value)
+        if number is not None:
+            if float(number) >= 0.67:
+                return "high"
+            if float(number) >= 0.34:
+                return "medium"
+            return "low"
+        text = str(value or fallback).strip().lower()
+        aliases = {
+            "small": "high",
+            "dense": "high",
+            "important": "high",
+            "large": "low",
+            "sparse": "low",
+            "minor": "low",
+        }
+        text = aliases.get(text, text)
+        return text if text in {"low", "medium", "high"} else fallback
+
+    def route2_normalize_translation_span(self, value: Any, *, target_score: str, complexity: str) -> str:
+        text = str(value or "").strip().lower()
+        aliases = {
+            "high": "small",
+            "dense": "small",
+            "low": "large",
+            "sparse": "large",
+            "normal": "medium",
+            "mid": "medium",
+        }
+        text = aliases.get(text, text)
+        if text in {"small", "medium", "large"}:
+            return text
+        if str(target_score) == "high" or str(complexity) == "high":
+            return "small"
+        if str(target_score) == "low" and str(complexity) == "low":
+            return "large"
+        return "medium"
+
+    def route2_normalize_facade_analysis(self, parsed: Dict[str, Any], fallback_reason: str = "") -> Dict[str, Any]:
+        if not isinstance(parsed, dict):
+            parsed = {}
+        fallback = self.route2_fallback_facade_analysis(fallback_reason)
+        floors_raw = self._as_float_or_none(parsed.get("floor_count_estimate", parsed.get("floors")))
+        floors = int(round(float(floors_raw))) if floors_raw is not None else int(fallback["floor_count_estimate"])
+        floors = max(1, min(int(LLM_ROUTE2_MAX_FLOORS), floors))
+        complexity = str(parsed.get("semantic_complexity", fallback["semantic_complexity"]) or "").strip().lower()
+        if complexity not in {"low", "medium", "high"}:
+            complexity = "medium"
+        density = str(parsed.get("recommended_scan_density", complexity) or "").strip().lower()
+        if density not in {"low", "medium", "high"}:
+            density = complexity
+        target_score = self.route2_normalize_target_score(parsed.get("target_score", parsed.get("target_priority")), "medium")
+        span = self.route2_normalize_translation_span(
+            parsed.get("recommended_translation_span", parsed.get("translation_span", parsed.get("scan_spacing_class"))),
+            target_score=target_score,
+            complexity=complexity,
+        )
+        terrace = str(parsed.get("terrace_or_awning_risk", parsed.get("terrace_awning_risk", "unknown")) or "unknown").strip().lower()
+        if terrace not in {"none", "low", "medium", "high", "unknown", "yes", "no"}:
+            terrace = "unknown"
+        raw_cues = parsed.get("detected_cues", [])
+        cues: List[Dict[str, Any]] = []
+        if isinstance(raw_cues, list):
+            for item in raw_cues[:16]:
+                if not isinstance(item, dict):
+                    continue
+                region = str(item.get("region", "") or item.get("semantic_region", "") or "").strip().lower()
+                horizontal = str(item.get("horizontal", "") or "").strip().lower()
+                vertical = str(item.get("vertical", "") or "").strip().lower()
+                if not region and horizontal and vertical:
+                    region = f"{vertical}-{horizontal}"
+                if not region:
+                    region = "mid-center"
+                cues.append(
+                    {
+                        "type": str(item.get("type", item.get("cue_type", "cue")) or "cue"),
+                        "region": region,
+                        "confidence": self._as_float_or_none(item.get("confidence")) if self._as_float_or_none(item.get("confidence")) is not None else None,
+                        "reason": str(item.get("reason", "") or ""),
+                    }
+                )
+        bands = parsed.get("recommended_height_bands", [])
+        if not isinstance(bands, list) or not bands:
+            bands = ["single_300cm"] if floors <= 2 else ["low_ground_250cm", "upper_floor_600cm"]
+        normalized = dict(fallback)
+        normalized.update(
+            {
+                "floor_count_estimate": floors,
+                "semantic_complexity": complexity,
+                "terrace_or_awning_risk": terrace,
+                "target_score": target_score,
+                "detected_cues": cues,
+                "recommended_scan_density": density,
+                "recommended_translation_span": span,
+                "recommended_height_bands": [str(item) for item in bands[: int(LLM_ROUTE2_MAX_FLOORS)]],
+                "reason": str(parsed.get("reason", fallback["reason"]) or fallback["reason"]),
+                "planner_source": "vlm" if parsed else fallback["planner_source"],
+            }
+        )
+        return normalized
+
+    def route2_build_facade_vlm_prompt(self) -> Tuple[str, str]:
+        state = self.route2_selected_state()
+        house_id = str(state.get("target_house_id", "") or "")
+        facade = str(state.get("facade", "") or "")
+        observation = state.get("observation_point", {}) if isinstance(state.get("observation_point"), dict) else {}
+        bbox = self.house_world_bbox_for_id(house_id)
+        context = {
+            "house_id": house_id,
+            "facade": facade,
+            "bbox_world_cm": bbox,
+            "observation_pose": observation,
+            "floor_height_m": self.route2_floor_height_m(),
+            "default_floors": self.route2_default_floors(),
+            "expected_schema": LLM_ROUTE2_FACADE_ANALYSIS_SCHEMA,
+        }
+        system_prompt = (
+            "You analyze one facade RGB image for a UAV house entrance search planner. "
+            "Return only compact JSON. Estimate visible floor count and whether terrace/awning/porch roof "
+            "may block the view. Score facade entrance-search target richness as low/medium/high, then choose "
+            "small/medium/large lateral translation span for later scan points."
+        )
+        user_prompt = (
+            "Analyze this facade image and return JSON with keys: "
+            "floor_count_estimate, semantic_complexity(low|medium|high), terrace_or_awning_risk, "
+            "target_score(low|medium|high or 0-1), detected_cues, recommended_translation_span(small|medium|large), "
+            "recommended_height_bands, reason. For ordinary one/two-floor houses prefer one search band near 300cm; "
+            "for three-floor/tall facades prefer two bands near 250cm and 600cm.\n"
+            f"Context:\n{json.dumps(context, indent=2, ensure_ascii=False)}"
+        )
+        return system_prompt, user_prompt
+
+    def route2_facade_paths(self) -> Tuple[Optional[Path], Optional[Path], str, str]:
+        state = self.route2_selected_state()
+        house_id = str(state.get("target_house_id", "") or "")
+        facade = str(state.get("facade", "") or "")
+        output_dir = self.route2_state_output_dir()
+        if not house_id or not facade or output_dir is None:
+            return None, None, house_id, facade
+        facade_dir = self.route2_facade_dir(output_dir, house_id, facade)
+        return output_dir, facade_dir, house_id, facade
+
+    def on_route2_move_to_observation(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        state = self.route2_selected_state()
+        observation = state.get("observation_point", {}) if isinstance(state.get("observation_point"), dict) else {}
+        if not observation:
+            self.on_route2_plan_nearest_facade()
+            state = self.route2_selected_state()
+            observation = state.get("observation_point", {}) if isinstance(state.get("observation_point"), dict) else {}
+        if not observation:
+            self.llm_route2_status_var.set("LLM Route V2: plan nearest facade first.")
+            return
+        if str(observation.get("status", "") or "") == "blocked":
+            self.llm_route2_status_var.set("LLM Route V2: selected observation is blocked; choose another facade.")
+            return
+        if self.route_thread is not None and self.route_thread.is_alive():
+            self.llm_route2_status_var.set("LLM Route V2: wait for current worker.")
+            return
+        self.route_stop_event.clear()
+        self.route_thread = threading.Thread(target=lambda: self.route2_move_to_observation_worker(session), daemon=True)
+        self.route_thread.start()
+
+    def route2_move_to_observation_worker(self, session: flight.DroneFlightSession) -> None:
+        state = self.route2_selected_state()
+        observation = state.get("observation_point", {}) if isinstance(state.get("observation_point"), dict) else {}
+        house_id = str(state.get("target_house_id", "") or observation.get("house_id", "") or "")
+        facade = str(state.get("facade", "") or observation.get("facade", "") or "")
+        if not observation:
+            self.root.after(0, lambda: self.llm_route2_status_var.set("LLM Route V2: missing observation point."))
+            return
+        planned_pose = {
+            "x": float(observation.get("x", 0.0)),
+            "y": float(observation.get("y", 0.0)),
+            "z": float(observation.get("z", 300.0)),
+            "yaw": float(observation.get("yaw_deg", observation.get("yaw", 0.0))),
+        }
+        self.root.after(
+            0,
+            lambda: self.llm_route2_status_var.set(
+                f"LLM Route V2: moving to obs {house_id}_{facade} ({planned_pose['x']:.1f},{planned_pose['y']:.1f},{planned_pose['z']:.1f})"
+            ),
+        )
+        result = self.safe("Route V2 move to observation", lambda: session.set_pose(planned_pose))
+        if isinstance(result, dict):
+            self.root.after(0, lambda r=result: self.apply_state(r))
+            move_payload = {
+                "house_id": house_id,
+                "facade": facade,
+                "planned_pose": planned_pose,
+                "result_pose": result.get("pose", {}) if isinstance(result.get("pose"), dict) else {},
+                "moved_at": datetime.now().isoformat(timespec="milliseconds"),
+            }
+            self.route2_update_state(last_observation_move=move_payload)
+            self.route2_write_state_artifact()
+            self.root.after(0, self.refresh_route2_preview)
+            self.root.after(0, self.refresh_llm_route2_map)
+            self.root.after(0, lambda: self.llm_route2_status_var.set(f"LLM Route V2: reached obs {house_id}_{facade}."))
+        else:
+            self.root.after(0, lambda: self.llm_route2_status_var.set("LLM Route V2: move to obs failed."))
+
+    def on_route2_capture_facade_rgb(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        state = self.route2_selected_state()
+        observation = state.get("observation_point", {}) if isinstance(state.get("observation_point"), dict) else {}
+        if not observation:
+            self.on_route2_plan_nearest_facade()
+            state = self.route2_selected_state()
+            observation = state.get("observation_point", {}) if isinstance(state.get("observation_point"), dict) else {}
+        if not observation:
+            self.llm_route2_status_var.set("LLM Route V2: plan nearest facade first.")
+            return
+        if str(observation.get("status", "") or "") == "blocked":
+            self.llm_route2_status_var.set("LLM Route V2: selected observation is blocked; choose another facade.")
+            return
+        if self.route_thread is not None and self.route_thread.is_alive():
+            self.llm_route2_status_var.set("LLM Route V2: wait for current worker.")
+            return
+        self.sync_capture_options_to_session(session)
+        self.route_stop_event.clear()
+        self.route_thread = threading.Thread(target=lambda: self.route2_capture_facade_rgb_worker(session), daemon=True)
+        self.route_thread.start()
+
+    def route2_capture_facade_rgb_worker(self, session: flight.DroneFlightSession) -> None:
+        output_dir, facade_dir, house_id, facade = self.route2_facade_paths()
+        if output_dir is None or facade_dir is None:
+            self.root.after(0, lambda: self.llm_route2_status_var.set("LLM Route V2: missing facade output directory."))
+            return
+        state = self.route2_selected_state()
+        observation = state.get("observation_point", {}) if isinstance(state.get("observation_point"), dict) else {}
+        planned_pose = {
+            "x": float(observation.get("x", 0.0)),
+            "y": float(observation.get("y", 0.0)),
+            "z": float(observation.get("z", 600.0)),
+            "yaw": float(observation.get("yaw_deg", observation.get("yaw", 0.0))),
+        }
+        self.root.after(0, lambda: self.llm_route2_status_var.set(f"LLM Route V2: moving to {house_id}_{facade} observation."))
+        result = self.safe("Route V2 observation set pose", lambda: session.set_pose(planned_pose))
+        if isinstance(result, dict):
+            self.root.after(0, lambda r=result: self.apply_state(r))
+        if self.route_stop_event.wait(0.3):
+            self.root.after(0, lambda: self.llm_route2_status_var.set("LLM Route V2: stopped before RGB capture."))
+            return
+        action_detail = dict(self.build_stream_action_detail())
+        action_detail.update(
+            {
+                "source": "llm_route_v2_facade_observation",
+                "house_id": house_id,
+                "facade": facade,
+                "facade_id": self.route2_facade_id(house_id, facade),
+                "planned_pose": planned_pose,
+            }
+        )
+        frame_index = self.route2_next_frame_index(output_dir)
+        capture_result = self.safe(
+            "Route V2 coarse RGB/LiDAR capture",
+            lambda: session.capture_lidar_stream_frame(output_dir, frame_index, action_detail=action_detail),
+        )
+        if not isinstance(capture_result, dict):
+            self.root.after(0, lambda: self.llm_route2_status_var.set("LLM Route V2: coarse RGB capture failed."))
+            return
+        coarse_rgb_path = facade_dir / "coarse_rgb.png"
+        rgb_path = self.route2_candidate_path(capture_result.get("rgb_path"))
+        if rgb_path is not None and rgb_path.exists() and rgb_path.is_file():
+            try:
+                if rgb_path.resolve() != coarse_rgb_path.resolve():
+                    coarse_rgb_path.write_bytes(rgb_path.read_bytes())
+            except Exception:
+                coarse_rgb_path.write_bytes(rgb_path.read_bytes())
+        coarse_rgb_value = str(coarse_rgb_path if coarse_rgb_path.exists() else (rgb_path or ""))
+        point_cloud_path = self.route2_candidate_path(capture_result.get("point_cloud_world_standard_m_ply_path"))
+        if point_cloud_path is not None and point_cloud_path.exists() and point_cloud_path.is_file():
+            (facade_dir / "coarse_lidar_preview.ply").write_bytes(point_cloud_path.read_bytes())
+        capture_payload = {
+            "capture_kind": "facade_coarse_observation",
+            "house_id": house_id,
+            "facade": facade,
+            "planned_pose": planned_pose,
+            "capture_result": capture_result,
+            "coarse_rgb_path": coarse_rgb_value,
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        self.write_json_artifact(facade_dir / "coarse_capture.json", capture_payload)
+        capture_row = {
+            "frame_index": int(capture_result.get("frame_index", frame_index)),
+            "capture_time": capture_result.get("capture_time", ""),
+            "capture_kind": "facade_coarse_observation",
+            "scan_id": f"{house_id}_{facade}_coarse_observation",
+            "house_id": house_id,
+            "facade": facade,
+            "facade_id": self.route2_facade_id(house_id, facade),
+            "planned_pose": planned_pose,
+            "pose": capture_result.get("pose", {}),
+            "commanded_pose": capture_result.get("commanded_pose", {}),
+            "actual_pose": capture_result.get("actual_pose", {}),
+            "pose_error": capture_result.get("pose_error", {}),
+            "capture_dir": capture_result.get("capture_dir", ""),
+            "rgb_path": capture_result.get("rgb_path", ""),
+            "point_cloud_world_standard_m_npy_path": capture_result.get("point_cloud_world_standard_m_npy_path", ""),
+            "point_cloud_world_standard_m_ply_path": capture_result.get("point_cloud_world_standard_m_ply_path", ""),
+            "point_cloud_preview_path": capture_result.get("point_cloud_preview_path", ""),
+            "point_count": int(capture_result.get("point_count", 0) or 0),
+            "action_detail": action_detail,
+        }
+        self.append_jsonl(output_dir / "lidar_capture_log.jsonl", capture_row)
+        self.append_jsonl(facade_dir / "coarse_lidar_capture_log.jsonl", capture_row)
+        self.route2_write_lidar_summary(output_dir, running=True)
+        self.route2_update_state(coarse_capture=capture_payload, coarse_rgb_path=coarse_rgb_value)
+        self.route2_write_state_artifact()
+        self.root.after(0, self.refresh_route2_preview)
+        self.root.after(0, self.refresh_llm_route2_map)
+        self.root.after(0, lambda: self.llm_route2_status_var.set(f"LLM Route V2: coarse RGB saved -> {coarse_rgb_path}"))
+
+    def on_route2_analyze_facade_vlm(self) -> None:
+        if self.route_thread is not None and self.route_thread.is_alive():
+            self.llm_route2_status_var.set("LLM Route V2: wait for current worker.")
+            return
+        if not self.route2_selected_state().get("observation_point"):
+            self.llm_route2_status_var.set("LLM Route V2: plan/capture facade first.")
+            return
+        self.route_thread = threading.Thread(target=self.route2_analyze_facade_vlm_worker, daemon=True)
+        self.route_thread.start()
+
+    def route2_analyze_facade_vlm_worker(self) -> None:
+        output_dir, facade_dir, house_id, facade = self.route2_facade_paths()
+        if output_dir is None or facade_dir is None:
+            self.root.after(0, lambda: self.llm_route2_status_var.set("LLM Route V2: missing facade output directory."))
+            return
+        image_path = self.route2_current_rgb_path()
+        analysis: Dict[str, Any]
+        response_payload: Dict[str, Any] = {}
+        self.root.after(0, lambda: self.llm_route2_status_var.set(f"LLM Route V2: analyzing {house_id}_{facade} with VLM..."))
+        try:
+            if image_path is None:
+                raise RuntimeError("missing coarse RGB image")
+            image_b64 = self.route2_read_image_b64(image_path)
+            if not image_b64:
+                raise RuntimeError("missing coarse RGB image")
+            if not self.effective_llm_api_key():
+                raise RuntimeError("missing API key")
+            system_prompt, user_prompt = self.route2_build_facade_vlm_prompt()
+            response_payload = self.call_configured_llm_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_output_tokens=900,
+                json_schema=LLM_ROUTE2_FACADE_ANALYSIS_SCHEMA,
+                image_b64=image_b64,
+            )
+            parsed = extract_json_object(str(response_payload.get("raw_text", "") or ""))
+            analysis = self.route2_normalize_facade_analysis(parsed, "")
+            response_payload["parsed"] = parsed
+        except Exception as exc:
+            LOGGER.warning("Route V2 facade VLM analysis fallback: %s", exc)
+            analysis = self.route2_fallback_facade_analysis(str(exc))
+            response_payload = {"error": str(exc), "fallback_used": True}
+        self.write_json_artifact(facade_dir / "llm_facade_response.json", response_payload)
+        self.write_json_artifact(facade_dir / "llm_facade_analysis.json", analysis)
+        self.route2_update_state(facade_analysis=analysis)
+        self.route2_write_state_artifact()
+        self.root.after(0, self.refresh_route2_preview)
+        self.root.after(
+            0,
+            lambda a=analysis: self.llm_route2_status_var.set(
+                f"LLM Route V2: analysis {a.get('planner_source')} floors={a.get('floor_count_estimate')} complexity={a.get('semantic_complexity')}"
+            ),
+        )
+
+    def route2_spacing_from_analysis(self, analysis: Dict[str, Any]) -> float:
+        state = self.route2_selected_state()
+        house_id = str(state.get("target_house_id", "") or analysis.get("house_id", "") or "")
+        facade = str(state.get("facade", "") or analysis.get("facade", "") or "")
+        density = self.route2_density_rule(house_id, facade, analysis).get("density", "medium")
+        return float(LLM_ROUTE2_RULE_DENSITY_SPACING_CM.get(str(density), LLM_ROUTE2_RULE_DENSITY_SPACING_CM["medium"]))
+
+    def route2_translation_span_from_analysis(self, analysis: Dict[str, Any]) -> str:
+        density = self.route2_density_rule(
+            str(analysis.get("house_id", "") or self.route2_selected_state().get("target_house_id", "") or ""),
+            str(analysis.get("facade", "") or self.route2_selected_state().get("facade", "") or ""),
+            analysis,
+        ).get("density", "medium")
+        return {"dense": "small", "medium": "medium", "sparse": "large"}.get(str(density), "medium")
+
+    def route2_density_rank(self, density: str) -> int:
+        return {"sparse": 0, "medium": 1, "dense": 2}.get(str(density or "").strip().lower(), 1)
+
+    def route2_density_from_rank(self, rank: int) -> str:
+        if int(rank) >= 2:
+            return "dense"
+        if int(rank) <= 0:
+            return "sparse"
+        return "medium"
+
+    def route2_default_facade_density(self, house_id: str, facade: str) -> str:
+        hid = str(house_id or "").strip()
+        facade_key = str(facade or "").strip().lower()
+        mapping = LLM_ROUTE2_HOUSE_FACADE_FALLBACK_DENSITY.get(hid, {})
+        density = str(mapping.get(facade_key, "") or "").strip().lower()
+        return density if density in {"dense", "medium", "sparse"} else "medium"
+
+    def route2_is_entry_cue(self, cue: Dict[str, Any]) -> bool:
+        text = " ".join(
+            str(cue.get(key, "") or "").lower()
+            for key in ("type", "cue_type", "region", "semantic_region", "reason")
+            if isinstance(cue, dict)
+        )
+        return any(keyword in text for keyword in ("door", "entrance", "entry", "gate", "porch", "awning"))
+
+    def route2_has_entry_cue(self, analysis: Dict[str, Any]) -> bool:
+        cues = analysis.get("detected_cues", []) if isinstance(analysis.get("detected_cues"), list) else []
+        if any(isinstance(cue, dict) and self.route2_is_entry_cue(cue) for cue in cues):
+            return True
+        text = " ".join(
+            str(analysis.get(key, "") or "").lower()
+            for key in ("reason", "terrace_or_awning_risk")
+        )
+        return any(keyword in text for keyword in ("door", "entrance", "entry", "gate", "porch", "awning"))
+
+    def route2_density_rule(self, house_id: str, facade: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
+        mode = self.route2_density_mode()
+        if mode != "auto":
+            density = {"high": "dense", "medium": "medium", "low": "sparse"}.get(mode, "medium")
+            return {
+                "density": density,
+                "source": "manual_density_mode",
+                "reason": f"Density mode override: {mode}",
+            }
+        default_density = self.route2_default_facade_density(house_id, facade)
+        planner_source = str(analysis.get("planner_source", "") or "").lower()
+        if planner_source.startswith("fallback") or not analysis:
+            return {
+                "density": default_density,
+                "source": "house_facade_fallback",
+                "reason": f"Fallback density for house={house_id} facade={facade}",
+            }
+        target_score = self.route2_normalize_target_score(analysis.get("target_score"), "medium")
+        recommended_density = str(analysis.get("recommended_scan_density", "") or "").strip().lower()
+        if recommended_density not in {"low", "medium", "high"}:
+            recommended_density = str(analysis.get("semantic_complexity", "medium") or "medium").strip().lower()
+        recommended_density = recommended_density if recommended_density in {"low", "medium", "high"} else "medium"
+        has_entry_cue = self.route2_has_entry_cue(analysis)
+        density = default_density
+        if recommended_density == "high" or target_score == "high" or (has_entry_cue and target_score in {"medium", "high"}):
+            density = "dense"
+        elif recommended_density == "low" and target_score == "low" and not has_entry_cue:
+            density = "sparse"
+        elif recommended_density == "medium" or target_score == "medium":
+            density = self.route2_density_from_rank(max(self.route2_density_rank(default_density), 1))
+        return {
+            "density": density,
+            "source": "vlm_semantics_rule_fusion",
+            "default_density": default_density,
+            "recommended_scan_density": recommended_density,
+            "target_score": target_score,
+            "entry_cue": bool(has_entry_cue),
+            "reason": "Final scan density is rule-clamped from facade role, VLM density, target score, and entry cues.",
+        }
+
+    def route2_detail_scan_preferred_standoff_cm(self, analysis: Dict[str, Any]) -> Tuple[float, str]:
+        span = self.route2_translation_span_from_analysis(analysis)
+        max_range = float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM))
+        min_range = float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM))
+        ratio = float(LLM_ROUTE2_SCAN_STANDOFF_RATIO.get(span, LLM_ROUTE2_SCAN_STANDOFF_RATIO["medium"]))
+        upper = min(float(LLM_ROUTE2_SCAN_STANDOFF_MAX_CM), max(min_range + 80.0, max_range - 100.0))
+        lower = max(float(LLM_ROUTE2_SCAN_STANDOFF_MIN_CM), min_range + 80.0)
+        preferred = min(max(lower, max_range * ratio), upper)
+        return float(preferred), span
+
+    def route2_scan_standoff_candidates(self, preferred: float, span: str) -> List[float]:
+        if span == "large":
+            raw = [preferred, preferred + 180.0, preferred + 320.0, preferred - 140.0, preferred - 280.0]
+        elif span == "small":
+            raw = [preferred, preferred - 100.0, preferred + 120.0, preferred - 200.0, preferred + 240.0]
+        else:
+            raw = [preferred, preferred + 140.0, preferred - 140.0, preferred + 280.0, preferred - 260.0]
+        min_range = float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM))
+        max_range = float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM))
+        lower = max(float(LLM_ROUTE2_SCAN_STANDOFF_MIN_CM), min_range + 80.0)
+        upper = min(float(LLM_ROUTE2_SCAN_STANDOFF_MAX_CM), max(lower, max_range - 100.0))
+        values: List[float] = []
+        for value in raw:
+            clipped = round(min(max(lower, float(value)), upper), 2)
+            if all(abs(clipped - existing) > 1.0 for existing in values):
+                values.append(clipped)
+        return values
+
+    def route2_safe_scan_intervals_for_standoff(
+        self,
+        house_id: str,
+        facade: str,
+        bbox: Dict[str, Any],
+        standoff: float,
+    ) -> List[Dict[str, Any]]:
+        corridor_info = self.scan_corridor_standoff_by_facade(house_id, bbox)
+        facade_info = corridor_info.get(facade, {}) if isinstance(corridor_info.get(facade), dict) else {}
+        corridor_info[facade] = {**facade_info, "standoff_cm": float(standoff), "safe": True}
+        safe = self.scan_safe_intervals_by_facade(house_id, bbox, corridor_info)
+        return safe.get(facade, []) if isinstance(safe.get(facade), list) else []
+
+    def route2_select_scan_geometry(
+        self,
+        house_id: str,
+        facade: str,
+        bbox: Dict[str, Any],
+        analysis: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        preferred, span = self.route2_detail_scan_preferred_standoff_cm(analysis)
+        best: Dict[str, Any] = {}
+        candidates = self.route2_scan_standoff_candidates(preferred, span)
+        observation = self.route2_selected_state().get("observation_point", {})
+        if isinstance(observation, dict) and str(observation.get("facade", "") or "").strip().lower() == str(facade).strip().lower():
+            observed_standoff = self._as_float_or_none(observation.get("standoff_cm"))
+            if observed_standoff is not None:
+                min_range = float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM))
+                max_range = float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM))
+                if min_range + 40.0 <= float(observed_standoff) <= max_range - 40.0:
+                    if all(abs(float(observed_standoff) - value) > 1.0 for value in candidates):
+                        candidates.append(round(float(observed_standoff), 2))
+        for standoff in candidates:
+            intervals = self.route2_safe_scan_intervals_for_standoff(house_id, facade, bbox, standoff)
+            if not intervals:
+                continue
+            safe_length = sum(
+                max(0.0, float(item.get("max", 0.0)) - float(item.get("min", 0.0)))
+                for item in intervals
+                if isinstance(item, dict)
+            )
+            best = {
+                "standoff_cm": round(float(standoff), 2),
+                "preferred_standoff_cm": round(float(preferred), 2),
+                "translation_span": span,
+                "safe_intervals": intervals,
+                "safe_interval_count": len(intervals),
+                "safe_axis_total_cm": round(float(safe_length), 2),
+                "scan_standoff_mode": (
+                    "observation_tight_corridor_detail_scan"
+                    if isinstance(observation, dict)
+                    and abs(float(standoff) - float(observation.get("standoff_cm", float("nan")))) <= 1.0
+                    else "lidar_range_detail_scan"
+                ),
+            }
+            break
+        if not best:
+            best = {
+                "standoff_cm": round(float(preferred), 2),
+                "preferred_standoff_cm": round(float(preferred), 2),
+                "translation_span": span,
+                "safe_intervals": [],
+                "safe_interval_count": 0,
+                "safe_axis_total_cm": 0.0,
+                "scan_standoff_mode": "no_safe_interval_for_lidar_range_detail_scan",
+            }
+        return best
+
+    def route2_height_bands_from_analysis(self, analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        floors = self._as_float_or_none(analysis.get("floor_count_estimate"))
+        floor_count = int(round(float(floors))) if floors is not None else self.route2_default_floors()
+        floor_count = max(1, min(int(LLM_ROUTE2_MAX_FLOORS), floor_count))
+        low_z = self.route2_low_z_cm()
+        z_step = self.route2_z_step_cm()
+        bands: List[Dict[str, Any]] = []
+        if floor_count <= 2:
+            z_cm = low_z + float(LLM_ROUTE2_SINGLE_BAND_Z_OFFSET_CM)
+            return [
+                {
+                    "height_band": "single_300cm",
+                    "floor_index": 1,
+                    "z_cm": round(float(z_cm), 2),
+                    "floor_height_m": self.route2_floor_height_m(),
+                    "floor_count_estimate": floor_count,
+                    "search_layer_role": "one_pass_for_one_or_two_floor_facade",
+                }
+            ]
+        band_specs = [
+            ("low_ground_250cm", 1, low_z, "low_ground_floor_band"),
+            ("upper_floor_600cm", 2, low_z + z_step, "upper_floor_band"),
+        ]
+        for name, floor_index, z_cm, role in band_specs:
+            bands.append(
+                {
+                    "height_band": name,
+                    "floor_index": floor_index,
+                    "z_cm": round(float(z_cm), 2),
+                    "floor_height_m": self.route2_floor_height_m(),
+                    "floor_count_estimate": floor_count,
+                    "search_layer_role": role,
+                }
+            )
+        return bands
+
+    def route2_axis_value_for_region(self, observation: Dict[str, Any], region: str) -> float:
+        axis_min = float(observation.get("safe_axis_min", observation.get("axis_value", 0.0)))
+        axis_max = float(observation.get("safe_axis_max", observation.get("axis_value", 0.0)))
+        region_l = str(region or "").lower()
+        if "left" in region_l:
+            ratio = 1.0 / 6.0
+        elif "right" in region_l:
+            ratio = 5.0 / 6.0
+        else:
+            ratio = 0.5
+        return axis_min + (axis_max - axis_min) * ratio
+
+    def route2_axis_value_for_region_intervals(
+        self,
+        intervals: List[Dict[str, Any]],
+        region: str,
+    ) -> Tuple[float, Dict[str, Any]]:
+        valid = [
+            item for item in intervals
+            if isinstance(item, dict)
+            and self._as_float_or_none(item.get("min")) is not None
+            and self._as_float_or_none(item.get("max")) is not None
+        ]
+        if not valid:
+            return 0.0, {"min": 0.0, "max": 0.0, "index": 0}
+        axis_min = min(float(item.get("min")) for item in valid)
+        axis_max = max(float(item.get("max")) for item in valid)
+        region_l = str(region or "").lower()
+        if "left" in region_l:
+            ratio = 1.0 / 6.0
+        elif "right" in region_l:
+            ratio = 5.0 / 6.0
+        else:
+            ratio = 0.5
+        raw = axis_min + (axis_max - axis_min) * ratio
+        for item in valid:
+            lo = float(item.get("min"))
+            hi = float(item.get("max"))
+            if lo <= raw <= hi:
+                return raw, item
+        best_item = max(valid, key=lambda item: float(item.get("max")) - float(item.get("min")))
+        lo = float(best_item.get("min"))
+        hi = float(best_item.get("max"))
+        return min(max(raw, lo), hi), best_item
+
+    def route2_band_for_region(self, bands: List[Dict[str, Any]], region: str) -> Dict[str, Any]:
+        if not bands:
+            return {"height_band": "floor_1", "floor_index": 1, "z_cm": self.route2_low_z_cm()}
+        region_l = str(region or "").lower()
+        if "low" in region_l:
+            return bands[0]
+        if "high" in region_l:
+            return bands[-1]
+        return bands[min(len(bands) - 1, len(bands) // 2)]
+
+    def route2_interval_sample_counts(
+        self,
+        intervals: List[Dict[str, Any]],
+        *,
+        spacing: float,
+        density: str,
+    ) -> List[int]:
+        limits = LLM_ROUTE2_RULE_DENSITY_LIMITS.get(
+            str(density),
+            LLM_ROUTE2_RULE_DENSITY_LIMITS["medium"],
+        )
+        min_count = int(limits.get("min", 4))
+        max_count = int(limits.get("max", 12))
+        lengths = [
+            max(0.0, abs(float(interval.get("max", 0.0)) - float(interval.get("min", 0.0))))
+            for interval in intervals
+            if isinstance(interval, dict)
+        ]
+        if not lengths:
+            return []
+        total_length = sum(lengths)
+        desired_total = int(math.ceil(total_length / max(1.0, float(spacing)))) + 1
+        desired_total = max(min_count, min(max_count, desired_total))
+        desired_total = max(desired_total, min(max_count, 2 * len(lengths)))
+        if total_length <= 0.0:
+            return [max(1, desired_total // max(1, len(lengths)))] * len(lengths)
+        counts = [max(2, int(round(desired_total * length / total_length))) for length in lengths]
+        while sum(counts) > desired_total:
+            candidates = [idx for idx, value in enumerate(counts) if value > 2]
+            if not candidates:
+                break
+            idx = max(candidates, key=lambda item: counts[item])
+            counts[idx] -= 1
+        while sum(counts) < desired_total:
+            idx = max(range(len(counts)), key=lambda item: lengths[item])
+            counts[idx] += 1
+        return counts
+
+    def route2_generate_facade_scan_points(self, analysis: Dict[str, Any]) -> List[Dict[str, Any]]:
+        state = self.route2_selected_state()
+        house_id = str(state.get("target_house_id", "") or "")
+        facade = str(state.get("facade", "") or "")
+        observation = state.get("observation_point", {}) if isinstance(state.get("observation_point"), dict) else {}
+        bbox = self.house_world_bbox_for_id(house_id)
+        if not house_id or not facade or not observation or not bbox:
+            return []
+        spacing = self.route2_spacing_from_analysis(analysis)
+        density_rule = self.route2_density_rule(house_id, facade, analysis)
+        density = str(density_rule.get("density", "medium") or "medium")
+        scan_geometry = self.route2_select_scan_geometry(house_id, facade, bbox, analysis)
+        translation_span = str(scan_geometry.get("translation_span", "medium") or "medium")
+        bands = self.route2_height_bands_from_analysis(analysis)
+        standoff = float(scan_geometry.get("standoff_cm", self.route_scan_standoff_cm()))
+        intervals = [
+            item for item in scan_geometry.get("safe_intervals", [])
+            if isinstance(item, dict) and self._as_float_or_none(item.get("min")) is not None and self._as_float_or_none(item.get("max")) is not None
+        ]
+        if not intervals:
+            return []
+        points: List[Dict[str, Any]] = []
+        scan_index = 0
+        interval_counts = self.route2_interval_sample_counts(intervals, spacing=spacing, density=density)
+        planned_facade_sample_count = sum(interval_counts)
+        for band in bands:
+            for interval_position, interval in enumerate(intervals):
+                axis_min = float(interval.get("min"))
+                axis_max = float(interval.get("max"))
+                count = interval_counts[interval_position] if interval_position < len(interval_counts) else 2
+                for local_idx in range(count):
+                    ratio = float(local_idx) / float(max(1, count - 1))
+                    axis_value = axis_min + (axis_max - axis_min) * ratio
+                    pose = self.route2_facade_pose_from_axis(bbox, facade, axis_value, standoff, float(band["z_cm"]))
+                    points.append(
+                        {
+                            "scan_id": f"{house_id}_{facade}_{band['height_band']}_{scan_index:03d}",
+                            "local_scan_index": scan_index,
+                            "house_id": house_id,
+                            "facade": facade,
+                            "facade_id": self.route2_facade_id(house_id, facade),
+                            "height_band": str(band["height_band"]),
+                            "floor_index": int(band["floor_index"]),
+                            "semantic_region": "full_facade",
+                            "target_score": str(analysis.get("target_score", "medium") or "medium"),
+                            "translation_span": translation_span,
+                            "rule_density": density,
+                            "density_rule": density_rule,
+                            "planned_facade_sample_count": planned_facade_sample_count,
+                            "x": pose["x"],
+                            "y": pose["y"],
+                            "z": pose["z"],
+                            "yaw_deg": pose["yaw_deg"],
+                            "standoff_cm": round(float(standoff), 2),
+                            "preferred_standoff_cm": scan_geometry.get("preferred_standoff_cm"),
+                            "scan_standoff_mode": scan_geometry.get("scan_standoff_mode"),
+                            "lidar_max_range_cm": float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+                            "scan_spacing_cm": round(float(spacing), 2),
+                            "view_type": "facade_floor_band_scan",
+                            "capture_trigger": "arrive_align_hover_capture",
+                            "safe_interval_index": interval.get("index", interval_position),
+                            "safe_interval_count": len(intervals),
+                            "safe_axis_min": round(axis_min, 2),
+                            "safe_axis_max": round(axis_max, 2),
+                            "status": "planned",
+                        }
+                    )
+                    scan_index += 1
+        cue_index = 0
+        for cue in analysis.get("detected_cues", []) if isinstance(analysis.get("detected_cues"), list) else []:
+            if not isinstance(cue, dict):
+                continue
+            if density == "sparse" and not self.route2_is_entry_cue(cue):
+                continue
+            region = str(cue.get("region", "") or "mid-center")
+            axis_value, cue_interval = self.route2_axis_value_for_region_intervals(intervals, region)
+            band = self.route2_band_for_region(bands, region)
+            pose = self.route2_facade_pose_from_axis(bbox, facade, axis_value, standoff, float(band["z_cm"]))
+            points.append(
+                {
+                    "scan_id": f"{house_id}_{facade}_{band['height_band']}_confirm_{cue_index:03d}",
+                    "local_scan_index": scan_index,
+                    "house_id": house_id,
+                    "facade": facade,
+                    "facade_id": self.route2_facade_id(house_id, facade),
+                    "height_band": str(band["height_band"]),
+                    "floor_index": int(band["floor_index"]),
+                    "semantic_region": region,
+                    "cue_type": str(cue.get("type", "cue") or "cue"),
+                    "cue_confidence": cue.get("confidence"),
+                    "target_score": str(analysis.get("target_score", "medium") or "medium"),
+                    "translation_span": translation_span,
+                    "rule_density": density,
+                    "density_rule": density_rule,
+                    "planned_facade_sample_count": planned_facade_sample_count,
+                    "x": pose["x"],
+                    "y": pose["y"],
+                    "z": pose["z"],
+                    "yaw_deg": pose["yaw_deg"],
+                    "standoff_cm": round(float(standoff), 2),
+                    "preferred_standoff_cm": scan_geometry.get("preferred_standoff_cm"),
+                    "scan_standoff_mode": scan_geometry.get("scan_standoff_mode"),
+                    "lidar_max_range_cm": float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+                    "scan_spacing_cm": round(float(spacing), 2),
+                    "view_type": "semantic_candidate_confirm_scan",
+                    "capture_trigger": "arrive_align_hover_capture",
+                    "safe_interval_index": cue_interval.get("index", 0),
+                    "safe_interval_count": len(intervals),
+                    "safe_axis_min": round(float(cue_interval.get("min", axis_value)), 2),
+                    "safe_axis_max": round(float(cue_interval.get("max", axis_value)), 2),
+                    "status": "planned",
+                }
+            )
+            cue_index += 1
+            scan_index += 1
+        return points
+
+    def route2_scan_order_from_point(self, point: Dict[str, Any]) -> int:
+        value = self._as_float_or_none(point.get("global_scan_order"))
+        if value is not None:
+            return int(value)
+        scan_id = str(point.get("scan_id", "") or "")
+        match = re.search(r"_scan_(\d+)", scan_id)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                return 0
+        return 0
+
+    def route2_existing_facade_scan_points(self, output_dir: Path, *, exclude_facade: str = "") -> List[Dict[str, Any]]:
+        points: List[Dict[str, Any]] = []
+        root = output_dir / "facade_observations"
+        if not root.exists():
+            return points
+        excluded = str(exclude_facade or "").strip().lower()
+        for path in sorted(root.glob("*/facade_search_plan.json")):
+            payload = flight.read_json_object(path)
+            if not isinstance(payload, dict):
+                continue
+            facade = str(payload.get("facade", "") or "").strip().lower()
+            if excluded and facade == excluded:
+                continue
+            for point in payload.get("scan_points", []) if isinstance(payload.get("scan_points"), list) else []:
+                if isinstance(point, dict):
+                    points.append(dict(point))
+        return points
+
+    def route2_assign_global_scan_ids(
+        self,
+        output_dir: Path,
+        house_id: str,
+        facade: str,
+        points: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        existing = self.route2_existing_facade_scan_points(output_dir, exclude_facade=facade)
+        next_order = max([self.route2_scan_order_from_point(point) for point in existing] + [0]) + 1
+        assigned: List[Dict[str, Any]] = []
+        for offset, point in enumerate(points):
+            item = dict(point)
+            order = next_order + offset
+            band = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(item.get("height_band", "band") or "band")).strip("_")
+            suffix = f"{facade}_{band}"
+            if str(item.get("view_type", "") or "") == "semantic_candidate_confirm_scan":
+                suffix = f"{suffix}_confirm"
+            item["global_scan_order"] = int(order)
+            item["scan_id"] = f"{house_id}_scan_{order:04d}_{suffix}"
+            assigned.append(item)
+        return assigned
+
+    def route2_write_merged_scan_points(self, output_dir: Path, house_id: str) -> List[Dict[str, Any]]:
+        points = self.route2_existing_facade_scan_points(output_dir)
+        points.sort(key=lambda item: (self.route2_scan_order_from_point(item), str(item.get("scan_id", "") or "")))
+        facade_counts: Dict[str, int] = {}
+        for point in points:
+            facade = str(point.get("facade", "") or "")
+            facade_counts[facade] = facade_counts.get(facade, 0) + 1
+        self.write_json_artifact(
+            output_dir / "scan_points.json",
+            {
+                "schema": "facade_v2_global_scan_points",
+                "target_house_id": house_id,
+                "scan_points": points,
+                "facade_counts": facade_counts,
+                "total_scan_count": len(points),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        return points
+
+    def on_route2_plan_facade_scan(self) -> None:
+        state = self.route2_selected_state()
+        if not state.get("observation_point"):
+            self.llm_route2_status_var.set("LLM Route V2: plan nearest facade first.")
+            return
+        analysis = state.get("facade_analysis", {}) if isinstance(state.get("facade_analysis"), dict) else {}
+        if not analysis:
+            analysis = self.route2_fallback_facade_analysis("Plan Facade Scan used fallback before VLM analysis.")
+        points = self.route2_generate_facade_scan_points(analysis)
+        output_dir, facade_dir, house_id, facade = self.route2_facade_paths()
+        if output_dir is None or facade_dir is None:
+            self.llm_route2_status_var.set("LLM Route V2: missing facade output directory.")
+            return
+        points = self.route2_assign_global_scan_ids(output_dir, house_id, facade, points)
+        validation = self.scan_point_validation_report(house_id, points)
+        search_plan = {
+            "schema": "facade_v2_scan_plan",
+            "house_id": house_id,
+            "facade": facade,
+            "facade_id": self.route2_facade_id(house_id, facade),
+            "observation_point": state.get("observation_point", {}),
+            "facade_analysis": analysis,
+            "scan_points": points,
+            "scan_point_validation_report": validation,
+            "route_blocked_by_safety": not bool(validation.get("valid", False)),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.write_json_artifact(facade_dir / "facade_search_plan.json", search_plan)
+        merged_points = self.route2_write_merged_scan_points(output_dir, house_id)
+        self.route2_update_state(facade_analysis=analysis, facade_search_plan=search_plan, facade_scan_points=points, validation_report=validation)
+        self.route2_write_state_artifact()
+        self.refresh_route2_preview()
+        self.refresh_llm_route2_map()
+        suffix = " | blocked by safety validation" if not bool(validation.get("valid", False)) else ""
+        self.llm_route2_status_var.set(f"LLM Route V2: planned facade scan {facade} points={len(points)} global_total={len(merged_points)}{suffix}")
+
+    def on_route2_capture_facade_scan(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        state = self.route2_selected_state()
+        points = state.get("facade_scan_points", []) if isinstance(state.get("facade_scan_points"), list) else []
+        if not points:
+            self.on_route2_plan_facade_scan()
+            state = self.route2_selected_state()
+            points = state.get("facade_scan_points", []) if isinstance(state.get("facade_scan_points"), list) else []
+        if not points:
+            self.llm_route2_status_var.set("LLM Route V2: no facade scan points.")
+            return
+        validation = self.scan_point_validation_report(str(state.get("target_house_id", "") or ""), points)
+        if not bool(validation.get("valid", False)):
+            self.route2_update_state(validation_report=validation)
+            self.refresh_route2_preview()
+            self.llm_route2_status_var.set("LLM Route V2: scan blocked by safety validation.")
+            return
+        if self.route_thread is not None and self.route_thread.is_alive():
+            self.llm_route2_status_var.set("LLM Route V2: wait for current worker.")
+            return
+        self.sync_capture_options_to_session(session)
+        self.route_stop_event.clear()
+        self.route_thread = threading.Thread(target=lambda: self.route2_capture_facade_scan_worker(session), daemon=True)
+        self.route_thread.start()
+
+    def route2_next_frame_index(self, output_dir: Path) -> int:
+        frame_indices: List[int] = []
+        frames_dir = output_dir / "frames"
+        if frames_dir.exists():
+            for path in frames_dir.glob("frame_*"):
+                if not path.is_dir():
+                    continue
+                match = re.match(r"frame_(\d+)", path.name)
+                if match:
+                    try:
+                        frame_indices.append(int(match.group(1)))
+                    except Exception:
+                        pass
+        for log_name in ("lidar_capture_log.jsonl", "scan_execution_log.jsonl"):
+            for row in self.read_jsonl_artifact(output_dir / log_name):
+                value = self._as_float_or_none(row.get("frame_index"))
+                if value is not None:
+                    frame_indices.append(int(value))
+                for item in row.get("frame_indices", []) if isinstance(row.get("frame_indices"), list) else []:
+                    item_value = self._as_float_or_none(item)
+                    if item_value is not None:
+                        frame_indices.append(int(item_value))
+        return max(frame_indices + [0]) + 1
+
+    def route2_write_lidar_summary(self, output_dir: Path, *, running: bool) -> None:
+        rows = self.read_jsonl_artifact(output_dir / "lidar_capture_log.jsonl")
+        summary = {
+            "capture_kind": "facade_v2_lidar",
+            "task_title": self.llm_task_text_var.get().strip() or "facade_v2_search",
+            "stream_dir": str(output_dir),
+            "frames_dir": str(output_dir / "frames"),
+            "reconstruction_dir": str(output_dir / "reconstruction"),
+            "running": bool(running),
+            "frame_count": len(rows),
+            "lidar_depth_min_cm": float(getattr(self.args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM)),
+            "lidar_depth_max_cm": float(getattr(self.args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM)),
+            "lidar_depth_projection": str(getattr(self.args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION)),
+            "lidar_capture_processing": self.lidar_capture_processing_mode(),
+            "coordinate_frame": "standard_zup",
+            "coordinate_units": "m",
+            "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        (output_dir / "stream_capture_lidar.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        trajectory_payload = dict(summary)
+        trajectory_payload["trajectory"] = rows
+        (output_dir / "trajectory.json").write_text(json.dumps(trajectory_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def route2_capture_facade_scan_worker(self, session: flight.DroneFlightSession) -> None:
+        output_dir, facade_dir, house_id, facade = self.route2_facade_paths()
+        if output_dir is None or facade_dir is None:
+            self.root.after(0, lambda: self.llm_route2_status_var.set("LLM Route V2: missing facade output directory."))
+            return
+        state = self.route2_selected_state()
+        points = [dict(point) for point in state.get("facade_scan_points", []) if isinstance(point, dict)]
+        total = len(points)
+        interval_s = self.route_capture_interval_s()
+        trajectory = state.get("facade_capture_rows", []) if isinstance(state.get("facade_capture_rows"), list) else []
+        self.root.after(0, lambda: self.llm_route2_status_var.set(f"LLM Route V2: capture facade {facade} points={total}"))
+        for idx, point in enumerate(points, start=1):
+            if self.route_stop_event.is_set():
+                self.root.after(0, lambda: self.llm_route2_status_var.set("LLM Route V2: scan capture stopped."))
+                return
+            scan_id = str(point.get("scan_id", "") or f"{house_id}_{facade}_{idx:03d}")
+            planned_pose = {
+                "x": float(point.get("x", 0.0)),
+                "y": float(point.get("y", 0.0)),
+                "z": float(point.get("z", 600.0)),
+                "yaw": float(point.get("yaw_deg", point.get("yaw", 0.0))),
+            }
+            self.root.after(0, lambda i=idx, t=total, sid=scan_id: self.llm_route2_status_var.set(f"LLM Route V2: move/capture {i}/{t} {sid}"))
+            set_result = self.safe("Route V2 scan set pose", lambda p=planned_pose: session.set_pose(p))
+            if isinstance(set_result, dict):
+                self.root.after(0, lambda r=set_result: self.apply_state(r))
+            if self.route_stop_event.wait(0.3):
+                return
+            capture_results: List[Dict[str, Any]] = []
+            for capture_index in range(self.route_capture_count()):
+                if self.route_stop_event.is_set():
+                    break
+                frame_index = self.route2_next_frame_index(output_dir)
+                action_detail = dict(self.build_stream_action_detail())
+                action_detail.update(
+                    {
+                        "source": "llm_route_v2_facade_scan",
+                        "scan_id": scan_id,
+                        "global_scan_order": point.get("global_scan_order"),
+                        "house_id": house_id,
+                        "facade": facade,
+                        "facade_id": self.route2_facade_id(house_id, facade),
+                        "height_band": str(point.get("height_band", "") or ""),
+                        "floor_index": point.get("floor_index"),
+                        "semantic_region": str(point.get("semantic_region", "") or ""),
+                        "capture_index": capture_index + 1,
+                        "capture_count": self.route_capture_count(),
+                        "planned_pose": planned_pose,
+                    }
+                )
+                result = self.safe(
+                    "Route V2 scan capture",
+                    lambda frame=frame_index, action=action_detail: session.capture_lidar_stream_frame(
+                        output_dir,
+                        frame,
+                        action_detail=action,
+                    ),
+                )
+                if not isinstance(result, dict):
+                    continue
+                capture_results.append(result)
+                row = {
+                    "frame_index": int(result.get("frame_index", frame_index)),
+                    "capture_time": result.get("capture_time", ""),
+                    "scan_id": scan_id,
+                    "global_scan_order": point.get("global_scan_order"),
+                    "house_id": house_id,
+                    "facade": facade,
+                    "facade_id": self.route2_facade_id(house_id, facade),
+                    "height_band": str(point.get("height_band", "") or ""),
+                    "floor_index": point.get("floor_index"),
+                    "semantic_region": str(point.get("semantic_region", "") or ""),
+                    "planned_pose": planned_pose,
+                    "pose": result.get("pose", {}),
+                    "commanded_pose": result.get("commanded_pose", {}),
+                    "actual_pose": result.get("actual_pose", {}),
+                    "pose_error": result.get("pose_error", {}),
+                    "capture_dir": result.get("capture_dir", ""),
+                    "rgb_path": result.get("rgb_path", ""),
+                    "point_cloud_world_standard_m_npy_path": result.get("point_cloud_world_standard_m_npy_path", ""),
+                    "point_cloud_world_standard_m_ply_path": result.get("point_cloud_world_standard_m_ply_path", ""),
+                    "point_cloud_preview_path": result.get("point_cloud_preview_path", ""),
+                    "point_count": int(result.get("point_count", 0) or 0),
+                    "action_detail": action_detail,
+                }
+                trajectory.append(row)
+                self.append_jsonl(output_dir / "lidar_capture_log.jsonl", row)
+                self.append_jsonl(facade_dir / "lidar_capture_log.jsonl", row)
+                self.route2_write_lidar_summary(output_dir, running=True)
+                if capture_index + 1 < self.route_capture_count() and self.route_stop_event.wait(interval_s):
+                    break
+            capture_status = "ok" if capture_results else "failed"
+            execution_entry = {
+                "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+                "house_id": house_id,
+                "facade": facade,
+                "scan_id": scan_id,
+                "global_scan_order": point.get("global_scan_order"),
+                "height_band": str(point.get("height_band", "") or ""),
+                "floor_index": point.get("floor_index"),
+                "planned_pose": planned_pose,
+                "capture_status": capture_status,
+                "capture_count": len(capture_results),
+                "frame_indices": [int(item.get("frame_index", 0) or 0) for item in capture_results],
+                "capture_dirs": [str(item.get("capture_dir", "") or "") for item in capture_results],
+                "point_count": sum(int(item.get("point_count", 0) or 0) for item in capture_results),
+            }
+            self.append_jsonl(output_dir / "scan_execution_log.jsonl", execution_entry)
+            self.append_jsonl(facade_dir / "scan_execution_log.jsonl", execution_entry)
+            for state_point in self.llm_route2_state.get("facade_scan_points", []) if isinstance(self.llm_route2_state.get("facade_scan_points"), list) else []:
+                if isinstance(state_point, dict) and str(state_point.get("scan_id", "") or "") == scan_id:
+                    state_point["status"] = "captured" if capture_status == "ok" else "capture_failed"
+            self.route2_update_state(facade_capture_rows=trajectory)
+            self.route2_write_state_artifact()
+            self.root.after(0, self.refresh_route2_preview)
+            self.root.after(0, self.refresh_llm_route2_map)
+            if idx < total and self.route_stop_event.wait(interval_s):
+                self.root.after(0, lambda: self.llm_route2_status_var.set("LLM Route V2: scan capture stopped."))
+                return
+        self.route2_write_lidar_summary(output_dir, running=False)
+        self.root.after(0, lambda: self.llm_route2_status_var.set(f"LLM Route V2: facade scan capture complete -> {output_dir}"))
+
+    def route2_validate_facade(self) -> Dict[str, Any]:
+        output_dir, facade_dir, house_id, facade = self.route2_facade_paths()
+        if output_dir is None or facade_dir is None:
+            raise RuntimeError("missing facade output directory")
+        state = self.route2_selected_state()
+        points = [point for point in state.get("facade_scan_points", []) if isinstance(point, dict)]
+        geometry = self.scan_point_validation_report(house_id, points)
+        execution_rows = self.read_jsonl_artifact(facade_dir / "scan_execution_log.jsonl")
+        capture_rows = self.read_jsonl_artifact(facade_dir / "lidar_capture_log.jsonl")
+        successful_scan_ids = {str(row.get("scan_id", "") or "") for row in execution_rows if str(row.get("capture_status", "") or "") == "ok"}
+        planned_bands = {str(point.get("height_band", "") or "") for point in points if str(point.get("height_band", "") or "")}
+        captured_bands = {
+            str(row.get("height_band", "") or "")
+            for row in execution_rows
+            if str(row.get("capture_status", "") or "") == "ok" and str(row.get("height_band", "") or "")
+        }
+        merged_point_count = sum(int(row.get("point_count", 0) or 0) for row in capture_rows)
+        coverage_report = {
+            "house_id": house_id,
+            "facade": facade,
+            "facade_id": self.route2_facade_id(house_id, facade),
+            "planned_scan_count": len(points),
+            "captured_scan_count": len(successful_scan_ids),
+            "capture_success_rate": round(float(len(successful_scan_ids)) / float(max(1, len(points))), 4),
+            "planned_height_bands": sorted(planned_bands),
+            "captured_height_bands": sorted(captured_bands),
+            "missing_height_bands": sorted(planned_bands - captured_bands),
+            "merged_point_count": int(merged_point_count),
+            "geometry_valid": bool(geometry.get("valid", False)),
+            "coverage_mode": "facade_v2_count_and_height_band",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        rescan_points: List[Dict[str, Any]] = []
+        missing_bands = planned_bands - captured_bands
+        if not bool(geometry.get("valid", False)) or missing_bands or not successful_scan_ids:
+            for band in sorted(missing_bands) or sorted(planned_bands):
+                candidates = [point for point in points if str(point.get("height_band", "") or "") == band]
+                if candidates:
+                    item = dict(candidates[len(candidates) // 2])
+                    item["scan_id"] = f"{house_id}_{facade}_{band}_rescan_000"
+                    item["status"] = "planned"
+                    item["view_type"] = "facade_v2_rescan"
+                    item["rescan_reason"] = "missing height band capture or geometry check failed"
+                    rescan_points.append(item)
+        rescan_plan = {
+            "house_id": house_id,
+            "facade": facade,
+            "rescan_points": rescan_points,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        checks = [
+            {"name": "scan_points_exist", "passed": len(points) > 0, "detail": f"{len(points)} points"},
+            {"name": "geometry_valid", "passed": bool(geometry.get("valid", False)), "detail": geometry},
+            {"name": "all_height_bands_captured", "passed": not (planned_bands - captured_bands), "detail": coverage_report["missing_height_bands"]},
+            {"name": "lidar_rows_exist", "passed": len(capture_rows) > 0, "detail": f"{len(capture_rows)} rows"},
+            {"name": "point_count_positive", "passed": merged_point_count > 0, "detail": f"point_count={merged_point_count}"},
+        ]
+        validation = {
+            "house_id": house_id,
+            "facade": facade,
+            "facade_id": self.route2_facade_id(house_id, facade),
+            "overall_passed": all(bool(check.get("passed", False)) for check in checks),
+            "checks": checks,
+            "coverage_report": coverage_report,
+            "rescan_plan": rescan_plan,
+            "validation_report_path": str(facade_dir / "facade_validation_report.json"),
+            "validated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.write_json_artifact(facade_dir / "facade_coverage_report.json", coverage_report)
+        self.write_json_artifact(facade_dir / "facade_rescan_plan.json", rescan_plan)
+        self.write_json_artifact(facade_dir / "facade_validation_report.json", validation)
+        self.route2_update_state(validation_report=validation, facade_coverage_report=coverage_report, facade_rescan_plan=rescan_plan)
+        self.route2_write_state_artifact()
+        return validation
+
+    def on_route2_validate_facade(self) -> None:
+        if self.route_thread is not None and self.route_thread.is_alive():
+            self.llm_route2_status_var.set("LLM Route V2: wait for current worker.")
+            return
+        try:
+            validation = self.route2_validate_facade()
+            self.refresh_route2_preview()
+            self.refresh_llm_route2_map()
+            self.llm_route2_status_var.set(
+                f"LLM Route V2: validation {'PASS' if validation.get('overall_passed') else 'CHECK'} -> {validation.get('validation_report_path', '')}"
+            )
+        except Exception as exc:
+            LOGGER.warning("Route V2 facade validation failed: %s", exc)
+            self.llm_route2_status_var.set(f"LLM Route V2: validation failed: {exc}")
 
     def on_llm_task_analyze(self) -> None:
         if self.route_thread is not None and self.route_thread.is_alive():
@@ -2311,6 +5071,321 @@ class RouteControlMixin:
                 self.root.after(0, lambda e=exc: self.llm_route_status_var.set(f"Direct Capture: finalize failed: {e}"))
         else:
             self.root.after(0, lambda: self.llm_route_status_var.set("Direct Capture: no captures completed."))
+
+    def on_route_lidar_capture(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        if self.route_thread is not None and self.route_thread.is_alive():
+            self.llm_route_status_var.set("Route Capture: worker already running.")
+            return
+        target_house_id = self.selected_route_target_house_id() or "001"
+        if not target_house_id:
+            self.llm_route_status_var.set("Route Capture: no target house selected.")
+            return
+        if str(self.llm_route_plan.get("target_house_id", "") or "") != target_house_id or not self.llm_route_scan_points:
+            try:
+                plan = self.fallback_route_plan(target_house_id)
+                plan["planner_source"] = "route_capture_lidar_fallback"
+                self.apply_route_plan(plan, status_prefix="Route Capture Setup")
+            except Exception as exc:
+                self.llm_route_status_var.set(f"Route Capture setup failed: {exc}")
+                return
+        scan_validation = self.scan_point_validation_report(target_house_id, self.llm_route_scan_points)
+        if not bool(scan_validation.get("valid", False)):
+            self.llm_route_status_var.set("Route Capture: scan point validation failed.")
+            self.llm_route_validation_report = {"scan_point_validation_report": scan_validation, "overall_passed": False}
+            self.refresh_route_preview()
+            return
+        output_dir = self.make_route_capture_output_dir(target_house_id)
+        self.prepare_active_plan_for_route_capture(target_house_id, output_dir)
+        self.sync_capture_options_to_session(session)
+        movement_state = self.safe("Route capture enable movement", lambda: session.set_movement_enabled(True))
+        if isinstance(movement_state, dict):
+            self.root.after(0, lambda r=movement_state: self.apply_state(r))
+        self.route_stop_event.clear()
+        self.route_thread = threading.Thread(
+            target=lambda: self.route_lidar_capture_worker(session, target_house_id, output_dir),
+            daemon=True,
+        )
+        self.route_thread.start()
+
+    def route_capture_target_point(self, target_house_id: str, x: float, y: float) -> Tuple[float, float]:
+        bbox = self.house_world_bbox_for_id(target_house_id)
+        if not bbox:
+            return float(x), float(y)
+        try:
+            target_x = min(max(float(x), float(bbox["min_x"])), float(bbox["max_x"]))
+            target_y = min(max(float(y), float(bbox["min_y"])), float(bbox["max_y"]))
+            if math.hypot(target_x - float(x), target_y - float(y)) <= 1e-6:
+                target_x = float(bbox.get("center_x", target_x))
+                target_y = float(bbox.get("center_y", target_y))
+            return target_x, target_y
+        except Exception:
+            return float(x), float(y)
+
+    def route_capture_desired_yaw_deg(self, target_house_id: str, x: float, y: float) -> float:
+        target_x, target_y = self.route_capture_target_point(target_house_id, x, y)
+        return math.degrees(math.atan2(float(target_y) - float(y), float(target_x) - float(x)))
+
+    def route_capture_align_yaw_with_qe(
+        self,
+        session: flight.DroneFlightSession,
+        target_house_id: str,
+        point: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        x = float(point.get("x", 0.0))
+        y = float(point.get("y", 0.0))
+        desired_yaw = self.route_capture_desired_yaw_deg(target_house_id, x, y)
+        yaw_steps: List[Dict[str, Any]] = []
+        tolerance = float(LLM_ROUTE_PATH_CAPTURE_YAW_TOLERANCE_DEG)
+        max_steps = 12
+        final_yaw: Optional[float] = None
+        for _step in range(max_steps):
+            state = self.safe("Route capture yaw state", session.get_state)
+            pose = state.get("pose", {}) if isinstance(state, dict) and isinstance(state.get("pose"), dict) else {}
+            yaw = self._as_float_or_none(pose.get("task_yaw", pose.get("yaw")))
+            if yaw is None:
+                break
+            final_yaw = float(yaw)
+            delta = self._normalize_angle_deg(desired_yaw - float(yaw))
+            if abs(delta) <= tolerance:
+                break
+            key = "e" if delta > 0.0 else "q"
+            yaw_step = min(float(LLM_ROUTE_PATH_CAPTURE_YAW_STEP_DEG), abs(float(delta)))
+            payload = dict(MOVE_COMMANDS[key])
+            payload["yaw_delta_deg"] = yaw_step if key == "e" else -yaw_step
+            payload["action_name"] = f"route_capture_{key}"
+            response = self.safe("Route capture q/e yaw", lambda p=payload: session.move_relative(p))
+            if isinstance(response, dict):
+                response_pose = response.get("pose", {}) if isinstance(response.get("pose"), dict) else {}
+                response_yaw = self._as_float_or_none(response_pose.get("task_yaw", response_pose.get("yaw")))
+                if response_yaw is not None:
+                    final_yaw = float(response_yaw)
+                self.root.after(0, lambda r=response: self.apply_state(r))
+            yaw_steps.append(
+                {
+                    "key": key,
+                    "yaw_delta_deg": round(float(payload["yaw_delta_deg"]), 3),
+                    "remaining_error_before_deg": round(float(delta), 3),
+                }
+            )
+            if not isinstance(response, dict) or self.route_stop_event.is_set():
+                break
+        final_error = self._normalize_angle_deg(desired_yaw - final_yaw) if final_yaw is not None else None
+        return {
+            "desired_yaw_deg": round(float(desired_yaw), 3),
+            "final_yaw_deg": round(float(final_yaw), 3) if final_yaw is not None else None,
+            "final_error_deg": round(float(final_error), 3) if final_error is not None else None,
+            "yaw_key_sequence": [step["key"] for step in yaw_steps],
+            "yaw_steps": yaw_steps,
+            "tolerance_deg": tolerance,
+        }
+
+    def capture_route_lidar_at_point(
+        self,
+        session: flight.DroneFlightSession,
+        output_dir: Path,
+        target_house_id: str,
+        point: Dict[str, Any],
+        *,
+        point_index: int,
+        total: int,
+    ) -> Dict[str, Any]:
+        scan_id = str(point.get("scan_id", "") or point.get("label", f"route_capture_{point_index:03d}"))
+        capture_count = self.route_capture_count()
+        interval_s = self.route_capture_interval_s()
+        capture_results: List[Dict[str, Any]] = []
+        yaw_result: Dict[str, Any] = {}
+        for capture_index in range(capture_count):
+            if self.route_stop_event.is_set():
+                break
+            yaw_result = self.route_capture_align_yaw_with_qe(session, target_house_id, point)
+            frame_index = len(self.llm_route_lidar_trajectory) + 1
+            action_detail = dict(self.build_stream_action_detail())
+            action_detail.update(
+                {
+                    "source": "route_capture_lidar",
+                    "route_capture_mode": "scan_point_path_lidar_qe_yaw",
+                    "scan_id": scan_id,
+                    "house_id": target_house_id,
+                    "facade": str(point.get("facade", "") or ""),
+                    "capture_index": capture_index + 1,
+                    "capture_count": capture_count,
+                    "capture_interval_s": interval_s,
+                    "planned_pose": {
+                        "x": float(point.get("x", 0.0)),
+                        "y": float(point.get("y", 0.0)),
+                        "z": float(point.get("z", self.target_house_capture_altitude_cm(target_house_id))),
+                    },
+                    "yaw_alignment": yaw_result,
+                }
+            )
+            result = self.safe(
+                "Route capture lidar frame",
+                lambda idx=frame_index, action=action_detail: session.capture_lidar_stream_frame(
+                    output_dir,
+                    idx,
+                    action_detail=action,
+                ),
+            )
+            if isinstance(result, dict):
+                capture_results.append(result)
+                trajectory_entry = {
+                    "frame_index": int(result.get("frame_index", frame_index)),
+                    "capture_time": result.get("capture_time", ""),
+                    "scan_id": scan_id,
+                    "house_id": target_house_id,
+                    "facade": str(point.get("facade", "") or ""),
+                    "route_capture_mode": "scan_point_path_lidar_qe_yaw",
+                    "capture_interval_s": interval_s,
+                    "point_index": point_index,
+                    "point_total": total,
+                    "planned_pose": action_detail["planned_pose"],
+                    "yaw_alignment": yaw_result,
+                    "pose": result.get("pose", {}),
+                    "commanded_pose": result.get("commanded_pose", {}),
+                    "actual_pose": result.get("actual_pose", {}),
+                    "pose_error": result.get("pose_error", {}),
+                    "action_detail": action_detail,
+                    "capture_dir": result.get("capture_dir", ""),
+                    "rgb_path": result.get("rgb_path", ""),
+                    "point_cloud_world_standard_m_npy_path": result.get("point_cloud_world_standard_m_npy_path", ""),
+                    "point_cloud_world_standard_m_ply_path": result.get("point_cloud_world_standard_m_ply_path", ""),
+                    "point_cloud_preview_path": result.get("point_cloud_preview_path", ""),
+                    "point_count": int(result.get("point_count", 0) or 0),
+                    "raw_capture_only": bool(result.get("raw_capture_only", self.lidar_capture_processing_mode() == "smooth")),
+                    "postprocess_status": result.get("postprocess_status", "pending"),
+                }
+                self.llm_route_lidar_trajectory.append(trajectory_entry)
+                self.append_jsonl(output_dir / "lidar_capture_log.jsonl", trajectory_entry)
+                self.append_jsonl(output_dir / "route_capture_lidar_log.jsonl", trajectory_entry)
+                self.write_house_search_lidar_summary(output_dir, running=True)
+                self.root.after(
+                    0,
+                    lambda sid=scan_id, c=len(self.llm_route_lidar_trajectory): self.llm_route_status_var.set(
+                        f"Route Capture: captured {sid} frames={c}"
+                    ),
+                )
+            if capture_index + 1 < capture_count and self.route_stop_event.wait(interval_s):
+                break
+        state = self.safe("Route capture final state", session.get_state)
+        actual_pose = state.get("pose", {}) if isinstance(state, dict) and isinstance(state.get("pose"), dict) else {}
+        capture_status = "ok" if capture_results else "failed"
+        execution_entry = {
+            "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+            "house_id": target_house_id,
+            "scan_id": scan_id,
+            "facade": str(point.get("facade", "") or ""),
+            "route_capture_mode": "scan_point_path_lidar_qe_yaw",
+            "capture_interval_s": interval_s,
+            "planned_pose": {
+                "x": float(point.get("x", 0.0)),
+                "y": float(point.get("y", 0.0)),
+                "z": float(point.get("z", self.target_house_capture_altitude_cm(target_house_id))),
+            },
+            "actual_pose": actual_pose,
+            "yaw_alignment": yaw_result,
+            "safety_state": "SAFE",
+            "capture_status": capture_status,
+            "capture_count": len(capture_results),
+            "capture_dirs": [str(item.get("capture_dir", "") or "") for item in capture_results],
+            "point_cloud_paths": [
+                str(item.get("point_cloud_world_standard_m_ply_path", "") or item.get("point_cloud_world_ply_path", "") or "")
+                for item in capture_results
+            ],
+        }
+        self.append_jsonl(output_dir / "scan_execution_log.jsonl", execution_entry)
+        self.update_route_point_runtime_status(point, "captured" if capture_status == "ok" else "capture_failed")
+        completed = sum(1 for item in self.llm_route_scan_points if isinstance(item, dict) and item.get("status") in {"captured", "visited"})
+        self.llm_route_execution_summary.update(
+            {
+                "completed_scan_count": int(completed),
+                "capture_success_count": int(self.llm_route_execution_summary.get("capture_success_count", 0) or 0) + (1 if capture_status == "ok" else 0),
+                "capture_failure_count": int(self.llm_route_execution_summary.get("capture_failure_count", 0) or 0) + (0 if capture_status == "ok" else 1),
+                "last_scan_id": scan_id,
+                "last_capture_status": capture_status,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        self.write_json_artifact(output_dir / "execution_summary.json", self.llm_route_execution_summary)
+        self.root.after(0, self.refresh_route_preview)
+        return execution_entry
+
+    def route_lidar_capture_worker(
+        self,
+        session: flight.DroneFlightSession,
+        target_house_id: str,
+        output_dir: Path,
+    ) -> None:
+        scan_points = self.scan_points_as_route_points(self.llm_route_scan_points)
+        route_points = self.llm_route_plan.get("route_points", []) if isinstance(self.llm_route_plan.get("route_points"), list) else []
+        index_by_scan_id = {
+            str(point.get("scan_id", "") or ""): idx
+            for idx, point in enumerate(route_points)
+            if isinstance(point, dict) and str(point.get("scan_id", "") or "")
+        }
+        total = len(scan_points)
+        interval_s = self.route_capture_interval_s()
+        captured_any = False
+        self.root.after(
+            0,
+            lambda: self.llm_route_status_var.set(
+                f"Route Capture: starting house={target_house_id} points={total} interval={interval_s:.2f}s"
+            ),
+        )
+        for point_index, point in enumerate(scan_points, start=1):
+            if self.route_stop_event.is_set():
+                self.root.after(0, lambda: self.llm_route_status_var.set("Route Capture: stopped."))
+                return
+            scan_id = str(point.get("scan_id", "") or "")
+            if scan_id in index_by_scan_id:
+                point["_route_point_index"] = index_by_scan_id[scan_id]
+            target_pose = {
+                "x": float(point.get("x", 0.0)),
+                "y": float(point.get("y", 0.0)),
+                "z": float(point.get("z", self.target_house_capture_altitude_cm(target_house_id))),
+            }
+            self.root.after(
+                0,
+                lambda i=point_index, t=total, sid=scan_id: self.llm_route_status_var.set(
+                    f"Route Capture: move/capture {i}/{t} {sid}"
+                ),
+            )
+            response = self.safe("Route capture set point", lambda p=target_pose: session.set_pose(p))
+            if isinstance(response, dict):
+                self.root.after(0, lambda r=response: self.apply_state(r))
+            else:
+                self.update_route_point_runtime_status(point, "capture_failed")
+                continue
+            capture_entry = self.capture_route_lidar_at_point(
+                session,
+                output_dir,
+                target_house_id,
+                point,
+                point_index=point_index,
+                total=total,
+            )
+            captured_any = captured_any or capture_entry.get("capture_status") == "ok"
+            self.root.after(0, self.refresh_llm_route_map)
+            if point_index < total and self.route_stop_event.wait(interval_s):
+                self.root.after(0, lambda: self.llm_route_status_var.set("Route Capture: stopped."))
+                return
+        if captured_any:
+            try:
+                finalize_result = self.finalize_house_search_outputs()
+                validation = self.validate_house_search_data(finalize_result=finalize_result)
+                self.root.after(
+                    0,
+                    lambda v=validation: self.llm_route_status_var.set(
+                        f"Route Capture: complete, validation={'PASS' if v.get('overall_passed') else 'CHECK'} -> {output_dir}"
+                    ),
+                )
+            except Exception as exc:
+                LOGGER.warning("Route capture finalize/validate failed: %s", exc)
+                self.root.after(0, lambda e=exc: self.llm_route_status_var.set(f"Route Capture: finalize failed: {e}"))
+        else:
+            self.root.after(0, lambda: self.llm_route_status_var.set("Route Capture: no captures completed."))
 
     def on_validate_house_search_data(self) -> None:
         if self.route_thread is not None and self.route_thread.is_alive():

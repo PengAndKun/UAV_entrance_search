@@ -53,7 +53,33 @@ def main() -> None:
     assert east_first["scan_id"].startswith("001_east_")
     assert east_first["x"] == 1150.0
     assert round(expected_yaw, 2) == east_first["yaw_deg"]
-    print(f"OK route scan verification: {len(first)} default points, {len(ordered)} ordered points")
+
+    clipped = route_scan.generate_rule_scan_points(
+        house_id="001",
+        bbox_world=bbox,
+        facade_order=["north"],
+        standoff_cm=850.0,
+        scan_spacing_cm=150.0,
+        altitude_cm=600.0,
+        facade_axis_intervals={
+            "north": [
+                {"index": 0, "min": 0.0, "max": 120.0},
+                {"index": 1, "min": 220.0, "max": 300.0},
+            ]
+        },
+    )
+    north_points = [point for point in clipped if point["facade"] == "north"]
+    assert north_points, "clipped north facade should still produce points"
+    assert all(
+        (0.0 <= point["x"] <= 120.0) or (220.0 <= point["x"] <= 300.0)
+        for point in north_points
+    )
+    assert {point["safe_interval_index"] for point in north_points} == {0, 1}
+
+    print(
+        f"OK route scan verification: {len(first)} default points, "
+        f"{len(ordered)} ordered points, {len(north_points)} clipped north points"
+    )
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ DEFAULT_MANUAL_SHIFT_MAP_CONFIG_NAME = "manual_shift_houses_config.json"
 DEFAULT_MAP_CONFIG_PATH = f"assets/overhead_map/{DEFAULT_MANUAL_SHIFT_MAP_CONFIG_NAME}"
 DEFAULT_MAP_BOUNDS = (1000.0, -500.0, 5000.0, 3000.0)
 DEFAULT_CORRECTED_MAP_CONFIG_NAME = "corrected_houses_config.json"
+DEFAULT_SETTING_MAP_CONFIG_NAME = "setting_map_houses_config.json"
 LLM_API_STYLE_OPTIONS = ("openai_chat", "openai_responses", "anthropic_sdk")
 LLM_OPENAI_DEFAULT_BASE_URL = "https://api.openai.com"
 LLM_ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
@@ -20,6 +21,68 @@ LLM_ROUTE_DEFAULT_REPEAT_CAP = 6
 LLM_ROUTE_SCAN_STANDOFF_CM = 850.0
 LLM_ROUTE_SCAN_SPACING_CM = 150.0
 LLM_ROUTE_CAPTURE_COUNT = 1
+LLM_ROUTE_PATH_CAPTURE_INTERVAL_S = 0.5
+LLM_ROUTE_PATH_CAPTURE_YAW_STEP_DEG = 30.0
+LLM_ROUTE_PATH_CAPTURE_YAW_TOLERANCE_DEG = 8.0
+LLM_ROUTE2_FACADE_OPTIONS = ("auto", "south", "east", "north", "west")
+LLM_ROUTE2_DEFAULT_FLOOR_HEIGHT_M = 3.0
+LLM_ROUTE2_DEFAULT_FLOORS = 2
+LLM_ROUTE2_LOW_Z_CM = 250.0
+LLM_ROUTE2_Z_STEP_CM = 350.0
+LLM_ROUTE2_MAX_FLOORS = 4
+LLM_ROUTE2_OBSERVATION_MIN_STANDOFF_CM = 850.0
+LLM_ROUTE2_OBSERVATION_MAX_STANDOFF_CM = 1800.0
+LLM_ROUTE2_OBSERVATION_DEPTH_FACTOR = 0.515
+LLM_ROUTE2_OBSERVATION_LENGTH_FACTOR = 0.95
+LLM_ROUTE2_SINGLE_BAND_Z_OFFSET_CM = 50.0
+LLM_ROUTE2_DENSITY_SPACING_CM: Dict[str, float] = {
+    "high": 80.0,
+    "medium": 120.0,
+    "low": 200.0,
+}
+LLM_ROUTE2_TRANSLATION_SPACING_CM: Dict[str, float] = {
+    "small": 80.0,
+    "medium": 140.0,
+    "large": 220.0,
+}
+LLM_ROUTE2_RULE_DENSITY_SPACING_CM: Dict[str, float] = {
+    "dense": 120.0,
+    "medium": 220.0,
+    "sparse": 600.0,
+}
+LLM_ROUTE2_RULE_DENSITY_LIMITS: Dict[str, Dict[str, int]] = {
+    "dense": {"min": 8, "max": 28},
+    "medium": {"min": 4, "max": 12},
+    "sparse": {"min": 2, "max": 7},
+}
+LLM_ROUTE2_HOUSE_FACADE_FALLBACK_DENSITY: Dict[str, Dict[str, str]] = {
+    "001": {
+        "west": "dense",
+        "south": "medium",
+        "north": "sparse",
+        "east": "sparse",
+    }
+}
+LLM_ROUTE2_SCAN_STANDOFF_RATIO: Dict[str, float] = {
+    "small": 0.333,
+    "medium": 0.333,
+    "large": 0.42,
+}
+LLM_ROUTE2_SCAN_STANDOFF_MIN_CM = 300.0
+LLM_ROUTE2_SCAN_STANDOFF_MAX_CM = 500.0
+LLM_ROUTE2_FACADE_ANALYSIS_SCHEMA: Dict[str, Any] = {
+    "facade_id": "001_east",
+    "floor_count_estimate": 2,
+    "semantic_complexity": "medium",
+    "terrace_or_awning_risk": "unknown",
+    "target_score": "medium",
+    "detected_cues": [
+        {"type": "door_candidate", "region": "low-center", "confidence": 0.5}
+    ],
+    "recommended_translation_span": "medium",
+    "recommended_height_bands": ["single_300cm"],
+    "reason": "Short facade analysis rationale.",
+}
 LLM_ROUTE_SCAN_POINTS_SCHEMA: Dict[str, Any] = {
     "scan_points": [
         {
@@ -37,6 +100,17 @@ LLM_ROUTE_SCAN_POINTS_SCHEMA: Dict[str, Any] = {
             "capture_trigger": "arrive_align_hover_capture",
             "view_type": "face_view",
             "status": "planned",
+            "safe_interval_index": 0,
+            "safe_interval_count": 1,
+            "safe_axis_min": 0.0,
+            "safe_axis_max": 0.0,
+            "safe_interval_source": "bbox_clearance_clipped",
+            "corridor_mode": "open_default",
+            "corridor_gap_cm": None,
+            "corridor_side_margin_cm": None,
+            "corridor_blocking_house_id": "",
+            "corridor_clearance_cm": LLM_ROUTE_HOUSE_CLEARANCE_CM,
+            "corridor_safe": True,
         }
     ]
 }

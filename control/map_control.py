@@ -27,19 +27,36 @@ class MapControlMixin:
     def solve_affine_from_anchors(self, anchors: List[Dict[str, float]]) -> Optional[List[List[float]]]:
         return solve_affine_from_anchor_points(anchors)
 
+    def solve_homography_from_anchors(self, anchors: List[Dict[str, float]]) -> Optional[List[List[float]]]:
+        return solve_homography_from_anchor_points(anchors)
+
     def normalize_map_calibration(self, payload: Any) -> Dict[str, Any]:
         calibration = payload if isinstance(payload, dict) else {}
         anchors = self.coerce_map_anchors(calibration.get("anchors", []))
         affine = calibration.get("affine_world_to_image")
         if not (isinstance(affine, list) and len(affine) == 2):
             affine = self.solve_affine_from_anchors(anchors)
+        homography = calibration.get("homography_world_to_image")
+        if not (isinstance(homography, list) and len(homography) == 3):
+            homography = self.solve_homography_from_anchors(anchors)
         normalized: Dict[str, Any] = {"anchors": anchors}
         if isinstance(affine, list) and len(affine) == 2:
             normalized["affine_world_to_image"] = affine
+        if isinstance(homography, list) and len(homography) == 3:
+            normalized["homography_world_to_image"] = homography
+            normalized["transform_mode"] = "homography"
+        else:
+            normalized["transform_mode"] = "affine" if "affine_world_to_image" in normalized else ""
         for key in ("image_width", "image_height"):
             if calibration.get(key) is not None:
                 try:
                     normalized[key] = int(calibration.get(key))
+                except Exception:
+                    pass
+        for key in ("affine_rmse_px", "homography_rmse_px"):
+            if calibration.get(key) is not None:
+                try:
+                    normalized[key] = float(calibration.get(key))
                 except Exception:
                     pass
         if calibration.get("rmse_px") is not None:
@@ -51,6 +68,10 @@ class MapControlMixin:
 
     def load_map_resources(self, *, force: bool = False) -> bool:
         config_path = self.resolve_project_path(str(self.args.map_config or DEFAULT_MAP_CONFIG_PATH))
+        if config_path.name == DEFAULT_MANUAL_SHIFT_MAP_CONFIG_NAME:
+            setting_path = config_path.parent / DEFAULT_SETTING_MAP_CONFIG_NAME
+            if setting_path.exists():
+                config_path = setting_path
         if not config_path.exists() and config_path.name == DEFAULT_MANUAL_SHIFT_MAP_CONFIG_NAME:
             fallback_path = self.resolve_project_path(DEFAULT_BASE_MAP_CONFIG_PATH)
             if fallback_path.exists():
@@ -92,7 +113,7 @@ class MapControlMixin:
         self.map_image_path = image_path
         self.map_image = image
         self.map_calibration = self.normalize_map_calibration(overhead.get("calibration", {}))
-        self.map_status_var.set(f"Map: loaded {image_path.name}")
+        self.map_status_var.set(f"Map: loaded {image_path.name} config={config_path.name}")
         self.refresh_house_target_choices()
         return True
 
@@ -218,11 +239,8 @@ class MapControlMixin:
         return None
 
     def world_to_image_point(self, world_x: float, world_y: float) -> Optional[Tuple[float, float]]:
-        affine = self.map_calibration.get("affine_world_to_image")
-        if not isinstance(affine, list) or len(affine) != 2:
-            return None
         try:
-            return world_to_image_with_affine(world_x, world_y, affine)
+            return world_to_image_with_calibration(world_x, world_y, self.map_calibration)
         except Exception:
             return None
 
@@ -542,6 +560,363 @@ class MapControlMixin:
         except Exception as exc:
             LOGGER.warning("Save corrected map config failed: %s", exc)
             self.status_var.set(f"Save corrected map config failed: {exc}")
+
+    def default_map_setting_anchors(self) -> List[Dict[str, Any]]:
+        image_size = self.map_image_size() or (1000, 1000)
+        image_w, image_h = float(image_size[0]), float(image_size[1])
+        presets = [
+            ("P1", 0.18, 0.20),
+            ("P2", 0.82, 0.20),
+            ("P3", 0.82, 0.80),
+            ("P4", 0.18, 0.80),
+            ("P5", 0.50, 0.50),
+        ]
+        bounds = self.map_world_bounds if isinstance(self.map_world_bounds, tuple) and len(self.map_world_bounds) == 4 else DEFAULT_MAP_BOUNDS
+        min_x, min_y, max_x, max_y = [float(value) for value in bounds]
+        anchors: List[Dict[str, Any]] = []
+        for index, (label, fx, fy) in enumerate(presets, start=1):
+            image_x = image_w * fx
+            image_y = image_h * fy
+            try:
+                world_x, world_y = image_to_world_with_calibration(image_x, image_y, self.map_calibration)
+            except Exception:
+                world_x = min_x + (max_x - min_x) * fx
+                world_y = min_y + (max_y - min_y) * fy
+            anchors.append(
+                {
+                    "index": index,
+                    "label": label,
+                    "world_x": round(float(world_x), 3),
+                    "world_y": round(float(world_y), 3),
+                    "image_x": round(float(image_x), 3),
+                    "image_y": round(float(image_y), 3),
+                }
+            )
+        return anchors
+
+    def map_setting_base_anchors(self) -> List[Dict[str, Any]]:
+        if not self.load_map_resources(force=not bool(self.map_config)):
+            return []
+        anchors = self.map_calibration.get("anchors", []) if isinstance(self.map_calibration, dict) else []
+        normalized = sorted(
+            [dict(anchor) for anchor in anchors if isinstance(anchor, dict)],
+            key=lambda anchor: float(anchor.get("index", 9999)),
+        )[:5]
+        return normalized if len(normalized) >= 3 else self.default_map_setting_anchors()
+
+    def map_setting_anchor_payload(self) -> List[Dict[str, Any]]:
+        rows = getattr(self, "map_setting_anchor_vars", [])
+        anchors: List[Dict[str, Any]] = []
+        for index, row in enumerate(rows, start=1):
+            try:
+                label = str(row["label"].get() or f"P{index}").strip() or f"P{index}"
+                selected = str(
+                    self.map_setting_selected_anchor_var.get()
+                    if getattr(self, "map_setting_selected_anchor_var", None) is not None
+                    else ""
+                )
+                anchors.append(
+                    {
+                        "index": index,
+                        "label": label,
+                        "world_x": float(row["world_x"].get()),
+                        "world_y": float(row["world_y"].get()),
+                        "image_x": float(row["image_x"].get()),
+                        "image_y": float(row["image_y"].get()),
+                        "status": "active" if label == selected else "pending",
+                    }
+                )
+            except Exception:
+                continue
+        return anchors
+
+    def setting_map_preview_houses(self, calibration: Dict[str, Any]) -> List[Dict[str, Any]]:
+        preview_config = json.loads(json.dumps(self.map_config if isinstance(self.map_config, dict) else {}))
+        preview_config["houses"] = rebuild_houses_for_corrected_transform(preview_config, calibration)
+        houses: List[Dict[str, Any]] = []
+        target_id = self.selected_route_target_house_id() or str(preview_config.get("current_target_id", "") or "")
+        for house in preview_config.get("houses", []) if isinstance(preview_config.get("houses"), list) else []:
+            if not isinstance(house, dict):
+                continue
+            try:
+                hid = str(house.get("id", "") or "")
+                houses.append(
+                    {
+                        "id": hid,
+                        "name": str(house.get("name", hid) or hid),
+                        "center_x": float(house.get("center_x", 0.0)),
+                        "center_y": float(house.get("center_y", 0.0)),
+                        "radius_cm": float(house.get("radius_cm", 600.0)),
+                        "status": str(house.get("status", "UNSEARCHED") or "UNSEARCHED"),
+                        "is_target": hid == target_id,
+                        "is_current": False,
+                    }
+                )
+            except Exception:
+                continue
+        return houses
+
+    def open_setting_map_window(self) -> None:
+        if getattr(self, "map_setting_window", None) is not None and self.map_setting_window.winfo_exists():
+            self.map_setting_window.lift()
+            self.map_setting_window.focus_force()
+            return
+        if not self.load_map_resources(force=True):
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Setting Map Calibration")
+        window.geometry("1120x620")
+        window.grid_columnconfigure(1, weight=1)
+        window.grid_rowconfigure(1, weight=1)
+        self.map_setting_window = window
+        self.map_setting_status_var = tk.StringVar(value="Setting Map: edit 5 anchors or click map to set selected anchor.")
+        self.map_setting_selected_anchor_var = tk.StringVar(value="P1")
+        self.map_setting_click_coord_var = tk.StringVar(value="Last image coord: n/a")
+        self.map_setting_anchor_vars = []
+
+        header = tk.Frame(window)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 4))
+        tk.Label(header, textvariable=self.map_setting_status_var, anchor="w").pack(side="left", fill="x", expand=True)
+        tk.Button(header, text="Apply Preview", command=self.apply_setting_map_preview).pack(side="right", padx=4)
+        tk.Button(header, text="Save Setting Config", command=self.save_setting_map_config).pack(side="right", padx=4)
+        tk.Button(header, text="Reload Anchors", command=self.reload_setting_map_anchors).pack(side="right", padx=4)
+
+        table = tk.LabelFrame(window, text="Calibration Points")
+        table.grid(row=1, column=0, sticky="nsw", padx=(8, 4), pady=4)
+        for col, title in enumerate(("Use", "Label", "World X", "World Y", "Image X", "Image Y")):
+            tk.Label(table, text=title).grid(row=0, column=col, sticky="w", padx=4, pady=4)
+        for row_index, anchor in enumerate(self.map_setting_base_anchors()[:5], start=1):
+            label = str(anchor.get("label", f"P{row_index}") or f"P{row_index}")
+            vars_row = {
+                "label": tk.StringVar(value=label),
+                "world_x": tk.StringVar(value=self._fmt_float(anchor.get("world_x", 0.0))),
+                "world_y": tk.StringVar(value=self._fmt_float(anchor.get("world_y", 0.0))),
+                "image_x": tk.StringVar(value=self._fmt_float(anchor.get("image_x", 0.0))),
+                "image_y": tk.StringVar(value=self._fmt_float(anchor.get("image_y", 0.0))),
+            }
+            self.map_setting_anchor_vars.append(vars_row)
+            ttk.Radiobutton(
+                table,
+                variable=self.map_setting_selected_anchor_var,
+                value=label,
+            ).grid(row=row_index, column=0, padx=4, pady=3)
+            for col, key in enumerate(("label", "world_x", "world_y", "image_x", "image_y"), start=1):
+                width = 7 if key == "label" else 10
+                tk.Entry(table, textvariable=vars_row[key], width=width).grid(row=row_index, column=col, padx=4, pady=3)
+
+        tk.Button(table, text="Use Default 5 Points", command=self.use_default_setting_map_anchors).grid(
+            row=7, column=0, columnspan=3, sticky="ew", padx=4, pady=(8, 4)
+        )
+        tk.Button(table, text="Set Selected To UAV Image", command=self.set_setting_anchor_to_current_uav_image).grid(
+            row=7, column=3, columnspan=3, sticky="ew", padx=4, pady=(8, 4)
+        )
+        tk.Label(table, textvariable=self.map_setting_click_coord_var, anchor="w").grid(
+            row=8, column=0, columnspan=4, sticky="ew", padx=4, pady=(4, 4)
+        )
+        tk.Button(table, text="Copy Image Coord", command=self.copy_setting_map_image_coord).grid(
+            row=8, column=4, columnspan=2, sticky="ew", padx=4, pady=(4, 4)
+        )
+
+        map_frame = tk.LabelFrame(window, text="Preview")
+        map_frame.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=4)
+        map_frame.grid_columnconfigure(0, weight=1)
+        map_frame.grid_rowconfigure(0, weight=1)
+        self.map_setting_widget = OverheadMapWidget(map_frame, world_bounds=self.map_world_bounds, canvas_w=760, canvas_h=500)
+        self.map_setting_widget.canvas.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self.map_setting_widget.set_map_click_callback(self.on_setting_map_click)
+        self.map_setting_widget.set_calibration_anchor_callbacks(
+            self.on_setting_anchor_select,
+            self.on_setting_anchor_drag,
+        )
+
+        def close_window() -> None:
+            self.map_setting_window = None
+            self.map_setting_widget = None
+            self.map_setting_anchor_vars = []
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+
+        window.protocol("WM_DELETE_WINDOW", close_window)
+        self.apply_setting_map_preview()
+
+    def reload_setting_map_anchors(self) -> None:
+        if getattr(self, "map_setting_anchor_vars", None) is None:
+            return
+        anchors = self.map_setting_base_anchors()[:5]
+        for row, anchor in zip(self.map_setting_anchor_vars, anchors):
+            row["label"].set(str(anchor.get("label", row["label"].get()) or row["label"].get()))
+            row["world_x"].set(self._fmt_float(anchor.get("world_x", 0.0)))
+            row["world_y"].set(self._fmt_float(anchor.get("world_y", 0.0)))
+            row["image_x"].set(self._fmt_float(anchor.get("image_x", 0.0)))
+            row["image_y"].set(self._fmt_float(anchor.get("image_y", 0.0)))
+        self.apply_setting_map_preview()
+
+    def use_default_setting_map_anchors(self) -> None:
+        anchors = self.default_map_setting_anchors()[:5]
+        for row, anchor in zip(getattr(self, "map_setting_anchor_vars", []), anchors):
+            row["label"].set(str(anchor.get("label", row["label"].get()) or row["label"].get()))
+            row["world_x"].set(self._fmt_float(anchor.get("world_x", 0.0)))
+            row["world_y"].set(self._fmt_float(anchor.get("world_y", 0.0)))
+            row["image_x"].set(self._fmt_float(anchor.get("image_x", 0.0)))
+            row["image_y"].set(self._fmt_float(anchor.get("image_y", 0.0)))
+        self.apply_setting_map_preview()
+
+    def on_setting_map_click(self, image_x: float, image_y: float) -> None:
+        self.map_setting_last_image_coord = (float(image_x), float(image_y))
+        if getattr(self, "map_setting_click_coord_var", None) is not None:
+            self.map_setting_click_coord_var.set(
+                f"Last image coord: x={float(image_x):.1f}, y={float(image_y):.1f}"
+            )
+        selected = str(self.map_setting_selected_anchor_var.get() if getattr(self, "map_setting_selected_anchor_var", None) is not None else "")
+        for row in getattr(self, "map_setting_anchor_vars", []):
+            if str(row["label"].get()) == selected:
+                row["image_x"].set(self._fmt_float(image_x))
+                row["image_y"].set(self._fmt_float(image_y))
+                self.apply_setting_map_preview()
+                return
+
+    def on_setting_anchor_select(self, label: str, image_x: float, image_y: float) -> None:
+        label = str(label or "").strip()
+        if not label:
+            return
+        self.map_setting_last_image_coord = (float(image_x), float(image_y))
+        if getattr(self, "map_setting_selected_anchor_var", None) is not None:
+            self.map_setting_selected_anchor_var.set(label)
+        if getattr(self, "map_setting_click_coord_var", None) is not None:
+            self.map_setting_click_coord_var.set(
+                f"Last image coord: x={float(image_x):.1f}, y={float(image_y):.1f}"
+            )
+        self.apply_setting_map_preview()
+
+    def on_setting_anchor_drag(self, label: str, image_x: float, image_y: float) -> None:
+        label = str(label or "").strip()
+        if not label:
+            return
+        self.map_setting_last_image_coord = (float(image_x), float(image_y))
+        if getattr(self, "map_setting_selected_anchor_var", None) is not None:
+            self.map_setting_selected_anchor_var.set(label)
+        if getattr(self, "map_setting_click_coord_var", None) is not None:
+            self.map_setting_click_coord_var.set(
+                f"Last image coord: x={float(image_x):.1f}, y={float(image_y):.1f}"
+            )
+        for row in getattr(self, "map_setting_anchor_vars", []):
+            if str(row["label"].get()) == label:
+                row["image_x"].set(self._fmt_float(image_x))
+                row["image_y"].set(self._fmt_float(image_y))
+                self.apply_setting_map_preview()
+                return
+
+    def copy_setting_map_image_coord(self) -> None:
+        coord = getattr(self, "map_setting_last_image_coord", None)
+        if coord is None:
+            if getattr(self, "map_setting_status_var", None) is not None:
+                self.map_setting_status_var.set("Setting Map: click map first to generate image coord.")
+            return
+        text = f"{float(coord[0]):.1f}, {float(coord[1]):.1f}"
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.map_setting_status_var.set(f"Setting Map: copied image coord {text}")
+        except Exception as exc:
+            self.map_setting_status_var.set(f"Setting Map: copy failed: {exc}")
+
+    def set_setting_anchor_to_current_uav_image(self) -> None:
+        pose = self.latest_state.get("pose", {}) if isinstance(self.latest_state.get("pose"), dict) else {}
+        x = self._as_float_or_none(pose.get("x"))
+        y = self._as_float_or_none(pose.get("y"))
+        if x is None or y is None:
+            self.map_setting_status_var.set("Setting Map: no current UAV pose.")
+            return
+        image_point = self.world_to_image_point(float(x), float(y))
+        if image_point is None:
+            self.map_setting_status_var.set("Setting Map: current map affine unavailable.")
+            return
+        self.on_setting_map_click(float(image_point[0]), float(image_point[1]))
+
+    def apply_setting_map_preview(self) -> None:
+        widget = getattr(self, "map_setting_widget", None)
+        if widget is None:
+            return
+        anchors = self.map_setting_anchor_payload()
+        if len(anchors) < 3:
+            self.map_setting_status_var.set("Setting Map: need at least 3 valid points.")
+            return
+        affine = solve_affine_from_anchor_points(anchors)
+        if affine is None:
+            self.map_setting_status_var.set("Setting Map: failed to solve affine.")
+            return
+        rmse = affine_rmse_px(anchors, affine)
+        self.map_setting_preview_affine = affine
+        pose = self.latest_state.get("pose", {}) if isinstance(self.latest_state.get("pose"), dict) else {}
+        pose_x = float(pose.get("x", 0.0)) if pose else 0.0
+        pose_y = float(pose.get("y", 0.0)) if pose else 0.0
+        pose_yaw = float(pose.get("task_yaw", pose.get("yaw", 0.0))) if pose else 0.0
+        _houses, boxes = self.build_map_display(pose)
+        widget.set_background_image(self.map_image)
+        widget.set_calibration(affine, self.map_image_size(), anchors)
+        widget.set_image_layer_offset(*self.map_display_offset_px)
+        widget.set_house_boxes(boxes if self.show_houses_var.get() else [])
+        widget.update_houses([])
+        widget.update_uav(pose_x, pose_y, pose_yaw)
+        widget.set_trajectory([])
+        widget.set_route_plan({})
+        self.map_setting_status_var.set(
+            f"Setting Map: preview affine solved, points={len(anchors)} rmse={rmse:.2f}px. Click map to move selected point."
+        )
+
+    def save_setting_map_config(self) -> None:
+        if not self.load_map_resources(force=not bool(self.map_config)):
+            return
+        anchors = self.map_setting_anchor_payload()
+        if len(anchors) < 3:
+            self.map_setting_status_var.set("Setting Map: need at least 3 valid points before saving.")
+            return
+        affine = solve_affine_from_anchor_points(anchors)
+        if affine is None:
+            self.map_setting_status_var.set("Setting Map: failed to solve affine.")
+            return
+        try:
+            corrected = json.loads(json.dumps(self.map_config))
+            overhead = corrected.setdefault("overhead_map", {})
+            calibration = overhead.setdefault("calibration", {})
+            calibration["anchors"] = anchors
+            calibration["affine_world_to_image"] = affine
+            calibration["rmse_px"] = affine_rmse_px(anchors, affine)
+            calibration["updated_at"] = time.time()
+            calibration["setting_map_status"] = "manual_anchor_adjusted"
+            image_size = self.map_image_size()
+            if image_size is not None:
+                calibration["image_width"] = int(image_size[0])
+                calibration["image_height"] = int(image_size[1])
+            corrected["houses"] = rebuild_houses_for_corrected_affine(corrected, affine)
+            corrected["map_setting_adjustment"] = {
+                "saved_at": time.time(),
+                "anchor_count": len(anchors),
+                "rmse_px": calibration["rmse_px"],
+                "source_config": str(self.map_config_path or ""),
+            }
+            base_dir = self.map_config_path.parent if self.map_config_path is not None else PROJECT_ROOT / "assets" / "overhead_map"
+            output_path = (base_dir / DEFAULT_SETTING_MAP_CONFIG_NAME).resolve()
+            with open(output_path, "w", encoding="utf-8") as fh:
+                json.dump(corrected, fh, indent=2, ensure_ascii=False)
+            self.args.map_config = str(output_path)
+            self.map_config = {}
+            self.map_config_path = None
+            self.map_image_path = None
+            self.map_image = None
+            self.load_map_resources(force=True)
+            self.refresh_house_target_choices()
+            self.map_setting_status_var.set(f"Setting Map: saved {output_path.name}, rmse={calibration['rmse_px']:.2f}px")
+            self.status_var.set(f"Saved setting map config: {output_path.name}")
+            self.refresh_map_once(force_reload=True)
+            self.refresh_llm_route_map()
+            self.refresh_llm_route2_map()
+        except Exception as exc:
+            LOGGER.warning("Save setting map config failed: %s", exc)
+            self.map_setting_status_var.set(f"Setting Map: save failed: {exc}")
+            self.status_var.set(f"Save setting map config failed: {exc}")
 
     def toggle_map_window(self) -> None:
         if self.map_window is not None and self.map_window.winfo_exists():

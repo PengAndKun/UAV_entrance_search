@@ -140,7 +140,14 @@ class OverheadMapWidget:
         self._image_canvas_rect: Optional[Tuple[float, float, float, float]] = None
         self._image_layer_offset_px: Tuple[float, float] = (0.0, 0.0)
         self._affine_world_to_image: Optional[np.ndarray] = None
+        self._homography_world_to_image: Optional[np.ndarray] = None
         self._calibration_anchors: List[dict] = []
+        self._calibration_anchor_canvas_points: Dict[str, Tuple[float, float, float]] = {}
+        self._calibration_anchor_select_callback: Optional[Callable[[str, float, float], None]] = None
+        self._calibration_anchor_drag_callback: Optional[Callable[[str, float, float], None]] = None
+        self._drag_anchor_label: Optional[str] = None
+        self._drag_anchor_start_canvas: Optional[Tuple[float, float]] = None
+        self._drag_anchor_moved: bool = False
         self._house_boxes: List[dict] = []
         self._rect_select_enabled: bool = False
         self._rect_select_callback: Optional[Callable[[dict], None]] = None
@@ -274,6 +281,12 @@ class OverheadMapWidget:
                         "y": wy,
                         "label": str(point.get("label", "") or f"R{idx}"),
                         "status": status,
+                        "route_point_type": str(point.get("route_point_type", "") or ""),
+                        "scan_id": str(point.get("scan_id", "") or ""),
+                        "facade": str(point.get("facade", "") or ""),
+                        "height_band": str(point.get("height_band", "") or ""),
+                        "floor_index": point.get("floor_index"),
+                        "safe_interval_index": point.get("safe_interval_index"),
                     }
                 )
         self._route_plan = points
@@ -307,9 +320,15 @@ class OverheadMapWidget:
         affine_world_to_image: Optional[List[List[float]]],
         image_size: Optional[Tuple[int, int]],
         anchors: Optional[List[dict]] = None,
+        homography_world_to_image: Optional[List[List[float]]] = None,
     ) -> None:
-        """Set an optional affine world->image calibration for the background map."""
+        """Set optional world->image calibration for the background map."""
         self._affine_world_to_image = None if affine_world_to_image is None else np.asarray(affine_world_to_image, dtype=np.float32)
+        self._homography_world_to_image = (
+            None
+            if homography_world_to_image is None
+            else np.asarray(homography_world_to_image, dtype=np.float32)
+        )
         self._image_size = None if image_size is None else (int(image_size[0]), int(image_size[1]))
         self._calibration_anchors = list(anchors or [])
         self._redraw()
@@ -317,6 +336,15 @@ class OverheadMapWidget:
     def set_map_click_callback(self, fn: Callable[[float, float], None]) -> None:
         """Register a callback for raw background clicks in image-pixel space."""
         self._map_click_callback = fn
+
+    def set_calibration_anchor_callbacks(
+        self,
+        select_fn: Optional[Callable[[str, float, float], None]] = None,
+        drag_fn: Optional[Callable[[str, float, float], None]] = None,
+    ) -> None:
+        """Register callbacks for selecting and dragging calibration anchors."""
+        self._calibration_anchor_select_callback = select_fn
+        self._calibration_anchor_drag_callback = drag_fn
 
     def set_house_boxes(self, house_boxes: List[dict]) -> None:
         """Set map-image rectangle annotations for houses."""
@@ -342,18 +370,25 @@ class OverheadMapWidget:
         World y (right/south)   鈫?canvas y (top 鈫?bottom)
         A small margin of 5 % is kept on each side.
         """
-        if self._affine_world_to_image is not None and self._image_size is not None:
-            image_x = (
-                float(self._affine_world_to_image[0, 0]) * float(wx)
-                + float(self._affine_world_to_image[0, 1]) * float(wy)
-                + float(self._affine_world_to_image[0, 2])
-            )
-            image_y = (
-                float(self._affine_world_to_image[1, 0]) * float(wx)
-                + float(self._affine_world_to_image[1, 1]) * float(wy)
-                + float(self._affine_world_to_image[1, 2])
-            )
-            return self.image_to_canvas(image_x, image_y, apply_layer_offset=False)
+        if self._image_size is not None:
+            if self._homography_world_to_image is not None:
+                point = self._homography_world_to_image @ np.asarray([float(wx), float(wy), 1.0], dtype=np.float32)
+                if abs(float(point[2])) > 1e-9:
+                    image_x = float(point[0] / point[2])
+                    image_y = float(point[1] / point[2])
+                    return self.image_to_canvas(image_x, image_y, apply_layer_offset=False)
+            if self._affine_world_to_image is not None:
+                image_x = (
+                    float(self._affine_world_to_image[0, 0]) * float(wx)
+                    + float(self._affine_world_to_image[0, 1]) * float(wy)
+                    + float(self._affine_world_to_image[0, 2])
+                )
+                image_y = (
+                    float(self._affine_world_to_image[1, 0]) * float(wx)
+                    + float(self._affine_world_to_image[1, 1]) * float(wy)
+                    + float(self._affine_world_to_image[1, 2])
+                )
+                return self.image_to_canvas(image_x, image_y, apply_layer_offset=False)
 
         margin_x = self._canvas_w * 0.05
         margin_y = self._canvas_h * 0.05
@@ -468,6 +503,7 @@ class OverheadMapWidget:
         except tk.TclError:
             return
         self._house_canvas_circles.clear()
+        self._calibration_anchor_canvas_points.clear()
         self._image_canvas_rect = None
 
         if self._background_bgr is not None:
@@ -656,10 +692,21 @@ class OverheadMapWidget:
                 x1, y1, _ = canvas_points[idx]
                 x2, y2, next_point = canvas_points[idx + 1]
                 point = canvas_points[idx][2]
+                point_type = str(point.get("route_point_type", "") or "")
+                next_type = str(next_point.get("route_point_type", "") or "")
+                if "observation" in point_type or "observation" in next_type:
+                    continue
                 point_is_scan = point.get("route_point_type") == "scan_point" or bool(point.get("scan_id"))
                 next_is_scan = next_point.get("route_point_type") == "scan_point" or bool(next_point.get("scan_id"))
                 if point_is_scan and next_is_scan and point.get("facade") != next_point.get("facade"):
                     continue
+                if point_is_scan and next_is_scan and point.get("facade") == next_point.get("facade"):
+                    if (
+                        point.get("safe_interval_index") is not None
+                        and next_point.get("safe_interval_index") is not None
+                        and str(point.get("safe_interval_index")) != str(next_point.get("safe_interval_index"))
+                    ):
+                        continue
                 self.canvas.create_line(
                     x1,
                     y1,
@@ -674,20 +721,33 @@ class OverheadMapWidget:
         for idx, (cx, cy, point) in enumerate(canvas_points):
             status = str(point.get("status", "") or "")
             is_scan_point = point.get("route_point_type") == "scan_point" or bool(point.get("scan_id"))
+            floor_index = 0
+            try:
+                floor_index = int(point.get("floor_index") or 0)
+            except Exception:
+                floor_index = 0
             if status in {"visited", "done", "captured"}:
                 color = ROUTE_PLAN_VISITED_COLOR
             elif status == "active":
                 color = ROUTE_PLAN_ACTIVE_COLOR
+            elif status == "blocked":
+                color = "#ef4444"
             elif is_scan_point:
-                color = "#ffd166"
+                band_palette = ["#ffd166", "#73d2de", "#c084fc", "#fb7185"]
+                color = band_palette[(max(1, floor_index) - 1) % len(band_palette)] if floor_index else "#ffd166"
             else:
                 color = ROUTE_PLAN_COLOR
             radius = 6 if status == "active" else (4 if is_scan_point else 5)
+            draw_cx = cx
+            draw_cy = cy
+            if is_scan_point and floor_index > 1:
+                draw_cx += float(((floor_index - 1) % 4) - 1.5) * 3.0
+                draw_cy -= float((floor_index - 1) // 4) * 3.0
             self.canvas.create_oval(
-                cx - radius,
-                cy - radius,
-                cx + radius,
-                cy + radius,
+                draw_cx - radius,
+                draw_cy - radius,
+                draw_cx + radius,
+                draw_cy + radius,
                 fill=color,
                 outline="#1a1a1a",
                 width=1,
@@ -698,8 +758,8 @@ class OverheadMapWidget:
                 label = label if idx % 5 == 0 else ""
             if label:
                 self.canvas.create_text(
-                    cx + 8,
-                    cy - 8,
+                    draw_cx + 8,
+                    draw_cy - 8,
                     text=label,
                     fill=ROUTE_PLAN_TEXT_COLOR,
                     font=("Consolas", 8, "bold"),
@@ -767,6 +827,7 @@ class OverheadMapWidget:
             outline = "#ffffff"
             text_fill = "#00f0ff"
             r = 7
+        self._calibration_anchor_canvas_points[label] = (float(cx), float(cy), float(r) + 8.0)
         self.canvas.create_oval(
             cx - r - 3, cy - r - 3, cx + r + 3, cy + r + 3,
             fill="#101018", outline="#101018", width=1, tags="dynamic",
@@ -904,7 +965,33 @@ class OverheadMapWidget:
     # Click handling
     # ------------------------------------------------------------------
 
+    def _hit_calibration_anchor(self, canvas_x: float, canvas_y: float) -> Optional[str]:
+        for label, (cx, cy, radius) in self._calibration_anchor_canvas_points.items():
+            if math.hypot(float(canvas_x) - cx, float(canvas_y) - cy) <= max(10.0, radius):
+                return label
+        return None
+
+    def _emit_calibration_anchor_select(self, label: str, canvas_x: float, canvas_y: float) -> None:
+        if self._calibration_anchor_select_callback is None:
+            return
+        image_x, image_y = self.canvas_to_image(float(canvas_x), float(canvas_y))
+        self._calibration_anchor_select_callback(str(label), float(image_x), float(image_y))
+
+    def _emit_calibration_anchor_drag(self, label: str, canvas_x: float, canvas_y: float) -> None:
+        if self._calibration_anchor_drag_callback is None:
+            return
+        image_x, image_y = self.canvas_to_image(float(canvas_x), float(canvas_y))
+        self._calibration_anchor_drag_callback(str(label), float(image_x), float(image_y))
+
     def _on_canvas_press(self, event: tk.Event) -> None:
+        if not self._rect_select_enabled:
+            label = self._hit_calibration_anchor(float(event.x), float(event.y))
+            if label:
+                self._drag_anchor_label = label
+                self._drag_anchor_start_canvas = (float(event.x), float(event.y))
+                self._drag_anchor_moved = False
+                self._emit_calibration_anchor_select(label, float(event.x), float(event.y))
+            return
         if not self._rect_select_enabled:
             return
         self._rect_start_canvas = (float(event.x), float(event.y))
@@ -912,6 +999,14 @@ class OverheadMapWidget:
         self._redraw()
 
     def _on_canvas_drag(self, event: tk.Event) -> None:
+        if self._drag_anchor_label:
+            if self._drag_anchor_start_canvas is not None:
+                sx, sy = self._drag_anchor_start_canvas
+                if math.hypot(float(event.x) - sx, float(event.y) - sy) < 2.0 and not self._drag_anchor_moved:
+                    return
+            self._drag_anchor_moved = True
+            self._emit_calibration_anchor_drag(self._drag_anchor_label, float(event.x), float(event.y))
+            return
         if not self._rect_select_enabled or self._rect_start_canvas is None:
             return
         sx, sy = self._rect_start_canvas
@@ -919,6 +1014,13 @@ class OverheadMapWidget:
         self._redraw()
 
     def _on_canvas_release(self, event: tk.Event) -> None:
+        if self._drag_anchor_label:
+            if self._drag_anchor_moved:
+                self._emit_calibration_anchor_drag(self._drag_anchor_label, float(event.x), float(event.y))
+            self._drag_anchor_label = None
+            self._drag_anchor_start_canvas = None
+            self._drag_anchor_moved = False
+            return
         if not self._rect_select_enabled or self._rect_start_canvas is None:
             return
         sx, sy = self._rect_start_canvas
@@ -945,6 +1047,10 @@ class OverheadMapWidget:
         if self._rect_select_enabled:
             return
         ex, ey = event.x, event.y
+        label = self._hit_calibration_anchor(float(ex), float(ey))
+        if label:
+            self._emit_calibration_anchor_select(label, float(ex), float(ey))
+            return
         if self._click_callback is not None:
             for house_id, (cx, cy, r_px) in self._house_canvas_circles.items():
                 dist = math.sqrt((ex - cx) ** 2 + (ey - cy) ** 2)
