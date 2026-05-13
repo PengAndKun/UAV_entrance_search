@@ -21,6 +21,12 @@ class FlightControlMixin:
         self.stream_capture_stop_event.set()
         self.lidar_stream_capture_stop_event.set()
         self.route_stop_event.set()
+        route3_stop_event = getattr(self, "llm_route3_stop_event", None)
+        if route3_stop_event is not None:
+            route3_stop_event.set()
+        route3_pause_event = getattr(self, "llm_route3_pause_event", None)
+        if route3_pause_event is not None:
+            route3_pause_event.clear()
         session = self.session
         if session is None:
             try:
@@ -232,6 +238,10 @@ class FlightControlMixin:
 
     def keyboard_control_tick(self) -> None:
         self.keyboard_loop_after_id = None
+        if getattr(self, "llm_route3_control_locked", False):
+            self.keyboard_pressed_symbols.clear()
+            self.update_keyboard_status("locked by LLM Route V3")
+            return
         if not self.keyboard_enabled_var.get():
             self.stop_keyboard_control(send_hold=True)
             return
@@ -319,6 +329,9 @@ class FlightControlMixin:
         )
 
     def send_move_symbol(self, symbol: str) -> None:
+        if getattr(self, "llm_route3_control_locked", False):
+            self.status_var.set(f"Move {symbol} ignored while LLM Route V3 controls movement.")
+            return
         if self.move_request_inflight or self.keyboard_request_inflight:
             self.status_var.set(f"Move {symbol} ignored while another move is in flight.")
             return

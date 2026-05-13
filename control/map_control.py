@@ -847,15 +847,26 @@ class MapControlMixin:
         if affine is None:
             self.map_setting_status_var.set("Setting Map: failed to solve affine.")
             return
-        rmse = affine_rmse_px(anchors, affine)
+        homography = solve_homography_from_anchor_points(anchors)
+        preview_calibration: Dict[str, Any] = {"anchors": anchors, "affine_world_to_image": affine}
+        if homography is not None:
+            preview_calibration["homography_world_to_image"] = homography
+            preview_calibration["transform_mode"] = "homography"
+            rmse = homography_rmse_px(anchors, homography)
+            mode = "homography"
+        else:
+            preview_calibration["transform_mode"] = "affine"
+            rmse = affine_rmse_px(anchors, affine)
+            mode = "affine"
         self.map_setting_preview_affine = affine
+        self.map_setting_preview_homography = homography
         pose = self.latest_state.get("pose", {}) if isinstance(self.latest_state.get("pose"), dict) else {}
         pose_x = float(pose.get("x", 0.0)) if pose else 0.0
         pose_y = float(pose.get("y", 0.0)) if pose else 0.0
         pose_yaw = float(pose.get("task_yaw", pose.get("yaw", 0.0))) if pose else 0.0
         _houses, boxes = self.build_map_display(pose)
         widget.set_background_image(self.map_image)
-        widget.set_calibration(affine, self.map_image_size(), anchors)
+        widget.set_calibration(affine, self.map_image_size(), anchors, homography)
         widget.set_image_layer_offset(*self.map_display_offset_px)
         widget.set_house_boxes(boxes if self.show_houses_var.get() else [])
         widget.update_houses([])
@@ -863,7 +874,7 @@ class MapControlMixin:
         widget.set_trajectory([])
         widget.set_route_plan({})
         self.map_setting_status_var.set(
-            f"Setting Map: preview affine solved, points={len(anchors)} rmse={rmse:.2f}px. Click map to move selected point."
+            f"Setting Map: preview {mode} solved, points={len(anchors)} rmse={rmse:.2f}px. Click map to move selected point."
         )
 
     def save_setting_map_config(self) -> None:
@@ -877,24 +888,36 @@ class MapControlMixin:
         if affine is None:
             self.map_setting_status_var.set("Setting Map: failed to solve affine.")
             return
+        homography = solve_homography_from_anchor_points(anchors)
         try:
             corrected = json.loads(json.dumps(self.map_config))
             overhead = corrected.setdefault("overhead_map", {})
             calibration = overhead.setdefault("calibration", {})
             calibration["anchors"] = anchors
             calibration["affine_world_to_image"] = affine
-            calibration["rmse_px"] = affine_rmse_px(anchors, affine)
+            calibration["affine_rmse_px"] = affine_rmse_px(anchors, affine)
+            if homography is not None:
+                calibration["homography_world_to_image"] = homography
+                calibration["homography_rmse_px"] = homography_rmse_px(anchors, homography)
+                calibration["rmse_px"] = calibration["homography_rmse_px"]
+                calibration["transform_mode"] = "homography"
+            else:
+                calibration.pop("homography_world_to_image", None)
+                calibration.pop("homography_rmse_px", None)
+                calibration["rmse_px"] = calibration["affine_rmse_px"]
+                calibration["transform_mode"] = "affine"
             calibration["updated_at"] = time.time()
             calibration["setting_map_status"] = "manual_anchor_adjusted"
             image_size = self.map_image_size()
             if image_size is not None:
                 calibration["image_width"] = int(image_size[0])
                 calibration["image_height"] = int(image_size[1])
-            corrected["houses"] = rebuild_houses_for_corrected_affine(corrected, affine)
+            corrected["houses"] = rebuild_houses_for_corrected_transform(corrected, calibration)
             corrected["map_setting_adjustment"] = {
                 "saved_at": time.time(),
                 "anchor_count": len(anchors),
                 "rmse_px": calibration["rmse_px"],
+                "transform_mode": calibration["transform_mode"],
                 "source_config": str(self.map_config_path or ""),
             }
             base_dir = self.map_config_path.parent if self.map_config_path is not None else PROJECT_ROOT / "assets" / "overhead_map"
@@ -913,6 +936,7 @@ class MapControlMixin:
             self.refresh_map_once(force_reload=True)
             self.refresh_llm_route_map()
             self.refresh_llm_route2_map()
+            self.refresh_llm_route3_map()
         except Exception as exc:
             LOGGER.warning("Save setting map config failed: %s", exc)
             self.map_setting_status_var.set(f"Setting Map: save failed: {exc}")
@@ -975,7 +999,12 @@ class MapControlMixin:
             anchors = calibration.get("anchors", []) if isinstance(calibration.get("anchors", []), list) else []
             anchors = self.anchors_with_touch_status(anchors) if self.show_calibration_points_var.get() else []
             self.map_widget.set_background_image(self.map_image)
-            self.map_widget.set_calibration(affine, self.map_image_size(), anchors)
+            self.map_widget.set_calibration(
+                affine,
+                self.map_image_size(),
+                anchors,
+                calibration.get("homography_world_to_image"),
+            )
             self.map_widget.set_image_layer_offset(*self.map_display_offset_px)
             self.map_widget.set_house_boxes(boxes if self.show_houses_var.get() else [])
             self.map_widget.update_houses([])

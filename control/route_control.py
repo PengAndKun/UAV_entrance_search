@@ -2478,7 +2478,8 @@ class RouteControlMixin:
             photo = ImageTk.PhotoImage(self.route2_rgb_preview_image(image, widget))
             self.route2_draw_rgb_preview_photo(widget, photo)
             self.llm_route2_rgb_photo = photo
-            self.llm_route2_rgb_status_var.set(f"Facade RGB: {image_path.name}")
+            suffix = " (panorama used)" if image_path.name == "coarse_rgb_panorama.png" else ""
+            self.llm_route2_rgb_status_var.set(f"Facade RGB: {image_path.name}{suffix}")
         except Exception as exc:
             LOGGER.warning("Refresh route v2 facade RGB failed: %s", exc)
             try:
@@ -2569,8 +2570,12 @@ class RouteControlMixin:
 
     def route2_current_rgb_path(self) -> Optional[Path]:
         state = self.route2_selected_state()
-        candidates: List[Any] = [state.get("coarse_rgb_path")]
+        candidates: List[Any] = [state.get("coarse_rgb_panorama_path")]
         coarse_capture = state.get("coarse_capture", {}) if isinstance(state.get("coarse_capture"), dict) else {}
+        candidates.append(coarse_capture.get("coarse_rgb_panorama_path"))
+        panorama_capture = state.get("panorama_capture", {}) if isinstance(state.get("panorama_capture"), dict) else {}
+        candidates.append(panorama_capture.get("coarse_rgb_panorama_path"))
+        candidates.append(state.get("coarse_rgb_path"))
         candidates.append(coarse_capture.get("coarse_rgb_path"))
         capture_result = coarse_capture.get("capture_result", {}) if isinstance(coarse_capture.get("capture_result"), dict) else {}
         candidates.append(capture_result.get("rgb_path"))
@@ -2579,6 +2584,8 @@ class RouteControlMixin:
             candidates.append(capture_dir / "rgb.png")
         _, facade_dir, _, _ = self.route2_facade_paths()
         if facade_dir is not None:
+            candidates.append(facade_dir / "coarse_rgb_panorama.png")
+            candidates.append(facade_dir / "coarse_rgb_center.png")
             candidates.append(facade_dir / "coarse_rgb.png")
         for candidate in candidates:
             path = candidate if isinstance(candidate, Path) else self.route2_candidate_path(candidate)
@@ -2781,7 +2788,7 @@ class RouteControlMixin:
         facade = str(facade or "").strip().lower()
         if facade not in {"south", "east", "north", "west"} or not blocking_obstacle:
             return {}
-        boundary_gap = 2.0
+        boundary_gap = float(LLM_ROUTE3_OBSERVATION_BOUNDARY_GAP_CM)
         try:
             if facade == "east":
                 new_standoff = float(blocking_obstacle["min_x"]) - boundary_gap - float(bbox["max_x"])
@@ -2793,7 +2800,7 @@ class RouteControlMixin:
                 new_standoff = float(bbox["min_y"]) - (float(blocking_obstacle["max_y"]) + boundary_gap)
         except Exception:
             return {}
-        if new_standoff <= 20.0:
+        if new_standoff < float(LLM_ROUTE_MIN_PERIMETER_STANDOFF_CM):
             return {}
         pose = self.route2_facade_pose_from_axis(bbox, facade, axis_value, new_standoff, z_cm)
         return {
@@ -3046,9 +3053,9 @@ class RouteControlMixin:
         completed = set(getattr(self, "llm_route2_completed_facades", set()) or set()) if skip_completed else set()
         pose_z = self._as_float_or_none(pose.get("z")) if pose else None
         if pose_z is not None and 80.0 <= float(pose_z) <= 900.0:
-            z_cm = float(pose_z)
+            z_cm = max(float(LLM_ROUTE2_OBSERVATION_Z_CM), float(pose_z))
         else:
-            z_cm = min(max(self.route2_low_z_cm(), 150.0), 300.0)
+            z_cm = max(float(LLM_ROUTE2_OBSERVATION_Z_CM), min(max(self.route2_low_z_cm(), 150.0), 300.0))
         candidates: List[Dict[str, Any]] = []
         for facade in ("south", "east", "north", "west"):
             if selected_facade and facade != selected_facade:
@@ -3290,9 +3297,9 @@ class RouteControlMixin:
         py = self._as_float_or_none(pose.get("y")) if pose else None
         pose_z = self._as_float_or_none(pose.get("z")) if pose else None
         if pose_z is not None and 80.0 <= float(pose_z) <= 900.0:
-            z_cm = float(pose_z)
+            z_cm = max(float(LLM_ROUTE2_OBSERVATION_Z_CM), float(pose_z))
         else:
-            z_cm = min(max(self.route2_low_z_cm(), 150.0), 300.0)
+            z_cm = max(float(LLM_ROUTE2_OBSERVATION_Z_CM), min(max(self.route2_low_z_cm(), 150.0), 300.0))
         axis_min, axis_max = self.route2_facade_axis_range(bbox, facade)
         axis_value = self.route2_facade_center_axis(bbox, facade)
         facade_length = abs(float(axis_max) - float(axis_min))
@@ -3519,20 +3526,25 @@ class RouteControlMixin:
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
         self.llm_route2_state = state
-        self.llm_route2_facade_var.set(f"Facade: {facade or 'n/a'}")
-        selected_var = getattr(self, "llm_route2_selected_facade_var", None)
-        if selected_var is not None and facade:
-            try:
-                selected_var.set(facade)
-            except tk.TclError:
-                pass
         self.write_json_artifact(facade_dir / "facade_observation_point.json", observation)
         self.route2_write_state_artifact()
-        self.llm_route2_status_var.set(
-            f"LLM Route V2: {status_label} facade={facade} obs=({observation.get('x')},{observation.get('y')},{observation.get('z')})"
-        )
-        self.refresh_route2_preview()
-        self.refresh_llm_route2_map()
+
+        def ui_update() -> None:
+            self.llm_route2_facade_var.set(f"Facade: {facade or 'n/a'}")
+            selected_var = getattr(self, "llm_route2_selected_facade_var", None)
+            if selected_var is not None and facade:
+                try:
+                    selected_var.set(facade)
+                except tk.TclError:
+                    pass
+            self.llm_route2_status_var.set(
+                f"LLM Route V2: {status_label} facade={facade} obs=({observation.get('x')},{observation.get('y')},{observation.get('z')})"
+            )
+            self.refresh_route2_preview()
+            self.refresh_llm_route2_map()
+            self.refresh_route3_support_views()
+
+        self.root.after(0, ui_update)
 
     def on_route2_plan_nearest_facade(self) -> None:
         target_house_id = self.selected_route_target_house_id()
@@ -3777,6 +3789,7 @@ class RouteControlMixin:
             "facade": facade,
             "bbox_world_cm": bbox,
             "observation_pose": observation,
+            "observation_obstacle_analysis": state.get("observation_obstacle_analysis", {}),
             "floor_height_m": self.route2_floor_height_m(),
             "default_floors": self.route2_default_floors(),
             "expected_schema": LLM_ROUTE2_FACADE_ANALYSIS_SCHEMA,
@@ -4468,6 +4481,66 @@ class RouteControlMixin:
             scan_index += 1
         return points
 
+    def route2_scan_continuity_start_pose(self) -> Dict[str, float]:
+        pose = self.current_route_pose() or {}
+        x = self._as_float_or_none(pose.get("x"))
+        y = self._as_float_or_none(pose.get("y"))
+        z = self._as_float_or_none(pose.get("z"))
+        if x is not None and y is not None:
+            return {"x": float(x), "y": float(y), "z": float(z if z is not None else 0.0)}
+        observation = self.route2_selected_state().get("observation_point", {})
+        if isinstance(observation, dict):
+            ox = self._as_float_or_none(observation.get("x"))
+            oy = self._as_float_or_none(observation.get("y"))
+            oz = self._as_float_or_none(observation.get("z"))
+            if ox is not None and oy is not None:
+                return {"x": float(ox), "y": float(oy), "z": float(oz if oz is not None else 0.0)}
+        return {}
+
+    def route2_scan_continuity_cost(self, current: Dict[str, Any], point: Dict[str, Any]) -> float:
+        dx = float(point.get("x", 0.0)) - float(current.get("x", 0.0))
+        dy = float(point.get("y", 0.0)) - float(current.get("y", 0.0))
+        dz = float(point.get("z", 0.0)) - float(current.get("z", 0.0))
+        return float(math.hypot(dx, dy) + 0.35 * abs(dz))
+
+    def route2_order_scan_points_continuously(
+        self,
+        points: List[Dict[str, Any]],
+        *,
+        start_pose: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        remaining = [dict(point) for point in points if isinstance(point, dict)]
+        if len(remaining) <= 1:
+            for idx, item in enumerate(remaining):
+                item["continuous_order_index"] = idx
+                item["continuous_sort_source"] = "single_or_empty"
+                item["travel_delta_cm"] = 0.0
+            return remaining
+        current = dict(start_pose or self.route2_scan_continuity_start_pose() or {})
+        if not current:
+            current = dict(remaining[0])
+        ordered: List[Dict[str, Any]] = []
+        previous_local_id = ""
+        while remaining:
+            best_idx = min(
+                range(len(remaining)),
+                key=lambda idx: (
+                    self.route2_scan_continuity_cost(current, remaining[idx]),
+                    int(remaining[idx].get("floor_index", 0) or 0),
+                    int(remaining[idx].get("local_scan_index", idx) or idx),
+                ),
+            )
+            item = remaining.pop(best_idx)
+            travel_delta = self.route2_scan_continuity_cost(current, item)
+            item["continuous_order_index"] = len(ordered)
+            item["previous_local_scan_id"] = previous_local_id
+            item["travel_delta_cm"] = round(float(travel_delta), 2)
+            item["continuous_sort_source"] = "nearest_neighbor_xy_plus_z"
+            ordered.append(item)
+            previous_local_id = str(item.get("scan_id", "") or "")
+            current = item
+        return ordered
+
     def route2_scan_order_from_point(self, point: Dict[str, Any]) -> int:
         value = self._as_float_or_none(point.get("global_scan_order"))
         if value is not None:
@@ -4519,6 +4592,11 @@ class RouteControlMixin:
             item["global_scan_order"] = int(order)
             item["scan_id"] = f"{house_id}_scan_{order:04d}_{suffix}"
             assigned.append(item)
+        previous_scan_id = ""
+        for idx, item in enumerate(assigned):
+            item["continuous_order_index"] = int(idx)
+            item["previous_scan_id"] = previous_scan_id
+            previous_scan_id = str(item.get("scan_id", "") or "")
         return assigned
 
     def route2_write_merged_scan_points(self, output_dir: Path, house_id: str) -> List[Dict[str, Any]]:
@@ -4554,6 +4632,7 @@ class RouteControlMixin:
         if output_dir is None or facade_dir is None:
             self.llm_route2_status_var.set("LLM Route V2: missing facade output directory.")
             return
+        points = self.route2_order_scan_points_continuously(points)
         points = self.route2_assign_global_scan_ids(output_dir, house_id, facade, points)
         validation = self.scan_point_validation_report(house_id, points)
         search_plan = {
@@ -4862,6 +4941,2157 @@ class RouteControlMixin:
         except Exception as exc:
             LOGGER.warning("Route V2 facade validation failed: %s", exc)
             self.llm_route2_status_var.set(f"LLM Route V2: validation failed: {exc}")
+
+    def make_route3_autosearch_output_dir(self, target_house_id: str) -> Path:
+        root = self.resolve_project_path("route_capture_lidar")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        safe_house = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(target_house_id or "unknown")).strip("_") or "unknown"
+        base_name = f"house_{safe_house}_autosearch_v3_{timestamp}"
+        root.mkdir(parents=True, exist_ok=True)
+        candidate = root / base_name
+        suffix = 1
+        while candidate.exists():
+            suffix += 1
+            candidate = root / f"{base_name}_{suffix}"
+        (candidate / "frames").mkdir(parents=True, exist_ok=True)
+        (candidate / "reconstruction").mkdir(parents=True, exist_ok=True)
+        (candidate / "facade_observations").mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def route3_float_param(self, var: tk.StringVar, default: float, *, min_value: float, max_value: float) -> float:
+        try:
+            value = float(var.get().strip())
+        except Exception:
+            value = float(default)
+        return max(float(min_value), min(float(max_value), float(value)))
+
+    def route3_nav_config(self) -> Dict[str, float]:
+        return {
+            "move_tick_ms": self.route3_float_param(self.llm_route3_move_tick_ms_var, 150.0, min_value=50.0, max_value=2000.0),
+            "nav_step_cm": self.route3_float_param(self.llm_route3_nav_step_cm_var, 20.0, min_value=5.0, max_value=200.0),
+            "reach_tol_cm": self.route3_float_param(self.llm_route3_reach_tol_cm_var, 60.0, min_value=5.0, max_value=500.0),
+            "z_tol_cm": self.route3_float_param(self.llm_route3_z_tol_cm_var, 40.0, min_value=5.0, max_value=500.0),
+            "yaw_tol_deg": self.route3_float_param(self.llm_route3_yaw_tol_deg_var, 10.0, min_value=1.0, max_value=90.0),
+            "max_stage_s": self.route3_float_param(self.llm_route3_max_stage_s_var, 90.0, min_value=5.0, max_value=900.0),
+        }
+
+    def route3_state_output_dir(self) -> Optional[Path]:
+        state = self.llm_route3_state if isinstance(getattr(self, "llm_route3_state", None), dict) else {}
+        raw = str(state.get("output_dir", "") or "")
+        if not raw:
+            return None
+        path = Path(raw)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "frames").mkdir(parents=True, exist_ok=True)
+        (path / "reconstruction").mkdir(parents=True, exist_ok=True)
+        (path / "facade_observations").mkdir(parents=True, exist_ok=True)
+        return path
+
+    def route3_update_state(self, **updates: Any) -> Dict[str, Any]:
+        state = dict(self.llm_route3_state if isinstance(getattr(self, "llm_route3_state", None), dict) else {})
+        state.update(updates)
+        state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self.llm_route3_state = state
+        return state
+
+    def route3_write_state_artifact(self) -> None:
+        output_dir = self.route3_state_output_dir()
+        if output_dir is None:
+            return
+        self.write_json_artifact(output_dir / "autonomy_state.json", self.llm_route3_state)
+
+    def route3_log_event(self, output_dir: Optional[Path], event_type: str, payload: Dict[str, Any]) -> None:
+        if output_dir is None:
+            return
+        row = {
+            "event_type": str(event_type),
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+            **(payload if isinstance(payload, dict) else {}),
+        }
+        self.append_jsonl(output_dir / "autonomy_events.jsonl", row)
+
+    def route3_set_stage(
+        self,
+        stage: str,
+        *,
+        output_dir: Optional[Path] = None,
+        facade: str = "",
+        message: str = "",
+        target: Optional[Dict[str, Any]] = None,
+        error: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        update: Dict[str, Any] = {"stage": stage}
+        if facade:
+            update["current_facade"] = facade
+        if target is not None:
+            update["current_target_pose"] = target
+        if error is not None:
+            update["last_error"] = error
+        self.route3_update_state(**update)
+        self.route3_write_state_artifact()
+        self.route3_log_event(output_dir or self.route3_state_output_dir(), "stage", {"stage": stage, "facade": facade, "message": message})
+        self.root.after(0, lambda s=stage: self.llm_route3_stage_var.set(f"Stage: {s}"))
+        if facade:
+            self.root.after(0, lambda f=facade: self.llm_route3_active_var.set(f"Active: facade={f}"))
+        if target:
+            self.root.after(
+                0,
+                lambda t=target: self.llm_route3_target_var.set(
+                    f"Target: ({float(t.get('x', 0.0)):.1f},{float(t.get('y', 0.0)):.1f},{float(t.get('z', 0.0)):.1f}) yaw={float(t.get('yaw', t.get('yaw_deg', 0.0))):.1f}"
+                ),
+            )
+        if error:
+            self.root.after(0, lambda e=error: self.llm_route3_error_var.set(f"Error: {e.get('reason', e.get('status', 'CHECK'))}"))
+        if message:
+            self.root.after(0, lambda m=message: self.llm_route3_status_var.set(f"LLM Route V3: {m}"))
+        self.root.after(0, self.refresh_route3_support_views)
+
+    def route3_pose_from_payload(self, payload: Dict[str, Any]) -> Dict[str, float]:
+        pose = payload.get("pose", payload) if isinstance(payload, dict) else {}
+        if not isinstance(pose, dict):
+            return {}
+        x = self._as_float_or_none(pose.get("x"))
+        y = self._as_float_or_none(pose.get("y"))
+        z = self._as_float_or_none(pose.get("z"))
+        yaw = self._as_float_or_none(pose.get("task_yaw", pose.get("yaw")))
+        if x is None or y is None:
+            return {}
+        return {
+            "x": float(x),
+            "y": float(y),
+            "z": float(z if z is not None else 0.0),
+            "yaw": float(yaw if yaw is not None else 0.0),
+        }
+
+    def route3_current_pose(self, session: Optional[flight.DroneFlightSession] = None) -> Dict[str, float]:
+        pose = self.route3_pose_from_payload(self.latest_state)
+        if pose:
+            return pose
+        if session is not None:
+            state = self.safe("Route V3 get state", session.get_state)
+            if isinstance(state, dict):
+                self.root.after(0, lambda r=state: self.apply_state(r))
+                return self.route3_pose_from_payload(state)
+        return {}
+
+    def route3_target_pose_from_point(self, point: Dict[str, Any]) -> Dict[str, float]:
+        return {
+            "x": float(point.get("x", point.get("world_x", 0.0)) or 0.0),
+            "y": float(point.get("y", point.get("world_y", 0.0)) or 0.0),
+            "z": float(point.get("z", 300.0) or 300.0),
+            "yaw": float(point.get("yaw_deg", point.get("yaw", 0.0)) or 0.0),
+        }
+
+    def route3_pose_error(self, current: Dict[str, float], target: Dict[str, float], config: Dict[str, float]) -> Dict[str, Any]:
+        dx = float(target["x"]) - float(current["x"])
+        dy = float(target["y"]) - float(current["y"])
+        dz = float(target["z"]) - float(current.get("z", 0.0))
+        yaw_error = self._normalize_angle_deg(float(target.get("yaw", target.get("yaw_deg", 0.0))) - float(current.get("yaw", 0.0)))
+        dist_xy = float(math.hypot(dx, dy))
+        return {
+            "dx": round(dx, 3),
+            "dy": round(dy, 3),
+            "dz": round(dz, 3),
+            "dist_xy_cm": round(dist_xy, 3),
+            "yaw_error_deg": round(float(yaw_error), 3),
+            "reached": bool(
+                dist_xy <= float(config["reach_tol_cm"])
+                and abs(dz) <= float(config["z_tol_cm"])
+                and abs(yaw_error) <= float(config["yaw_tol_deg"])
+            ),
+        }
+
+    def route3_movement_payload_for_target(self, current: Dict[str, float], target: Dict[str, float], config: Dict[str, float]) -> Dict[str, Any]:
+        error = self.route3_pose_error(current, target, config)
+        yaw_rad = math.radians(float(current.get("yaw", 0.0)))
+        dx = float(error["dx"])
+        dy = float(error["dy"])
+        forward = dx * math.cos(yaw_rad) + dy * math.sin(yaw_rad)
+        right = -dx * math.sin(yaw_rad) + dy * math.cos(yaw_rad)
+        horizontal_len = math.hypot(forward, right)
+        step = float(config["nav_step_cm"])
+        if horizontal_len <= float(config["reach_tol_cm"]):
+            forward = 0.0
+            right = 0.0
+        elif horizontal_len > step and horizontal_len > 1e-6:
+            scale = step / horizontal_len
+            forward *= scale
+            right *= scale
+        up = float(error["dz"])
+        if abs(up) <= float(config["z_tol_cm"]):
+            up = 0.0
+        else:
+            up = max(-step, min(step, up))
+        yaw_delta = float(error["yaw_error_deg"])
+        if abs(yaw_delta) <= float(config["yaw_tol_deg"]):
+            yaw_delta = 0.0
+        else:
+            yaw_delta = max(-30.0, min(30.0, yaw_delta))
+        if abs(forward) <= 1e-6 and abs(right) <= 1e-6 and abs(up) <= 1e-6 and abs(yaw_delta) <= 1e-6:
+            action = "hold"
+        else:
+            action = "route3_nav"
+        return {
+            "forward_cm": round(float(forward), 3),
+            "right_cm": round(float(right), 3),
+            "up_cm": round(float(up), 3),
+            "yaw_delta_deg": round(float(yaw_delta), 3),
+            "action_name": action,
+        }
+
+    def route3_predict_next_pose(self, current: Dict[str, float], payload: Dict[str, Any]) -> Dict[str, float]:
+        yaw_rad = math.radians(float(current.get("yaw", 0.0)))
+        forward = float(payload.get("forward_cm", 0.0) or 0.0)
+        right = float(payload.get("right_cm", 0.0) or 0.0)
+        return {
+            "x": float(current["x"]) + forward * math.cos(yaw_rad) - right * math.sin(yaw_rad),
+            "y": float(current["y"]) + forward * math.sin(yaw_rad) + right * math.cos(yaw_rad),
+            "z": float(current.get("z", 0.0)) + float(payload.get("up_cm", 0.0) or 0.0),
+            "yaw": self._normalize_angle_deg(float(current.get("yaw", 0.0)) + float(payload.get("yaw_delta_deg", 0.0) or 0.0)),
+        }
+
+    def route3_safety_report_for_pose(self, target_house_id: str, pose: Dict[str, float]) -> Dict[str, Any]:
+        bounds = self.route2_observation_map_bounds_report(float(pose["x"]), float(pose["y"]))
+        if not bool(bounds.get("in_bounds", True)):
+            return {"safe": False, "reason": "map_boundary", "map_bounds": bounds}
+        target_bbox = self.house_world_bbox_for_id(str(target_house_id or "").strip())
+        if target_bbox and self.point_inside_open_bbox(float(pose["x"]), float(pose["y"]), target_bbox):
+            return {
+                "safe": False,
+                "reason": "target_house_bbox",
+                "blocking_house_id": str(target_house_id or ""),
+                "obstacle": target_bbox,
+                "map_bounds": bounds,
+            }
+        obstacle = self.route2_observation_blocking_house(
+            target_house_id,
+            float(pose["x"]),
+            float(pose["y"]),
+            clearance_cm=float(LLM_ROUTE_HOUSE_CLEARANCE_CM),
+        )
+        if obstacle:
+            return {
+                "safe": False,
+                "reason": "non_target_house_clearance",
+                "blocking_house_id": str(obstacle.get("house_id", "") or ""),
+                "obstacle": obstacle,
+                "map_bounds": bounds,
+            }
+        return {"safe": True, "reason": "", "map_bounds": bounds}
+
+    def route3_navigation_world_bounds(
+        self,
+        start_pose: Dict[str, float],
+        target_pose: Dict[str, float],
+        target_house_id: str,
+    ) -> Tuple[float, float, float, float]:
+        xs = [float(start_pose["x"]), float(target_pose["x"])]
+        ys = [float(start_pose["y"]), float(target_pose["y"])]
+        house_ids = {str(target_house_id or "").strip()}
+        for item in self.house_records_for_route_planning():
+            if not isinstance(item, dict):
+                continue
+            house_id = str(item.get("id", item.get("house_id", "")) or "")
+            if house_id:
+                house_ids.add(house_id)
+        for house_id in house_ids:
+            bbox = self.house_world_bbox_for_id(house_id)
+            if not bbox:
+                continue
+            xs.extend([float(bbox["min_x"]), float(bbox["max_x"])])
+            ys.extend([float(bbox["min_y"]), float(bbox["max_y"])])
+        bounds = getattr(self, "map_world_bounds", None)
+        if isinstance(bounds, tuple) and len(bounds) == 4:
+            try:
+                min_x, min_y, max_x, max_y = [float(value) for value in bounds]
+                xs.extend([min_x, max_x])
+                ys.extend([min_y, max_y])
+            except Exception:
+                pass
+        margin = max(1200.0, 3.0 * float(LLM_ROUTE3_ASTAR_GRID_CM))
+        return min(xs) - margin, min(ys) - margin, max(xs) + margin, max(ys) + margin
+
+    def route3_navigation_obstacles(self, target_house_id: str) -> List[Dict[str, Any]]:
+        planner_buffer = 2.0
+        raw_obstacles = [
+            dict(item)
+            for item in self.route_forbidden_house_bboxes(
+                target_house_id=str(target_house_id or "").strip(),
+                clearance_cm=float(LLM_ROUTE_HOUSE_CLEARANCE_CM),
+            )
+            if isinstance(item, dict)
+        ]
+        target_bbox = self.house_world_bbox_for_id(str(target_house_id or "").strip())
+        if target_bbox:
+            target_raw = dict(target_bbox)
+            target_raw["house_id"] = str(target_house_id or "").strip()
+            target_raw["clearance_cm"] = 0.0
+            target_raw["obstacle_role"] = "target_house_raw_bbox_no_fly"
+            raw_obstacles.append(target_raw)
+        obstacles: List[Dict[str, Any]] = []
+        for obstacle in raw_obstacles:
+            item = dict(obstacle)
+            try:
+                item["min_x"] = float(item["min_x"]) - planner_buffer
+                item["max_x"] = float(item["max_x"]) + planner_buffer
+                item["min_y"] = float(item["min_y"]) - planner_buffer
+                item["max_y"] = float(item["max_y"]) + planner_buffer
+                item["planner_buffer_cm"] = planner_buffer
+            except Exception:
+                pass
+            obstacles.append(item)
+        return obstacles
+
+    def route3_point_blocked_by_obstacles(self, x: float, y: float, obstacles: List[Dict[str, Any]]) -> Dict[str, Any]:
+        for obstacle in obstacles:
+            if self.point_inside_open_bbox(float(x), float(y), obstacle):
+                return dict(obstacle)
+        return {}
+
+    def route3_segment_blocked_by_obstacles(
+        self,
+        start: Dict[str, Any],
+        end: Dict[str, Any],
+        obstacles: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        ax = float(start["x"])
+        ay = float(start["y"])
+        bx = float(end["x"])
+        by = float(end["y"])
+        for obstacle in obstacles:
+            if self.segment_intersects_open_bbox(ax, ay, bx, by, obstacle):
+                item = dict(obstacle)
+                item["segment_block_source"] = "analytic_bbox_intersection"
+                return item
+        distance = math.hypot(bx - ax, by - ay)
+        steps = max(2, int(math.ceil(distance / max(1.0, float(LLM_ROUTE3_SEGMENT_SAFETY_SAMPLE_CM)))))
+        for index in range(1, steps):
+            t = float(index) / float(steps)
+            x = ax + (bx - ax) * t
+            y = ay + (by - ay) * t
+            blocker = self.route3_point_blocked_by_obstacles(x, y, obstacles)
+            if blocker:
+                blocker["segment_block_source"] = "sampled_bbox_intersection"
+                blocker["segment_sample_t"] = round(float(t), 4)
+                blocker["segment_sample_x"] = round(float(x), 3)
+                blocker["segment_sample_y"] = round(float(y), 3)
+                return blocker
+        return {}
+
+    def route3_obstacle_identity(self, obstacle: Dict[str, Any]) -> str:
+        return str(obstacle.get("house_id", obstacle.get("id", "")) or "")
+
+    def route3_escape_waypoint_from_obstacle(
+        self,
+        start_pose: Dict[str, float],
+        obstacle: Dict[str, Any],
+        target_pose: Dict[str, float],
+        obstacles: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        margin = max(
+            float(LLM_ROUTE3_ESCAPE_MARGIN_CM),
+            float(LLM_ROUTE3_NAV_SEGMENT_REACH_TOL_CM) + 0.5 * float(LLM_ROUTE3_ASTAR_GRID_CM),
+        )
+        x = float(start_pose["x"])
+        y = float(start_pose["y"])
+        min_x = float(obstacle["min_x"])
+        max_x = float(obstacle["max_x"])
+        min_y = float(obstacle["min_y"])
+        max_y = float(obstacle["max_y"])
+        target_x = float(target_pose["x"])
+        target_y = float(target_pose["y"])
+
+        def clamp(value: float, low: float, high: float) -> float:
+            return max(float(low), min(float(high), float(value)))
+
+        candidates: List[Dict[str, Any]] = []
+        seen: set[Tuple[int, int, str]] = set()
+
+        def add_candidate(cx: float, cy: float, side: str) -> None:
+            key = (int(round(float(cx) * 10.0)), int(round(float(cy) * 10.0)), side)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append({"x": float(cx), "y": float(cy), "exit_side": side})
+
+        side_y_values = [
+            y,
+            clamp(target_y, min_y - margin, max_y + margin),
+            min_y - margin,
+            max_y + margin,
+        ]
+        for side_y in side_y_values:
+            add_candidate(min_x - margin, side_y, "west")
+            add_candidate(max_x + margin, side_y, "east")
+        side_x_values = [
+            x,
+            clamp(target_x, min_x - margin, max_x + margin),
+            min_x - margin,
+            max_x + margin,
+        ]
+        for side_x in side_x_values:
+            add_candidate(side_x, min_y - margin, "south")
+            add_candidate(side_x, max_y + margin, "north")
+        valid: List[Dict[str, Any]] = []
+        for candidate in candidates:
+            bounds_report = self.route2_observation_map_bounds_report(float(candidate["x"]), float(candidate["y"]))
+            if not bool(bounds_report.get("in_bounds", True)):
+                continue
+            blocker = self.route3_point_blocked_by_obstacles(float(candidate["x"]), float(candidate["y"]), obstacles)
+            if blocker:
+                continue
+            travel = math.hypot(float(candidate["x"]) - x, float(candidate["y"]) - y)
+            to_target = math.hypot(float(target_pose["x"]) - float(candidate["x"]), float(target_pose["y"]) - float(candidate["y"]))
+            item = {
+                "x": round(float(candidate["x"]), 3),
+                "y": round(float(candidate["y"]), 3),
+                "z": round(float(start_pose.get("z", target_pose.get("z", 0.0))), 3),
+                "yaw": round(float(start_pose.get("yaw", target_pose.get("yaw", 0.0))), 3),
+                "waypoint_index": 0,
+                "waypoint_final": False,
+                "waypoint_role": "escape",
+                "escape_from_obstacle_house_id": self.route3_obstacle_identity(obstacle),
+                "escape_from_obstacle": obstacle,
+                "escape_side": candidate["exit_side"],
+                "escape_margin_cm": round(float(margin), 2),
+                "strict_reach_tol_cm": float(LLM_ROUTE3_ESCAPE_REACH_TOL_CM),
+                "strict_yaw_tol_deg": 180.0,
+                "escape_travel_cm": round(float(travel), 2),
+                "escape_score": round(float(travel + 0.25 * to_target), 2),
+                "map_bounds": bounds_report,
+            }
+            valid.append(item)
+        if not valid:
+            return {}
+        valid.sort(key=lambda item: (float(item["escape_score"]), float(item["escape_travel_cm"])))
+        return valid[0]
+
+    def route3_escape_safety_allowed(
+        self,
+        current: Dict[str, float],
+        predicted: Dict[str, float],
+        target_pose: Dict[str, float],
+        safety: Dict[str, Any],
+        escape_obstacle: Optional[Dict[str, Any]],
+    ) -> bool:
+        if not escape_obstacle:
+            return False
+        if str(safety.get("reason", "") or "") not in {"non_target_house_clearance", "target_house_bbox"}:
+            return False
+        safety_obstacle = safety.get("obstacle", {}) if isinstance(safety.get("obstacle"), dict) else {}
+        safety_id = self.route3_obstacle_identity(safety_obstacle)
+        escape_id = self.route3_obstacle_identity(escape_obstacle)
+        if safety_id and escape_id and safety_id != escape_id:
+            return False
+        if self.point_inside_open_bbox(float(target_pose["x"]), float(target_pose["y"]), escape_obstacle):
+            return False
+        current_inside = self.point_inside_open_bbox(float(current["x"]), float(current["y"]), escape_obstacle)
+        predicted_inside = self.point_inside_open_bbox(float(predicted["x"]), float(predicted["y"]), escape_obstacle)
+        if not current_inside and not predicted_inside:
+            return False
+        current_dist = math.hypot(float(target_pose["x"]) - float(current["x"]), float(target_pose["y"]) - float(current["y"]))
+        predicted_dist = math.hypot(float(target_pose["x"]) - float(predicted["x"]), float(target_pose["y"]) - float(predicted["y"]))
+        return bool(predicted_dist <= current_dist + 5.0)
+
+    def route3_astar_index_for_point(
+        self,
+        x: float,
+        y: float,
+        *,
+        min_x: float,
+        min_y: float,
+        grid_cm: float,
+    ) -> Tuple[int, int]:
+        return (
+            int(round((float(x) - float(min_x)) / float(grid_cm))),
+            int(round((float(y) - float(min_y)) / float(grid_cm))),
+        )
+
+    def route3_point_for_astar_index(
+        self,
+        node: Tuple[int, int],
+        *,
+        min_x: float,
+        min_y: float,
+        grid_cm: float,
+    ) -> Dict[str, float]:
+        return {
+            "x": float(min_x) + float(node[0]) * float(grid_cm),
+            "y": float(min_y) + float(node[1]) * float(grid_cm),
+        }
+
+    def route3_smooth_waypoints(
+        self,
+        waypoints: List[Dict[str, float]],
+        obstacles: List[Dict[str, Any]],
+    ) -> List[Dict[str, float]]:
+        if len(waypoints) <= 2:
+            return waypoints
+        smoothed: List[Dict[str, float]] = [waypoints[0]]
+        anchor_index = 0
+        while anchor_index < len(waypoints) - 1:
+            next_index = len(waypoints) - 1
+            while next_index > anchor_index + 1:
+                if not self.route3_segment_blocked_by_obstacles(waypoints[anchor_index], waypoints[next_index], obstacles):
+                    break
+                next_index -= 1
+            smoothed.append(waypoints[next_index])
+            anchor_index = next_index
+        return smoothed
+
+    def route3_plan_navigation_waypoints(
+        self,
+        start_pose: Dict[str, float],
+        target_pose: Dict[str, float],
+        target_house_id: str,
+        *,
+        grid_cm: float = LLM_ROUTE3_ASTAR_GRID_CM,
+    ) -> Dict[str, Any]:
+        target_safety = self.route3_safety_report_for_pose(target_house_id, target_pose)
+        if not bool(target_safety.get("safe", False)):
+            return {"status": "blocked", "reason": "unsafe_target", "target_safety": target_safety, "waypoints": []}
+        obstacles = self.route3_navigation_obstacles(target_house_id)
+        start_obstacle = self.route3_point_blocked_by_obstacles(float(start_pose["x"]), float(start_pose["y"]), obstacles)
+        target_obstacle = self.route3_point_blocked_by_obstacles(float(target_pose["x"]), float(target_pose["y"]), obstacles)
+        if target_obstacle:
+            return {"status": "blocked", "reason": "target_inside_obstacle", "obstacle": target_obstacle, "waypoints": []}
+        planning_start = dict(start_pose)
+        escape_waypoint: Dict[str, Any] = {}
+        if start_obstacle:
+            escape_waypoint = self.route3_escape_waypoint_from_obstacle(start_pose, start_obstacle, target_pose, obstacles)
+            if not escape_waypoint:
+                return {"status": "blocked", "reason": "start_inside_obstacle", "obstacle": start_obstacle, "waypoints": []}
+            planning_start = {
+                "x": float(escape_waypoint["x"]),
+                "y": float(escape_waypoint["y"]),
+                "z": float(escape_waypoint.get("z", start_pose.get("z", target_pose.get("z", 0.0)))),
+                "yaw": float(escape_waypoint.get("yaw", start_pose.get("yaw", target_pose.get("yaw", 0.0)))),
+            }
+        direct_blocker = self.route3_segment_blocked_by_obstacles(planning_start, target_pose, obstacles)
+        direct_bounds = self.route2_observation_map_bounds_report(float(target_pose["x"]), float(target_pose["y"]))
+        if not direct_blocker and bool(direct_bounds.get("in_bounds", True)):
+            waypoints = [dict(target_pose)]
+            raw_waypoints = [dict(planning_start), dict(target_pose)]
+            reason = "direct_path_clear"
+            if escape_waypoint:
+                waypoints = [dict(escape_waypoint), dict(target_pose)]
+                raw_waypoints = [dict(start_pose), dict(escape_waypoint), dict(target_pose)]
+                reason = "start_escape_then_direct_path"
+            return {
+                "status": "ok",
+                "reason": reason,
+                "grid_cm": float(grid_cm),
+                "waypoints": waypoints,
+                "raw_waypoints": raw_waypoints,
+                "start_obstacle": start_obstacle,
+                "escape_waypoint": escape_waypoint,
+                "obstacle_count": len(obstacles),
+            }
+
+        min_x, min_y, max_x, max_y = self.route3_navigation_world_bounds(planning_start, target_pose, target_house_id)
+        grid = max(40.0, float(grid_cm))
+        start_node = self.route3_astar_index_for_point(float(planning_start["x"]), float(planning_start["y"]), min_x=min_x, min_y=min_y, grid_cm=grid)
+        target_node = self.route3_astar_index_for_point(float(target_pose["x"]), float(target_pose["y"]), min_x=min_x, min_y=min_y, grid_cm=grid)
+        max_ix = int(math.ceil((max_x - min_x) / grid))
+        max_iy = int(math.ceil((max_y - min_y) / grid))
+
+        def node_valid(node: Tuple[int, int]) -> bool:
+            if node == start_node or node == target_node:
+                return True
+            ix, iy = node
+            if ix < 0 or iy < 0 or ix > max_ix or iy > max_iy:
+                return False
+            point = self.route3_point_for_astar_index(node, min_x=min_x, min_y=min_y, grid_cm=grid)
+            bounds_report = self.route2_observation_map_bounds_report(point["x"], point["y"])
+            if not bool(bounds_report.get("in_bounds", True)):
+                return False
+            return not bool(self.route3_point_blocked_by_obstacles(point["x"], point["y"], obstacles))
+
+        neighbors = [
+            (-1, -1, math.sqrt(2.0)),
+            (-1, 0, 1.0),
+            (-1, 1, math.sqrt(2.0)),
+            (0, -1, 1.0),
+            (0, 1, 1.0),
+            (1, -1, math.sqrt(2.0)),
+            (1, 0, 1.0),
+            (1, 1, math.sqrt(2.0)),
+        ]
+        open_heap: List[Tuple[float, float, Tuple[int, int]]] = []
+        heapq.heappush(open_heap, (0.0, 0.0, start_node))
+        came_from: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        best_cost: Dict[Tuple[int, int], float] = {start_node: 0.0}
+        visited = 0
+        max_visits = max(1000, (max_ix + 1) * (max_iy + 1))
+        found = False
+        while open_heap and visited <= max_visits:
+            _priority, cost, node = heapq.heappop(open_heap)
+            if cost > best_cost.get(node, float("inf")) + 1e-6:
+                continue
+            visited += 1
+            if node == target_node:
+                found = True
+                break
+            for dx, dy, step_cost in neighbors:
+                nxt = (node[0] + dx, node[1] + dy)
+                if not node_valid(nxt):
+                    continue
+                if node == start_node:
+                    current_point = {"x": float(planning_start["x"]), "y": float(planning_start["y"])}
+                else:
+                    current_point = self.route3_point_for_astar_index(node, min_x=min_x, min_y=min_y, grid_cm=grid)
+                if nxt == target_node:
+                    next_point = {"x": float(target_pose["x"]), "y": float(target_pose["y"])}
+                else:
+                    next_point = self.route3_point_for_astar_index(nxt, min_x=min_x, min_y=min_y, grid_cm=grid)
+                if self.route3_segment_blocked_by_obstacles(current_point, next_point, obstacles):
+                    continue
+                new_cost = cost + step_cost
+                if new_cost + 1e-6 < best_cost.get(nxt, float("inf")):
+                    best_cost[nxt] = new_cost
+                    came_from[nxt] = node
+                    heuristic = math.hypot(float(target_node[0] - nxt[0]), float(target_node[1] - nxt[1]))
+                    heapq.heappush(open_heap, (new_cost + heuristic, new_cost, nxt))
+        if not found:
+            return {
+                "status": "blocked",
+                "reason": "astar_no_path",
+                "grid_cm": grid,
+                "bounds": {"min_x": min_x, "min_y": min_y, "max_x": max_x, "max_y": max_y},
+                "visited": visited,
+                "obstacle_count": len(obstacles),
+                "direct_blocker": direct_blocker,
+                "waypoints": [],
+            }
+        nodes = [target_node]
+        while nodes[-1] != start_node:
+            nodes.append(came_from[nodes[-1]])
+        nodes.reverse()
+        raw_xy = [self.route3_point_for_astar_index(node, min_x=min_x, min_y=min_y, grid_cm=grid) for node in nodes]
+        raw_xy[0] = {"x": float(planning_start["x"]), "y": float(planning_start["y"])}
+        raw_xy[-1] = {"x": float(target_pose["x"]), "y": float(target_pose["y"])}
+        smooth_xy = self.route3_smooth_waypoints(raw_xy, obstacles)
+        waypoints: List[Dict[str, float]] = []
+        for idx, point in enumerate(smooth_xy[1:], start=1):
+            is_last = idx == len(smooth_xy) - 1
+            waypoint = {
+                "x": round(float(point["x"]), 3),
+                "y": round(float(point["y"]), 3),
+                "z": round(float(target_pose["z"] if is_last else start_pose.get("z", target_pose["z"])), 3),
+                "yaw": round(float(target_pose["yaw"] if is_last else start_pose.get("yaw", target_pose["yaw"])), 3),
+                "waypoint_index": idx,
+                "waypoint_final": bool(is_last),
+            }
+            waypoints.append(waypoint)
+        raw_waypoints_out: List[Dict[str, Any]] = raw_xy
+        if escape_waypoint:
+            waypoints = [dict(escape_waypoint)] + waypoints
+            raw_waypoints_out = [dict(start_pose), dict(escape_waypoint)] + raw_xy[1:]
+        return {
+            "status": "ok",
+            "reason": "start_escape_then_astar_path" if escape_waypoint else "astar_path",
+            "grid_cm": grid,
+            "bounds": {"min_x": min_x, "min_y": min_y, "max_x": max_x, "max_y": max_y},
+            "visited": visited,
+            "raw_waypoints": raw_waypoints_out,
+            "waypoints": waypoints,
+            "start_obstacle": start_obstacle,
+            "escape_waypoint": escape_waypoint,
+            "obstacle_count": len(obstacles),
+            "direct_blocker": direct_blocker,
+        }
+
+    def route3_hold(self, session: flight.DroneFlightSession, *, output_dir: Optional[Path] = None, reason: str = "hold") -> Dict[str, Any]:
+        payload = {"forward_cm": 0.0, "right_cm": 0.0, "up_cm": 0.0, "yaw_delta_deg": 0.0, "action_name": "hold"}
+        result = self.safe("Route V3 hold", lambda: session.move_relative(payload))
+        self.route3_log_event(output_dir, "hold", {"reason": reason, "payload": payload})
+        return result if isinstance(result, dict) else {}
+
+    def route3_set_control_lock(self, locked: bool) -> None:
+        self.llm_route3_control_locked = bool(locked)
+        try:
+            if locked:
+                self.root.after(0, lambda: self.stop_keyboard_control(send_hold=False))
+                self.root.after(0, lambda: self.update_keyboard_status("locked by LLM Route V3"))
+            else:
+                self.root.after(0, self.update_keyboard_status)
+        except Exception:
+            pass
+
+    def route3_enable_physics_movement(self, session: flight.DroneFlightSession) -> None:
+        self.route3_set_control_lock(True)
+        result = self.safe("Route V3 movement mode physics", lambda: session.set_movement_mode("physics"))
+        self.safe("Route V3 enable movement", lambda: session.set_movement_enabled(True))
+        self.movement_mode_state = "physics"
+        try:
+            self.root.after(0, lambda: self.movement_mode_var.set("physics"))
+            if isinstance(result, dict):
+                self.root.after(0, lambda r=result: self.apply_state(r))
+        except Exception:
+            pass
+
+    def route3_wait_if_paused(self, session: flight.DroneFlightSession, output_dir: Optional[Path]) -> bool:
+        held = False
+        while self.llm_route3_pause_event.is_set() and not self.llm_route3_stop_event.is_set():
+            if not held:
+                self.route3_hold(session, output_dir=output_dir, reason="paused")
+                held = True
+            self.root.after(0, lambda: self.llm_route3_status_var.set("LLM Route V3: paused."))
+            time.sleep(0.2)
+        return bool(self.llm_route3_stop_event.is_set())
+
+    def route3_follow_navigation_waypoint_with_movement(
+        self,
+        session: flight.DroneFlightSession,
+        target_pose: Dict[str, float],
+        *,
+        output_dir: Path,
+        stage: str,
+        facade: str,
+        target_id: str,
+        target_house_id: str,
+        waypoint_index: int,
+        waypoint_count: int,
+        config: Dict[str, float],
+        escape_obstacle: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        current = self.route3_current_pose(session)
+        if not current:
+            return {"status": "failed", "reason": "missing_current_pose"}
+        started_at = time.time()
+        tick_s = float(config["move_tick_ms"]) / 1000.0
+        step_index = 0
+        last_error: Dict[str, Any] = {}
+        target_safety = self.route3_safety_report_for_pose(target_house_id, target_pose)
+        if not bool(target_safety.get("safe", False)):
+            self.route3_hold(session, output_dir=output_dir, reason="unsafe_waypoint")
+            return {
+                "status": "blocked",
+                "reason": "unsafe_waypoint",
+                "stage": stage,
+                "facade": facade,
+                "target_id": target_id,
+                "waypoint_index": waypoint_index,
+                "waypoint_count": waypoint_count,
+                "safety": target_safety,
+            }
+        while not self.llm_route3_stop_event.is_set():
+            if self.route3_wait_if_paused(session, output_dir):
+                break
+            error = self.route3_pose_error(current, target_pose, config)
+            last_error = error
+            self.root.after(
+                0,
+                lambda e=error: self.llm_route3_error_var.set(
+                    f"Error: xy={float(e['dist_xy_cm']):.1f} z={float(e['dz']):.1f} yaw={float(e['yaw_error_deg']):.1f}"
+                ),
+            )
+            if bool(error.get("reached", False)):
+                self.route3_hold(session, output_dir=output_dir, reason="target_reached")
+                return {
+                    "status": "ok",
+                    "reason": "target_reached",
+                    "stage": stage,
+                    "facade": facade,
+                    "target_id": target_id,
+                    "waypoint_index": waypoint_index,
+                    "waypoint_count": waypoint_count,
+                    "pose_error": error,
+                    "elapsed_s": round(time.time() - started_at, 3),
+                    "current_pose": current,
+                }
+            if time.time() - started_at > float(config["max_stage_s"]):
+                self.route3_hold(session, output_dir=output_dir, reason="nav_timeout")
+                return {
+                    "status": "timeout",
+                    "reason": "nav_timeout",
+                    "stage": stage,
+                    "facade": facade,
+                    "target_id": target_id,
+                    "waypoint_index": waypoint_index,
+                    "waypoint_count": waypoint_count,
+                    "pose_error": error,
+                    "elapsed_s": round(time.time() - started_at, 3),
+                    "current_pose": current,
+                }
+            payload = self.route3_movement_payload_for_target(current, target_pose, config)
+            predicted = self.route3_predict_next_pose(current, payload)
+            safety = self.route3_safety_report_for_pose(target_house_id, predicted)
+            escape_safety_allowed = self.route3_escape_safety_allowed(
+                current,
+                predicted,
+                target_pose,
+                safety,
+                escape_obstacle,
+            )
+            trace = {
+                "stage": stage,
+                "facade": facade,
+                "target_id": target_id,
+                "waypoint_index": waypoint_index,
+                "waypoint_count": waypoint_count,
+                "step_index": step_index,
+                "current_pose": current,
+                "target_pose": target_pose,
+                "pose_error": error,
+                "payload": payload,
+                "predicted_pose": predicted,
+                "safety": safety,
+                "created_at": datetime.now().isoformat(timespec="milliseconds"),
+            }
+            if escape_safety_allowed:
+                trace["safety_override"] = {
+                    "allowed": True,
+                    "reason": "escape_start_inside_obstacle",
+                    "escape_from_obstacle_house_id": self.route3_obstacle_identity(escape_obstacle or {}),
+                }
+            self.append_jsonl(output_dir / "movement_trace.jsonl", trace)
+            self.root.after(
+                0,
+                lambda p=payload: self.llm_route3_payload_var.set(
+                    f"Payload: f={p['forward_cm']} r={p['right_cm']} u={p['up_cm']} yaw={p['yaw_delta_deg']}"
+                ),
+            )
+            if not bool(safety.get("safe", False)) and not escape_safety_allowed:
+                self.route3_hold(session, output_dir=output_dir, reason=str(safety.get("reason", "unsafe_next_step")))
+                self.route3_log_event(output_dir, "navigation_blocked", trace)
+                return {
+                    "status": "blocked",
+                    "reason": str(safety.get("reason", "unsafe_next_step")),
+                    "stage": stage,
+                    "facade": facade,
+                    "target_id": target_id,
+                    "waypoint_index": waypoint_index,
+                    "waypoint_count": waypoint_count,
+                    "pose_error": error,
+                    "safety": safety,
+                    "current_pose": current,
+                }
+            if escape_safety_allowed:
+                self.route3_log_event(output_dir, "navigation_escape_safety_override", trace)
+            result = self.safe("Route V3 movement tick", lambda p=payload: session.move_relative(p))
+            if not isinstance(result, dict):
+                self.route3_hold(session, output_dir=output_dir, reason="movement_failed")
+                return {
+                    "status": "failed",
+                    "reason": "movement_failed",
+                    "pose_error": error,
+                    "current_pose": current,
+                    "waypoint_index": waypoint_index,
+                    "waypoint_count": waypoint_count,
+                }
+            self.root.after(0, lambda r=result: self.apply_state(r))
+            next_pose = self.route3_pose_from_payload(result)
+            if next_pose:
+                current = next_pose
+            else:
+                current = predicted
+            step_index += 1
+            if self.llm_route3_stop_event.wait(max(0.01, tick_s)):
+                break
+        self.route3_hold(session, output_dir=output_dir, reason="stopped")
+        return {
+            "status": "stopped",
+            "reason": "stopped",
+            "pose_error": last_error,
+            "current_pose": current,
+            "waypoint_index": waypoint_index,
+            "waypoint_count": waypoint_count,
+        }
+
+    def route3_navigate_to_pose_with_movement(
+        self,
+        session: flight.DroneFlightSession,
+        target_pose: Dict[str, float],
+        *,
+        output_dir: Path,
+        stage: str,
+        facade: str,
+        target_id: str,
+        target_house_id: str,
+    ) -> Dict[str, Any]:
+        base_config = self.route3_nav_config()
+        self.route3_enable_physics_movement(session)
+        current = self.route3_current_pose(session)
+        if not current:
+            return {"status": "failed", "reason": "missing_current_pose"}
+        max_replans = int(LLM_ROUTE3_ASTAR_MAX_REPLANS)
+        replan_count = 0
+        started_at = time.time()
+        last_result: Dict[str, Any] = {}
+        while replan_count <= max_replans and not self.llm_route3_stop_event.is_set():
+            plan = self.route3_plan_navigation_waypoints(
+                current,
+                target_pose,
+                target_house_id,
+                grid_cm=float(LLM_ROUTE3_ASTAR_GRID_CM),
+            )
+            plan_log = {
+                "stage": stage,
+                "facade": facade,
+                "target_id": target_id,
+                "target_pose": target_pose,
+                "current_pose": current,
+                "replan_count": replan_count,
+                "plan": plan,
+                "created_at": datetime.now().isoformat(timespec="milliseconds"),
+            }
+            self.append_jsonl(output_dir / "navigation_plan.jsonl", plan_log)
+            self.route3_log_event(output_dir, "navigation_plan", plan_log)
+            if plan.get("status") != "ok":
+                self.route3_hold(session, output_dir=output_dir, reason=str(plan.get("reason", "navigation_plan_failed")))
+                return {
+                    "status": "blocked",
+                    "reason": str(plan.get("reason", "navigation_plan_failed")),
+                    "stage": stage,
+                    "facade": facade,
+                    "target_id": target_id,
+                    "navigation_plan": plan,
+                    "replan_count": replan_count,
+                    "elapsed_s": round(time.time() - started_at, 3),
+                }
+            waypoints = [dict(item) for item in plan.get("waypoints", []) if isinstance(item, dict)]
+            if not waypoints:
+                waypoints = [dict(target_pose)]
+            waypoint_count = len(waypoints)
+            blocked_for_replan = False
+            for idx, waypoint in enumerate(waypoints, start=1):
+                waypoint_pose = {
+                    "x": float(waypoint.get("x", target_pose["x"])),
+                    "y": float(waypoint.get("y", target_pose["y"])),
+                    "z": float(waypoint.get("z", target_pose["z"])),
+                    "yaw": float(waypoint.get("yaw", target_pose["yaw"])),
+                }
+                segment_config = dict(base_config)
+                is_escape_waypoint = isinstance(waypoint.get("escape_from_obstacle"), dict)
+                if is_escape_waypoint:
+                    segment_config["reach_tol_cm"] = min(
+                        float(segment_config["reach_tol_cm"]),
+                        float(waypoint.get("strict_reach_tol_cm", LLM_ROUTE3_ESCAPE_REACH_TOL_CM) or LLM_ROUTE3_ESCAPE_REACH_TOL_CM),
+                    )
+                    segment_config["yaw_tol_deg"] = float(waypoint.get("strict_yaw_tol_deg", 180.0) or 180.0)
+                elif idx < waypoint_count:
+                    segment_config["reach_tol_cm"] = max(
+                        float(segment_config["reach_tol_cm"]),
+                        float(LLM_ROUTE3_NAV_SEGMENT_REACH_TOL_CM),
+                    )
+                    segment_config["yaw_tol_deg"] = 180.0
+                result = self.route3_follow_navigation_waypoint_with_movement(
+                    session,
+                    waypoint_pose,
+                    output_dir=output_dir,
+                    stage=stage,
+                    facade=facade,
+                    target_id=target_id,
+                    target_house_id=target_house_id,
+                    waypoint_index=idx,
+                    waypoint_count=waypoint_count,
+                    config=segment_config,
+                    escape_obstacle=waypoint.get("escape_from_obstacle") if isinstance(waypoint.get("escape_from_obstacle"), dict) else None,
+                )
+                last_result = result
+                if result.get("status") == "ok":
+                    current = result.get("current_pose", waypoint_pose) if isinstance(result.get("current_pose"), dict) else waypoint_pose
+                    continue
+                if result.get("status") == "blocked" and replan_count < max_replans:
+                    fresh = self.route3_current_pose(session)
+                    current = fresh or (result.get("current_pose", current) if isinstance(result.get("current_pose"), dict) else current)
+                    replan_count += 1
+                    blocked_for_replan = True
+                    break
+                result["navigation_plan"] = plan
+                result["replan_count"] = replan_count
+                result["elapsed_s"] = round(time.time() - started_at, 3)
+                return result
+            if blocked_for_replan:
+                continue
+            return {
+                "status": "ok",
+                "reason": "target_reached",
+                "stage": stage,
+                "facade": facade,
+                "target_id": target_id,
+                "navigation_plan": plan,
+                "replan_count": replan_count,
+                "waypoint_count": waypoint_count,
+                "pose_error": last_result.get("pose_error", {}),
+                "elapsed_s": round(time.time() - started_at, 3),
+            }
+        self.route3_hold(session, output_dir=output_dir, reason="replan_exhausted")
+        return {
+            "status": "blocked",
+            "reason": "replan_exhausted",
+            "stage": stage,
+            "facade": facade,
+            "target_id": target_id,
+            "last_result": last_result,
+            "replan_count": replan_count,
+            "elapsed_s": round(time.time() - started_at, 3),
+        }
+
+    def route3_observation_needs_panorama(self, observation: Dict[str, Any]) -> bool:
+        if not isinstance(observation, dict) or not observation:
+            return False
+        adjustment = observation.get("observation_boundary_adjustment", {})
+        if isinstance(adjustment, dict) and adjustment:
+            return True
+        coverage = self._as_float_or_none(observation.get("observation_panorama_coverage_ratio"))
+        if coverage is not None and float(coverage) < float(LLM_ROUTE3_PANORAMA_COVERAGE_THRESHOLD):
+            return True
+        return False
+
+    def route3_facade_target_point_from_axis(self, bbox: Dict[str, Any], facade: str, axis_value: float) -> Dict[str, float]:
+        facade = str(facade or "").strip().lower()
+        axis = float(axis_value)
+        if facade == "south":
+            return {"x": axis, "y": float(bbox["min_y"])}
+        if facade == "north":
+            return {"x": axis, "y": float(bbox["max_y"])}
+        if facade == "east":
+            return {"x": float(bbox["max_x"]), "y": axis}
+        return {"x": float(bbox["min_x"]), "y": axis}
+
+    def route3_panorama_observation_poses(
+        self,
+        house_id: str,
+        facade: str,
+        planned_pose: Dict[str, float],
+    ) -> List[Dict[str, Any]]:
+        bbox = self.house_world_bbox_for_id(house_id)
+        if not bbox:
+            return [{"label": "center", **dict(planned_pose)}]
+        axis_min, axis_max = self.route2_facade_axis_range(bbox, facade)
+        axis_center = self.route2_facade_center_axis(bbox, facade)
+        pose_x = float(planned_pose.get("x", 0.0))
+        pose_y = float(planned_pose.get("y", 0.0))
+
+        def yaw_to_axis(axis_value: float) -> float:
+            target = self.route3_facade_target_point_from_axis(bbox, facade, axis_value)
+            return math.degrees(math.atan2(float(target["y"]) - pose_y, float(target["x"]) - pose_x))
+
+        center_yaw = yaw_to_axis(axis_center)
+
+        def clamped_side_yaw(axis_value: float, fallback_sign: float) -> float:
+            raw = yaw_to_axis(axis_value)
+            delta = self._normalize_angle_deg(raw - center_yaw)
+            sign = -1.0 if delta < 0.0 else (1.0 if delta > 0.0 else fallback_sign)
+            magnitude = max(
+                float(LLM_ROUTE3_PANORAMA_MIN_YAW_DELTA_DEG),
+                min(float(LLM_ROUTE3_PANORAMA_MAX_YAW_DELTA_DEG), abs(float(delta))),
+            )
+            return self._normalize_angle_deg(center_yaw + sign * magnitude)
+
+        return [
+            {"label": "left", **dict(planned_pose), "yaw": round(float(clamped_side_yaw(axis_min, -1.0)), 2)},
+            {"label": "center", **dict(planned_pose), "yaw": round(float(center_yaw), 2)},
+            {"label": "right", **dict(planned_pose), "yaw": round(float(clamped_side_yaw(axis_max, 1.0)), 2)},
+        ]
+
+    def route3_copy_capture_rgb(self, capture_result: Dict[str, Any], output_path: Path) -> str:
+        rgb_path = self.route2_candidate_path(capture_result.get("rgb_path"))
+        if rgb_path is not None and rgb_path.exists() and rgb_path.is_file():
+            try:
+                if rgb_path.resolve() != output_path.resolve():
+                    output_path.write_bytes(rgb_path.read_bytes())
+            except Exception:
+                output_path.write_bytes(rgb_path.read_bytes())
+        return str(output_path if output_path.exists() else (rgb_path or ""))
+
+    def route3_write_panorama_image(self, image_paths: List[Path], output_path: Path) -> bool:
+        images: List[np.ndarray] = []
+        for path in image_paths:
+            try:
+                if not path.exists():
+                    continue
+                data = np.fromfile(str(path), dtype=np.uint8)
+                image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                if image is not None and image.size:
+                    images.append(image)
+            except Exception:
+                continue
+        if not images:
+            return False
+        min_height = min(int(image.shape[0]) for image in images)
+        resized: List[np.ndarray] = []
+        for image in images:
+            scale = float(min_height) / max(1.0, float(image.shape[0]))
+            width = max(1, int(round(float(image.shape[1]) * scale)))
+            resized.append(cv2.resize(image, (width, min_height), interpolation=cv2.INTER_AREA))
+        panorama = cv2.hconcat(resized)
+        ok, encoded = cv2.imencode(".png", panorama)
+        if not ok:
+            return False
+        output_path.write_bytes(encoded.tobytes())
+        return True
+
+    def route3_capture_facade_rgb_panorama_current(
+        self,
+        session: flight.DroneFlightSession,
+        *,
+        output_dir: Path,
+        facade_dir: Path,
+        house_id: str,
+        facade: str,
+        planned_pose: Dict[str, float],
+    ) -> Dict[str, Any]:
+        poses = self.route3_panorama_observation_poses(house_id, facade, planned_pose)
+        rows: List[Dict[str, Any]] = []
+        captures: Dict[str, Any] = {}
+        image_paths: Dict[str, str] = {}
+        for pose in poses:
+            label = str(pose.get("label", "center") or "center")
+            yaw_pose = {
+                "x": float(pose.get("x", planned_pose["x"])),
+                "y": float(pose.get("y", planned_pose["y"])),
+                "z": float(pose.get("z", planned_pose["z"])),
+                "yaw": float(pose.get("yaw", planned_pose.get("yaw", 0.0))),
+            }
+            nav = self.route3_navigate_to_pose_with_movement(
+                session,
+                yaw_pose,
+                output_dir=output_dir,
+                stage="CAPTURE_RGB_PANORAMA",
+                facade=facade,
+                target_id=f"{house_id}_{facade}_panorama_{label}",
+                target_house_id=house_id,
+            )
+            if nav.get("status") != "ok":
+                return {"status": "failed", "reason": "panorama_yaw_navigation_failed", "label": label, "navigation": nav}
+            action_detail = dict(self.build_stream_action_detail())
+            action_detail.update(
+                {
+                    "source": "llm_route_v3_facade_observation_panorama",
+                    "house_id": house_id,
+                    "facade": facade,
+                    "facade_id": self.route2_facade_id(house_id, facade),
+                    "planned_pose": yaw_pose,
+                    "panorama_label": label,
+                    "panorama_pose_count": len(poses),
+                }
+            )
+            frame_index = self.route2_next_frame_index(output_dir)
+            capture_result = self.safe(
+                f"Route V3 panorama RGB capture {label}",
+                lambda idx=frame_index, action=action_detail: session.capture_lidar_stream_frame(output_dir, idx, action_detail=action),
+            )
+            if not isinstance(capture_result, dict):
+                return {"status": "failed", "reason": "panorama_capture_failed", "label": label}
+            image_path = facade_dir / f"coarse_rgb_{label}.png"
+            image_paths[label] = self.route3_copy_capture_rgb(capture_result, image_path)
+            captures[label] = capture_result
+            row = {
+                "frame_index": int(capture_result.get("frame_index", frame_index)),
+                "capture_time": capture_result.get("capture_time", ""),
+                "capture_kind": "facade_coarse_observation_v3_panorama",
+                "scan_id": f"{house_id}_{facade}_coarse_observation_{label}",
+                "house_id": house_id,
+                "facade": facade,
+                "facade_id": self.route2_facade_id(house_id, facade),
+                "planned_pose": yaw_pose,
+                "pose": capture_result.get("pose", {}),
+                "commanded_pose": capture_result.get("commanded_pose", {}),
+                "actual_pose": capture_result.get("actual_pose", {}),
+                "pose_error": capture_result.get("pose_error", {}),
+                "capture_dir": capture_result.get("capture_dir", ""),
+                "rgb_path": capture_result.get("rgb_path", ""),
+                "copied_rgb_path": image_paths[label],
+                "point_cloud_world_standard_m_npy_path": capture_result.get("point_cloud_world_standard_m_npy_path", ""),
+                "point_cloud_world_standard_m_ply_path": capture_result.get("point_cloud_world_standard_m_ply_path", ""),
+                "point_cloud_preview_path": capture_result.get("point_cloud_preview_path", ""),
+                "point_count": int(capture_result.get("point_count", 0) or 0),
+                "action_detail": action_detail,
+            }
+            rows.append(row)
+            self.append_jsonl(output_dir / "lidar_capture_log.jsonl", row)
+            self.append_jsonl(facade_dir / "coarse_lidar_capture_log.jsonl", row)
+        center_path = self.route2_candidate_path(image_paths.get("center"))
+        if center_path is not None and center_path.exists():
+            try:
+                (facade_dir / "coarse_rgb.png").write_bytes(center_path.read_bytes())
+            except Exception:
+                pass
+        panorama_path = facade_dir / "coarse_rgb_panorama.png"
+        ordered_paths = [
+            self.route2_candidate_path(image_paths.get("left")),
+            self.route2_candidate_path(image_paths.get("center")),
+            self.route2_candidate_path(image_paths.get("right")),
+        ]
+        stitch_ok = self.route3_write_panorama_image([path for path in ordered_paths if path is not None], panorama_path)
+        if not stitch_ok and center_path is not None and center_path.exists():
+            panorama_path.write_bytes(center_path.read_bytes())
+        capture_payload = {
+            "capture_kind": "facade_coarse_observation_v3_panorama",
+            "house_id": house_id,
+            "facade": facade,
+            "planned_pose": planned_pose,
+            "panorama_poses": poses,
+            "capture_results": captures,
+            "rows": rows,
+            "coarse_rgb_left_path": image_paths.get("left", ""),
+            "coarse_rgb_center_path": image_paths.get("center", ""),
+            "coarse_rgb_right_path": image_paths.get("right", ""),
+            "coarse_rgb_panorama_path": str(panorama_path if panorama_path.exists() else ""),
+            "coarse_rgb_path": str(panorama_path if panorama_path.exists() else (center_path or "")),
+            "panorama_stitch_ok": bool(stitch_ok),
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        self.write_json_artifact(facade_dir / "panorama_capture.json", capture_payload)
+        self.write_json_artifact(facade_dir / "coarse_capture.json", capture_payload)
+        self.route2_write_lidar_summary(output_dir, running=True)
+        self.route2_update_state(
+            coarse_capture=capture_payload,
+            panorama_capture=capture_payload,
+            coarse_rgb_path=capture_payload["coarse_rgb_path"],
+            coarse_rgb_panorama_path=capture_payload["coarse_rgb_panorama_path"],
+        )
+        self.route2_write_state_artifact()
+        return {"status": "ok", "capture": capture_payload, "rows": rows}
+
+    def route3_capture_facade_rgb_current(
+        self,
+        session: flight.DroneFlightSession,
+        *,
+        output_dir: Path,
+        facade_dir: Path,
+        house_id: str,
+        facade: str,
+        planned_pose: Dict[str, float],
+    ) -> Dict[str, Any]:
+        state = self.route2_selected_state()
+        observation = state.get("observation_point", {}) if isinstance(state.get("observation_point"), dict) else {}
+        if self.route3_observation_needs_panorama(observation):
+            return self.route3_capture_facade_rgb_panorama_current(
+                session,
+                output_dir=output_dir,
+                facade_dir=facade_dir,
+                house_id=house_id,
+                facade=facade,
+                planned_pose=planned_pose,
+            )
+        action_detail = dict(self.build_stream_action_detail())
+        action_detail.update(
+            {
+                "source": "llm_route_v3_facade_observation",
+                "house_id": house_id,
+                "facade": facade,
+                "facade_id": self.route2_facade_id(house_id, facade),
+                "planned_pose": planned_pose,
+            }
+        )
+        frame_index = self.route2_next_frame_index(output_dir)
+        capture_result = self.safe(
+            "Route V3 coarse RGB/LiDAR capture",
+            lambda: session.capture_lidar_stream_frame(output_dir, frame_index, action_detail=action_detail),
+        )
+        if not isinstance(capture_result, dict):
+            return {"status": "failed", "reason": "capture_failed"}
+        coarse_rgb_path = facade_dir / "coarse_rgb.png"
+        rgb_path = self.route2_candidate_path(capture_result.get("rgb_path"))
+        if rgb_path is not None and rgb_path.exists() and rgb_path.is_file():
+            try:
+                if rgb_path.resolve() != coarse_rgb_path.resolve():
+                    coarse_rgb_path.write_bytes(rgb_path.read_bytes())
+            except Exception:
+                coarse_rgb_path.write_bytes(rgb_path.read_bytes())
+        capture_payload = {
+            "capture_kind": "facade_coarse_observation_v3",
+            "house_id": house_id,
+            "facade": facade,
+            "planned_pose": planned_pose,
+            "capture_result": capture_result,
+            "coarse_rgb_path": str(coarse_rgb_path if coarse_rgb_path.exists() else (rgb_path or "")),
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        self.write_json_artifact(facade_dir / "coarse_capture.json", capture_payload)
+        row = {
+            "frame_index": int(capture_result.get("frame_index", frame_index)),
+            "capture_time": capture_result.get("capture_time", ""),
+            "capture_kind": "facade_coarse_observation_v3",
+            "scan_id": f"{house_id}_{facade}_coarse_observation",
+            "house_id": house_id,
+            "facade": facade,
+            "facade_id": self.route2_facade_id(house_id, facade),
+            "planned_pose": planned_pose,
+            "pose": capture_result.get("pose", {}),
+            "commanded_pose": capture_result.get("commanded_pose", {}),
+            "actual_pose": capture_result.get("actual_pose", {}),
+            "pose_error": capture_result.get("pose_error", {}),
+            "capture_dir": capture_result.get("capture_dir", ""),
+            "rgb_path": capture_result.get("rgb_path", ""),
+            "point_cloud_world_standard_m_npy_path": capture_result.get("point_cloud_world_standard_m_npy_path", ""),
+            "point_cloud_world_standard_m_ply_path": capture_result.get("point_cloud_world_standard_m_ply_path", ""),
+            "point_cloud_preview_path": capture_result.get("point_cloud_preview_path", ""),
+            "point_count": int(capture_result.get("point_count", 0) or 0),
+            "action_detail": action_detail,
+        }
+        self.append_jsonl(output_dir / "lidar_capture_log.jsonl", row)
+        self.append_jsonl(facade_dir / "coarse_lidar_capture_log.jsonl", row)
+        self.route2_write_lidar_summary(output_dir, running=True)
+        self.route2_update_state(coarse_capture=capture_payload, coarse_rgb_path=capture_payload["coarse_rgb_path"])
+        self.route2_write_state_artifact()
+        return {"status": "ok", "capture": capture_payload, "row": row}
+
+    def route3_obstacle_fallback_analysis(
+        self,
+        image_path: Optional[Path],
+        planned_pose: Dict[str, float],
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        current_z = float(planned_pose.get("z", LLM_ROUTE2_OBSERVATION_Z_CM) or LLM_ROUTE2_OBSERVATION_Z_CM)
+        green_ratio = 0.0
+        center_green_ratio = 0.0
+        try:
+            if image_path is not None and image_path.exists():
+                data = np.fromfile(str(image_path), dtype=np.uint8)
+                image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                if image is not None and image.size:
+                    h, w = image.shape[:2]
+                    roi = image[int(h * 0.40): h, :]
+                    center = roi[:, int(w * 0.30): int(w * 0.70)]
+                    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                    hsv_center = cv2.cvtColor(center, cv2.COLOR_BGR2HSV)
+                    green = (
+                        (hsv[:, :, 0] >= 32)
+                        & (hsv[:, :, 0] <= 92)
+                        & (hsv[:, :, 1] >= 35)
+                        & (hsv[:, :, 2] >= 35)
+                    )
+                    green_center = (
+                        (hsv_center[:, :, 0] >= 32)
+                        & (hsv_center[:, :, 0] <= 92)
+                        & (hsv_center[:, :, 1] >= 35)
+                        & (hsv_center[:, :, 2] >= 35)
+                    )
+                    green_ratio = float(np.mean(green)) if green.size else 0.0
+                    center_green_ratio = float(np.mean(green_center)) if green_center.size else 0.0
+        except Exception as exc:
+            reason = reason or str(exc)
+        obstacle = bool(green_ratio >= 0.38 or center_green_ratio >= 0.32)
+        severity = "high" if center_green_ratio >= 0.48 or green_ratio >= 0.55 else ("medium" if obstacle else "none")
+        recommended_z = current_z
+        if obstacle:
+            recommended_z = min(
+                float(LLM_ROUTE3_OBSTACLE_MAX_OBSERVATION_Z_CM),
+                max(float(LLM_ROUTE2_OBSERVATION_Z_CM), current_z + float(LLM_ROUTE3_OBSTACLE_RAISE_STEP_CM)),
+            )
+        return {
+            "foreground_obstacle_present": obstacle,
+            "obstacle_type": "vegetation_or_foreground_occluder" if obstacle else "none",
+            "severity": severity,
+            "facade_visibility": "blocked" if severity == "high" else ("partially_blocked" if obstacle else "clear"),
+            "recommend_raise": obstacle,
+            "recommended_observation_z_cm": round(float(recommended_z), 2),
+            "green_ratio_lower_view": round(float(green_ratio), 4),
+            "green_ratio_lower_center": round(float(center_green_ratio), 4),
+            "planner_source": "vision_heuristic_fallback",
+            "reason": reason or ("foreground vegetation likely blocks the facade" if obstacle else "no strong foreground obstacle detected"),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def route3_normalize_obstacle_analysis(
+        self,
+        parsed: Dict[str, Any],
+        planned_pose: Dict[str, float],
+        fallback_reason: str = "",
+    ) -> Dict[str, Any]:
+        if not isinstance(parsed, dict):
+            parsed = {}
+        fallback = self.route3_obstacle_fallback_analysis(None, planned_pose, fallback_reason)
+        present_raw = parsed.get("foreground_obstacle_present", parsed.get("obstacle_visible", parsed.get("blocked")))
+        if isinstance(present_raw, str):
+            present = present_raw.strip().lower() in {"true", "yes", "y", "1", "blocked", "present"}
+        elif present_raw is None:
+            present = bool(fallback["foreground_obstacle_present"])
+        else:
+            present = bool(present_raw)
+        severity = str(parsed.get("severity", fallback["severity"]) or "").strip().lower()
+        if severity not in {"none", "low", "medium", "high"}:
+            severity = "medium" if present else "none"
+        visibility = str(parsed.get("facade_visibility", fallback["facade_visibility"]) or "").strip().lower()
+        if visibility not in {"clear", "partially_blocked", "blocked", "unknown"}:
+            visibility = "blocked" if severity == "high" else ("partially_blocked" if present else "clear")
+        recommend_raise_raw = parsed.get("recommend_raise", parsed.get("raise_altitude", parsed.get("should_climb")))
+        if isinstance(recommend_raise_raw, str):
+            recommend_raise = recommend_raise_raw.strip().lower() in {"true", "yes", "y", "1", "raise", "climb"}
+        elif recommend_raise_raw is None:
+            recommend_raise = bool(present and severity in {"medium", "high"})
+        else:
+            recommend_raise = bool(recommend_raise_raw)
+        current_z = float(planned_pose.get("z", LLM_ROUTE2_OBSERVATION_Z_CM) or LLM_ROUTE2_OBSERVATION_Z_CM)
+        recommended_raw = self._as_float_or_none(parsed.get("recommended_observation_z_cm", parsed.get("recommended_z_cm")))
+        if recommended_raw is None:
+            recommended_z = current_z + float(LLM_ROUTE3_OBSTACLE_RAISE_STEP_CM) if recommend_raise else current_z
+        else:
+            recommended_z = float(recommended_raw)
+        recommended_z = max(float(LLM_ROUTE2_OBSERVATION_Z_CM), min(float(LLM_ROUTE3_OBSTACLE_MAX_OBSERVATION_Z_CM), recommended_z))
+        if recommend_raise and recommended_z <= current_z + 5.0:
+            recommended_z = min(float(LLM_ROUTE3_OBSTACLE_MAX_OBSERVATION_Z_CM), current_z + float(LLM_ROUTE3_OBSTACLE_RAISE_STEP_CM))
+        return {
+            "foreground_obstacle_present": present,
+            "obstacle_type": str(parsed.get("obstacle_type", fallback["obstacle_type"]) or "unknown"),
+            "severity": severity,
+            "facade_visibility": visibility,
+            "recommend_raise": bool(recommend_raise),
+            "recommended_observation_z_cm": round(float(recommended_z), 2),
+            "reason": str(parsed.get("reason", fallback["reason"]) or fallback["reason"]),
+            "planner_source": "vlm_obstacle_check" if parsed else fallback["planner_source"],
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def route3_analyze_observation_obstacle(
+        self,
+        facade_dir: Path,
+        *,
+        house_id: str,
+        facade: str,
+        planned_pose: Dict[str, float],
+    ) -> Dict[str, Any]:
+        image_path = self.route2_current_rgb_path()
+        response_payload: Dict[str, Any] = {}
+        analysis: Dict[str, Any]
+        try:
+            if image_path is None:
+                raise RuntimeError("missing coarse RGB image")
+            image_b64 = self.route2_read_image_b64(image_path)
+            if not image_b64:
+                raise RuntimeError("missing coarse RGB image")
+            if not self.effective_llm_api_key():
+                raise RuntimeError("missing API key")
+            context = {
+                "house_id": house_id,
+                "facade": facade,
+                "planned_pose": planned_pose,
+                "preferred_min_observation_z_cm": LLM_ROUTE2_OBSERVATION_Z_CM,
+                "max_observation_z_cm": LLM_ROUTE3_OBSTACLE_MAX_OBSERVATION_Z_CM,
+            }
+            response_payload = self.call_configured_llm_text(
+                system_prompt=(
+                    "You inspect a UAV forward RGB image before facade search. "
+                    "Detect foreground occluders such as hedges, bushes, fences, walls, trees, cars, or awnings "
+                    "that block the view of the house facade. Return compact JSON only."
+                ),
+                user_prompt=(
+                    "Decide whether the UAV should climb before facade analysis. "
+                    "Use recommend_raise=true when the lower or center facade is blocked by foreground objects. "
+                    "For normal observation prefer at least 280cm height; if blocked, recommend a higher z, usually 400-550cm.\n"
+                    "Return JSON keys: foreground_obstacle_present, obstacle_type, severity(none|low|medium|high), "
+                    "facade_visibility(clear|partially_blocked|blocked), recommend_raise, recommended_observation_z_cm, reason.\n"
+                    f"Context:\n{json.dumps(context, indent=2, ensure_ascii=False)}"
+                ),
+                max_output_tokens=500,
+                json_schema=LLM_ROUTE3_OBSERVATION_OBSTACLE_SCHEMA,
+                image_b64=image_b64,
+            )
+            parsed = extract_json_object(str(response_payload.get("raw_text", "") or ""))
+            analysis = self.route3_normalize_obstacle_analysis(parsed, planned_pose, "")
+            response_payload["parsed"] = parsed
+        except Exception as exc:
+            LOGGER.warning("Route V3 observation obstacle fallback: %s", exc)
+            analysis = self.route3_obstacle_fallback_analysis(image_path, planned_pose, str(exc))
+            response_payload = {"error": str(exc), "fallback_used": True}
+        self.write_json_artifact(facade_dir / "observation_obstacle_response.json", response_payload)
+        self.write_json_artifact(facade_dir / "observation_obstacle_analysis.json", analysis)
+        state = self.route2_selected_state()
+        checks = list(state.get("observation_obstacle_checks", [])) if isinstance(state.get("observation_obstacle_checks"), list) else []
+        checks.append(analysis)
+        self.route2_update_state(observation_obstacle_analysis=analysis, observation_obstacle_checks=checks)
+        self.route2_write_state_artifact()
+        return analysis
+
+    def route3_raise_observation_if_obstructed(
+        self,
+        session: flight.DroneFlightSession,
+        *,
+        output_dir: Path,
+        facade_dir: Path,
+        house_id: str,
+        facade: str,
+        obs_pose: Dict[str, float],
+        obstacle_analysis: Dict[str, Any],
+    ) -> Tuple[Dict[str, float], Dict[str, Any]]:
+        if not bool(obstacle_analysis.get("recommend_raise", False)):
+            return obs_pose, {"status": "not_needed", "obstacle_analysis": obstacle_analysis}
+        target_z = self._as_float_or_none(obstacle_analysis.get("recommended_observation_z_cm"))
+        if target_z is None:
+            return obs_pose, {"status": "not_needed", "reason": "missing_recommended_z", "obstacle_analysis": obstacle_analysis}
+        target_z = max(float(LLM_ROUTE2_OBSERVATION_Z_CM), min(float(LLM_ROUTE3_OBSTACLE_MAX_OBSERVATION_Z_CM), float(target_z)))
+        if target_z <= float(obs_pose.get("z", 0.0)) + 5.0:
+            return obs_pose, {"status": "not_needed", "reason": "target_z_not_higher", "obstacle_analysis": obstacle_analysis}
+        raised_pose = dict(obs_pose)
+        raised_pose["z"] = round(float(target_z), 2)
+        self.route3_set_stage(
+            "CHECK_OBS_OCCLUSION",
+            output_dir=output_dir,
+            facade=facade,
+            target=raised_pose,
+            message=f"{facade} foreground obstacle detected; climbing to {raised_pose['z']:.0f}cm",
+        )
+        nav_result = self.route3_navigate_to_pose_with_movement(
+            session,
+            raised_pose,
+            output_dir=output_dir,
+            stage="CHECK_OBS_OCCLUSION",
+            facade=facade,
+            target_id=f"{house_id}_{facade}_obs_raise",
+            target_house_id=house_id,
+        )
+        self.route3_log_event(output_dir, "observation_raise_navigation", nav_result)
+        if nav_result.get("status") != "ok":
+            return obs_pose, {"status": "raise_failed", "navigation": nav_result, "obstacle_analysis": obstacle_analysis}
+        state = self.route2_selected_state()
+        observation = dict(state.get("observation_point", {}) if isinstance(state.get("observation_point"), dict) else {})
+        observation.update({"z": raised_pose["z"], "observation_raise_reason": obstacle_analysis})
+        self.route2_update_state(observation_point=observation)
+        self.write_json_artifact(facade_dir / "facade_observation_point.json", observation)
+        self.route2_write_state_artifact()
+        return raised_pose, {"status": "raised", "navigation": nav_result, "obstacle_analysis": obstacle_analysis}
+
+    def route3_plan_facade_scan_current(self) -> Dict[str, Any]:
+        state = self.route2_selected_state()
+        analysis = state.get("facade_analysis", {}) if isinstance(state.get("facade_analysis"), dict) else {}
+        if not analysis:
+            analysis = self.route2_fallback_facade_analysis("Route V3 used fallback before VLM analysis.")
+        points = self.route2_generate_facade_scan_points(analysis)
+        output_dir, facade_dir, house_id, facade = self.route2_facade_paths()
+        if output_dir is None or facade_dir is None:
+            raise RuntimeError("missing facade output directory")
+        points = self.route2_order_scan_points_continuously(points)
+        points = self.route2_assign_global_scan_ids(output_dir, house_id, facade, points)
+        validation = self.scan_point_validation_report(house_id, points)
+        search_plan = {
+            "schema": "facade_v3_scan_plan",
+            "house_id": house_id,
+            "facade": facade,
+            "facade_id": self.route2_facade_id(house_id, facade),
+            "observation_point": state.get("observation_point", {}),
+            "facade_analysis": analysis,
+            "scan_points": points,
+            "scan_point_validation_report": validation,
+            "route_blocked_by_safety": not bool(validation.get("valid", False)),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.write_json_artifact(facade_dir / "facade_search_plan.json", search_plan)
+        merged_points = self.route2_write_merged_scan_points(output_dir, house_id)
+        self.route2_update_state(facade_analysis=analysis, facade_search_plan=search_plan, facade_scan_points=points, validation_report=validation)
+        self.route2_write_state_artifact()
+        return {"search_plan": search_plan, "points": points, "validation": validation, "merged_points": merged_points}
+
+    def route3_capture_scan_point_current(
+        self,
+        session: flight.DroneFlightSession,
+        *,
+        output_dir: Path,
+        facade_dir: Path,
+        point: Dict[str, Any],
+        planned_pose: Dict[str, float],
+    ) -> Dict[str, Any]:
+        capture_count = max(1, self.route_capture_count())
+        capture_results: List[Dict[str, Any]] = []
+        scan_id = str(point.get("scan_id", "") or "")
+        for capture_idx in range(capture_count):
+            action_detail = dict(self.build_stream_action_detail())
+            action_detail.update(
+                {
+                    "source": "llm_route_v3_facade_scan",
+                    "scan_id": scan_id,
+                    "house_id": point.get("house_id"),
+                    "facade": point.get("facade"),
+                    "facade_id": point.get("facade_id"),
+                    "global_scan_order": point.get("global_scan_order"),
+                    "height_band": point.get("height_band"),
+                    "floor_index": point.get("floor_index"),
+                    "planned_pose": planned_pose,
+                    "capture_index": capture_idx,
+                }
+            )
+            frame_index = self.route2_next_frame_index(output_dir)
+            capture_result = self.safe(
+                "Route V3 scan capture",
+                lambda idx=frame_index, action=action_detail: session.capture_lidar_stream_frame(
+                    output_dir,
+                    idx,
+                    action_detail=action,
+                ),
+            )
+            if isinstance(capture_result, dict):
+                capture_results.append(capture_result)
+        capture_status = "ok" if capture_results else "failed"
+        rows: List[Dict[str, Any]] = []
+        for result in capture_results:
+            row = {
+                "frame_index": int(result.get("frame_index", 0) or 0),
+                "capture_time": result.get("capture_time", ""),
+                "capture_kind": "facade_scan_v3",
+                "scan_id": scan_id,
+                "global_scan_order": point.get("global_scan_order"),
+                "house_id": point.get("house_id"),
+                "facade": point.get("facade"),
+                "facade_id": point.get("facade_id"),
+                "height_band": point.get("height_band"),
+                "floor_index": point.get("floor_index"),
+                "planned_pose": planned_pose,
+                "pose": result.get("pose", {}),
+                "commanded_pose": result.get("commanded_pose", {}),
+                "actual_pose": result.get("actual_pose", {}),
+                "pose_error": result.get("pose_error", {}),
+                "capture_dir": result.get("capture_dir", ""),
+                "rgb_path": result.get("rgb_path", ""),
+                "point_cloud_world_standard_m_npy_path": result.get("point_cloud_world_standard_m_npy_path", ""),
+                "point_cloud_world_standard_m_ply_path": result.get("point_cloud_world_standard_m_ply_path", ""),
+                "point_cloud_preview_path": result.get("point_cloud_preview_path", ""),
+                "point_count": int(result.get("point_count", 0) or 0),
+                "action_detail": result.get("action_detail", {}),
+            }
+            rows.append(row)
+            self.append_jsonl(output_dir / "lidar_capture_log.jsonl", row)
+            self.append_jsonl(facade_dir / "lidar_capture_log.jsonl", row)
+        execution_entry = {
+            "scan_id": scan_id,
+            "global_scan_order": point.get("global_scan_order"),
+            "house_id": point.get("house_id"),
+            "facade": point.get("facade"),
+            "height_band": point.get("height_band"),
+            "floor_index": point.get("floor_index"),
+            "planned_pose": planned_pose,
+            "capture_status": capture_status,
+            "capture_count": len(capture_results),
+            "frame_indices": [int(item.get("frame_index", 0) or 0) for item in capture_results],
+            "capture_dirs": [str(item.get("capture_dir", "") or "") for item in capture_results],
+            "point_count": sum(int(item.get("point_count", 0) or 0) for item in capture_results),
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        self.append_jsonl(output_dir / "scan_execution_log.jsonl", execution_entry)
+        self.append_jsonl(facade_dir / "scan_execution_log.jsonl", execution_entry)
+        trajectory = list(self.route2_selected_state().get("facade_capture_rows", [])) if isinstance(self.route2_selected_state().get("facade_capture_rows"), list) else []
+        trajectory.extend(rows)
+        for state_point in self.llm_route2_state.get("facade_scan_points", []) if isinstance(self.llm_route2_state.get("facade_scan_points"), list) else []:
+            if isinstance(state_point, dict) and str(state_point.get("scan_id", "") or "") == scan_id:
+                state_point["status"] = "captured" if capture_status == "ok" else "capture_failed"
+        self.route2_update_state(facade_capture_rows=trajectory)
+        self.route2_write_state_artifact()
+        self.route2_write_lidar_summary(output_dir, running=True)
+        return {"status": capture_status, "rows": rows, "execution": execution_entry}
+
+    def route3_decide_next_facade(
+        self,
+        target_house_id: str,
+        candidates: List[Dict[str, Any]],
+        completed: set[str],
+        blocked: set[str],
+    ) -> Dict[str, Any]:
+        available = [
+            candidate for candidate in candidates
+            if isinstance(candidate, dict)
+            and str(candidate.get("facade", "") or "") not in completed
+            and str(candidate.get("facade", "") or "") not in blocked
+            and str(candidate.get("status", "") or "") != "blocked"
+            and not str(candidate.get("observation_blocking_house_id", "") or "")
+        ]
+        fallback = {
+            "next_action": "select_facade" if available else "done",
+            "target_facade": str(available[0].get("facade", "") or "") if available else "",
+            "reason": "fallback nearest safe uncompleted facade",
+            "rescan_required": False,
+            "stop_condition_met": not bool(available),
+            "planner_source": "rule_fallback",
+        }
+        if not available or not self.effective_llm_api_key():
+            return fallback
+        try:
+            context = {
+                "target_house_id": target_house_id,
+                "completed_facades": sorted(completed),
+                "blocked_facades": sorted(blocked),
+                "candidate_observation_points": available,
+                "current_pose": self.route3_current_pose(),
+                "task": self.llm_task_text_var.get().strip(),
+            }
+            response = self.call_configured_llm_text(
+                system_prompt=(
+                    "You are a high-level UAV house facade search supervisor. "
+                    "Choose the next facade only; do not output low-level movement commands. "
+                    "Return compact JSON."
+                ),
+                user_prompt=(
+                    "Choose the next safe facade to search. Return JSON with keys "
+                    "next_action(select_facade|done), target_facade, reason, rescan_required, stop_condition_met.\n"
+                    f"Context:\n{json.dumps(context, indent=2, ensure_ascii=False)}"
+                ),
+                max_output_tokens=400,
+                json_schema={
+                    "next_action": "select_facade",
+                    "target_facade": "west",
+                    "reason": "",
+                    "rescan_required": False,
+                    "stop_condition_met": False,
+                },
+            )
+            parsed = extract_json_object(str(response.get("raw_text", "") or ""))
+            chosen = str(parsed.get("target_facade", "") or "").strip().lower()
+            valid_facades = {str(item.get("facade", "") or "") for item in available}
+            if chosen in valid_facades:
+                parsed["planner_source"] = "llm_high_level"
+                return parsed
+        except Exception as exc:
+            LOGGER.warning("Route V3 high-level LLM decision fallback: %s", exc)
+        return fallback
+
+    def route3_initialize_run(self, target_house_id: str, *, force_new: bool = False) -> Path:
+        current = self.llm_route3_state if isinstance(getattr(self, "llm_route3_state", None), dict) else {}
+        current_target = str(current.get("target_house_id", "") or "")
+        output_dir = self.route3_state_output_dir()
+        if force_new or output_dir is None or current_target != str(target_house_id):
+            output_dir = self.make_route3_autosearch_output_dir(target_house_id)
+            self.llm_route3_completed_facades = set()
+            self.llm_route3_blocked_facades = set()
+            self.llm_route3_state = {
+                "mode": "facade_autosearch_v3",
+                "target_house_id": target_house_id,
+                "output_dir": str(output_dir),
+                "stage": "INIT_RUN",
+                "completed_facades": [],
+                "blocked_facades": [],
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "nav_config": self.route3_nav_config(),
+            }
+        self.llm_route2_state = {
+            "mode": "facade_by_facade_vlm_v2",
+            "target_house_id": target_house_id,
+            "output_dir": str(output_dir),
+            "facade": "",
+            "facade_id": "",
+            "completed_facades": sorted(self.llm_route3_completed_facades),
+        }
+        self.llm_route2_completed_facades = set(self.llm_route3_completed_facades)
+        self.route3_write_state_artifact()
+        return output_dir
+
+    def route3_run_summary(self, output_dir: Path, *, status: str) -> Dict[str, Any]:
+        capture_rows = self.read_jsonl_artifact(output_dir / "lidar_capture_log.jsonl")
+        execution_rows = self.read_jsonl_artifact(output_dir / "scan_execution_log.jsonl")
+        summary = {
+            "schema": "facade_autosearch_v3_summary",
+            "status": status,
+            "target_house_id": str(self.llm_route3_state.get("target_house_id", "") or ""),
+            "completed_facades": sorted(self.llm_route3_completed_facades),
+            "blocked_facades": sorted(self.llm_route3_blocked_facades),
+            "capture_count": len(capture_rows),
+            "scan_execution_count": len(execution_rows),
+            "output_dir": str(output_dir),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.write_json_artifact(output_dir / "autosearch_summary.json", summary)
+        return summary
+
+    def route3_full_search_worker(self, session: flight.DroneFlightSession, *, single_facade: bool = False, force_new: bool = False) -> None:
+        target_house_id = self.selected_route_target_house_id()
+        if not target_house_id:
+            self.root.after(0, lambda: self.llm_route3_status_var.set("LLM Route V3: select a target house first."))
+            return
+        self.route3_set_control_lock(True)
+        output_dir = self.route3_initialize_run(target_house_id, force_new=force_new)
+        self.route3_set_stage("PLAN_4_FACADES", output_dir=output_dir, message=f"planning facade candidates for house={target_house_id}")
+        self.sync_capture_options_to_session(session)
+        self.route3_enable_physics_movement(session)
+        status = "running"
+        try:
+            while not self.llm_route3_stop_event.is_set():
+                completed = set(self.llm_route3_completed_facades)
+                blocked = set(self.llm_route3_blocked_facades)
+                if len(completed | blocked) >= 4:
+                    status = "done"
+                    break
+                candidates = self.route2_all_facade_observation_candidates(target_house_id, skip_completed=False)
+                self.route3_update_state(candidate_observation_points=candidates, completed_facades=sorted(completed), blocked_facades=sorted(blocked))
+                self.route3_write_state_artifact()
+                decision = self.route3_decide_next_facade(target_house_id, candidates, completed, blocked)
+                self.route3_log_event(output_dir, "high_level_decision", decision)
+                facade = str(decision.get("target_facade", "") or "").strip().lower()
+                if not facade or bool(decision.get("stop_condition_met", False)):
+                    status = "done"
+                    break
+                selected = next((dict(item) for item in candidates if str(item.get("facade", "") or "") == facade), {})
+                if not selected:
+                    self.llm_route3_blocked_facades.add(facade)
+                    continue
+                self.route3_set_stage("SELECT_NEXT_FACADE", output_dir=output_dir, facade=facade, message=f"selected facade={facade}")
+                self.llm_route2_state = {"target_house_id": target_house_id, "output_dir": str(output_dir)}
+                self.apply_route2_observation_plan(target_house_id, selected, candidates, status_label="v3 selected")
+                facade_dir = self.route2_facade_dir(output_dir, target_house_id, facade)
+                observation = self.route2_selected_state().get("observation_point", selected)
+                obs_pose = self.route3_target_pose_from_point(observation)
+                self.route3_set_stage("NAV_TO_OBS", output_dir=output_dir, facade=facade, target=obs_pose, message=f"navigating to {facade} observation")
+                nav_result = self.route3_navigate_to_pose_with_movement(
+                    session,
+                    obs_pose,
+                    output_dir=output_dir,
+                    stage="NAV_TO_OBS",
+                    facade=facade,
+                    target_id=f"{target_house_id}_{facade}_obs",
+                    target_house_id=target_house_id,
+                )
+                self.route3_log_event(output_dir, "navigation_result", nav_result)
+                if nav_result.get("status") != "ok":
+                    self.llm_route3_blocked_facades.add(facade)
+                    self.route3_update_state(blocked_facades=sorted(self.llm_route3_blocked_facades))
+                    self.route3_write_state_artifact()
+                    self.route3_set_stage("DECIDE_NEXT", output_dir=output_dir, facade=facade, error=nav_result, message=f"{facade} observation navigation blocked")
+                    if single_facade:
+                        break
+                    continue
+                if self.llm_route3_stop_event.is_set():
+                    break
+                self.route3_set_stage("CAPTURE_RGB", output_dir=output_dir, facade=facade, target=obs_pose, message=f"capturing {facade} RGB")
+                rgb_result = self.route3_capture_facade_rgb_current(
+                    session,
+                    output_dir=output_dir,
+                    facade_dir=facade_dir,
+                    house_id=target_house_id,
+                    facade=facade,
+                    planned_pose=obs_pose,
+                )
+                self.route3_log_event(output_dir, "facade_rgb_capture", rgb_result)
+                self.root.after(0, self.refresh_route3_support_views)
+                if rgb_result.get("status") == "ok":
+                    self.route3_set_stage("CHECK_OBS_OCCLUSION", output_dir=output_dir, facade=facade, target=obs_pose, message=f"checking {facade} foreground obstacle")
+                    obstacle_analysis = self.route3_analyze_observation_obstacle(
+                        facade_dir,
+                        house_id=target_house_id,
+                        facade=facade,
+                        planned_pose=obs_pose,
+                    )
+                    self.route3_log_event(output_dir, "observation_obstacle_analysis", obstacle_analysis)
+                    raised_pose, raise_result = self.route3_raise_observation_if_obstructed(
+                        session,
+                        output_dir=output_dir,
+                        facade_dir=facade_dir,
+                        house_id=target_house_id,
+                        facade=facade,
+                        obs_pose=obs_pose,
+                        obstacle_analysis=obstacle_analysis,
+                    )
+                    self.route3_log_event(output_dir, "observation_raise_result", raise_result)
+                    if raise_result.get("status") == "raised":
+                        obs_pose = raised_pose
+                        self.route3_set_stage("CAPTURE_RGB", output_dir=output_dir, facade=facade, target=obs_pose, message=f"recapturing {facade} RGB after climb")
+                        rgb_result = self.route3_capture_facade_rgb_current(
+                            session,
+                            output_dir=output_dir,
+                            facade_dir=facade_dir,
+                            house_id=target_house_id,
+                            facade=facade,
+                            planned_pose=obs_pose,
+                        )
+                        self.route3_log_event(output_dir, "facade_rgb_recapture_after_raise", rgb_result)
+                        if rgb_result.get("status") == "ok":
+                            post_obstacle_analysis = self.route3_analyze_observation_obstacle(
+                                facade_dir,
+                                house_id=target_house_id,
+                                facade=facade,
+                                planned_pose=obs_pose,
+                            )
+                            self.route3_log_event(output_dir, "observation_obstacle_analysis_after_raise", post_obstacle_analysis)
+                    self.root.after(0, self.refresh_route3_support_views)
+
+                self.route3_set_stage("ANALYZE_VLM", output_dir=output_dir, facade=facade, message=f"analyzing {facade} facade")
+                self.route2_analyze_facade_vlm_worker()
+                self.root.after(0, self.refresh_route3_support_views)
+
+                self.route3_set_stage("PLAN_SCAN", output_dir=output_dir, facade=facade, message=f"planning {facade} scan")
+                plan_result = self.route3_plan_facade_scan_current()
+                points = [point for point in plan_result.get("points", []) if isinstance(point, dict)]
+                self.route3_log_event(output_dir, "facade_scan_plan", {"facade": facade, "point_count": len(points), "validation": plan_result.get("validation", {})})
+                self.root.after(0, self.refresh_route3_support_views)
+                if not points:
+                    self.llm_route3_blocked_facades.add(facade)
+                    self.route3_update_state(blocked_facades=sorted(self.llm_route3_blocked_facades))
+                    self.route3_write_state_artifact()
+                    self.route3_set_stage("DECIDE_NEXT", output_dir=output_dir, facade=facade, message=f"{facade} scan has no valid points")
+                    if single_facade:
+                        break
+                    continue
+
+                total = len(points)
+                for idx, point in enumerate(points, start=1):
+                    if self.llm_route3_stop_event.is_set():
+                        break
+                    scan_id = str(point.get("scan_id", "") or f"{facade}_{idx}")
+                    target_pose = self.route3_target_pose_from_point(point)
+                    self.route3_set_stage(
+                        "NAV_TO_SCAN_POINT",
+                        output_dir=output_dir,
+                        facade=facade,
+                        target=target_pose,
+                        message=f"scan {idx}/{total} {scan_id}",
+                    )
+                    nav_scan = self.route3_navigate_to_pose_with_movement(
+                        session,
+                        target_pose,
+                        output_dir=output_dir,
+                        stage="NAV_TO_SCAN_POINT",
+                        facade=facade,
+                        target_id=scan_id,
+                        target_house_id=target_house_id,
+                    )
+                    self.route3_log_event(output_dir, "scan_navigation_result", nav_scan)
+                    if nav_scan.get("status") != "ok":
+                        point["status"] = "blocked"
+                        point["block_reason"] = nav_scan.get("reason", "navigation_failed")
+                        continue
+                    self.route3_set_stage("CAPTURE_SCAN", output_dir=output_dir, facade=facade, target=target_pose, message=f"capturing {scan_id}")
+                    capture = self.route3_capture_scan_point_current(
+                        session,
+                        output_dir=output_dir,
+                        facade_dir=facade_dir,
+                        point=point,
+                        planned_pose=target_pose,
+                    )
+                    self.route3_log_event(output_dir, "scan_capture", {"scan_id": scan_id, **capture})
+                    progress = 100.0 * (len(completed) + (idx / max(1, total))) / 4.0
+                    self.root.after(0, lambda v=progress: self.llm_route3_progress_var.set(max(0.0, min(100.0, v))))
+                    self.root.after(0, lambda i=idx, t=total, f=facade: self.llm_route3_progress_text_var.set(f"Autonomy: {f} {i}/{t}"))
+                    self.root.after(0, self.refresh_route3_support_views)
+
+                self.route2_write_lidar_summary(output_dir, running=False)
+                self.route3_set_stage("VALIDATE_FACADE", output_dir=output_dir, facade=facade, message=f"validating {facade}")
+                validation = self.route2_validate_facade()
+                self.route3_log_event(output_dir, "facade_validation", validation)
+                self.llm_route3_completed_facades.add(facade)
+                self.route3_update_state(completed_facades=sorted(self.llm_route3_completed_facades), blocked_facades=sorted(self.llm_route3_blocked_facades))
+                self.route3_write_state_artifact()
+                self.root.after(0, self.refresh_route3_support_views)
+                if single_facade:
+                    status = "single_facade_complete"
+                    break
+                self.route3_set_stage("DECIDE_NEXT", output_dir=output_dir, facade=facade, message=f"{facade} complete; deciding next facade")
+            if self.llm_route3_stop_event.is_set():
+                status = "stopped"
+            if status == "done" and self.llm_route3_blocked_facades:
+                status = "done_with_blocked"
+            final_stage = "DONE" if status == "done" else ("DONE_WITH_BLOCKED" if status == "done_with_blocked" else "DECIDE_NEXT")
+            self.route3_set_stage(final_stage, output_dir=output_dir, message=f"autosearch {status}")
+            summary = self.route3_run_summary(output_dir, status=status)
+            self.route3_log_event(output_dir, "summary", summary)
+            self.root.after(0, lambda s=status, d=output_dir: self.llm_route3_status_var.set(f"LLM Route V3: {s} -> {d}"))
+            self.root.after(0, self.refresh_route3_support_views)
+        except Exception as exc:
+            LOGGER.warning("Route V3 autosearch failed: %s", exc)
+            self.route3_log_event(output_dir, "error", {"reason": str(exc)})
+            self.route3_run_summary(output_dir, status="failed")
+            self.root.after(0, lambda e=exc: self.llm_route3_status_var.set(f"LLM Route V3: failed: {e}"))
+        finally:
+            self.route3_set_control_lock(False)
+
+    def refresh_route3_preview(self) -> None:
+        preview_text = getattr(self, "llm_route3_preview_text", None)
+        if preview_text is None:
+            return
+        payload = {
+            "autonomy_state": self.llm_route3_state if isinstance(getattr(self, "llm_route3_state", None), dict) else {},
+            "active_facade_state": self.llm_route2_state if isinstance(getattr(self, "llm_route2_state", None), dict) else {},
+        }
+        try:
+            if not preview_text.winfo_exists():
+                self.llm_route3_preview_text = None
+                return
+            preview_text.configure(state="normal")
+            preview_text.delete("1.0", "end")
+            preview_text.insert("1.0", json.dumps(payload, indent=2, ensure_ascii=False))
+            preview_text.configure(state="disabled")
+        except tk.TclError:
+            self.llm_route3_preview_text = None
+
+    def refresh_route3_analysis_view(self) -> None:
+        analysis_text = getattr(self, "llm_route3_analysis_text", None)
+        if analysis_text is None:
+            return
+        state = self.route2_selected_state()
+        analysis = state.get("facade_analysis", {}) if isinstance(state.get("facade_analysis"), dict) else {}
+        payload = analysis if analysis else {"facade": state.get("facade", ""), "status": "No facade analysis yet."}
+        try:
+            if not analysis_text.winfo_exists():
+                self.llm_route3_analysis_text = None
+                return
+            analysis_text.configure(state="normal")
+            analysis_text.delete("1.0", "end")
+            analysis_text.insert("1.0", json.dumps(payload, indent=2, ensure_ascii=False))
+            analysis_text.configure(state="disabled")
+        except tk.TclError:
+            self.llm_route3_analysis_text = None
+
+    def refresh_route3_rgb_display(self) -> None:
+        widget = getattr(self, "llm_route3_rgb_label", None)
+        if widget is None:
+            return
+        image_path = self.route2_current_rgb_path()
+        if image_path is None:
+            try:
+                self.route2_draw_rgb_preview_message(widget, "No facade RGB")
+                self.llm_route3_rgb_photo = None
+                self.llm_route2_rgb_status_var.set("Facade RGB: none")
+            except tk.TclError:
+                self.llm_route3_rgb_label = None
+            return
+        try:
+            image = Image.open(image_path).convert("RGB")
+            photo = ImageTk.PhotoImage(self.route2_rgb_preview_image(image, widget))
+            self.route2_draw_rgb_preview_photo(widget, photo)
+            self.llm_route3_rgb_photo = photo
+            suffix = " (panorama used)" if image_path.name == "coarse_rgb_panorama.png" else ""
+            self.llm_route2_rgb_status_var.set(f"Facade RGB: {image_path.name}{suffix}")
+        except Exception as exc:
+            LOGGER.warning("Refresh route v3 facade RGB failed: %s", exc)
+            try:
+                self.route2_draw_rgb_preview_message(widget, f"RGB load failed:\n{exc}")
+                self.llm_route3_rgb_photo = None
+                self.llm_route2_rgb_status_var.set("Facade RGB: load failed")
+            except tk.TclError:
+                self.llm_route3_rgb_label = None
+
+    def refresh_llm_route3_map(self) -> None:
+        widget = getattr(self, "llm_route3_map_widget", None)
+        if widget is None:
+            return
+        try:
+            if not self.load_map_resources(force=not bool(self.map_config)):
+                self.llm_route3_map_status_var.set("Route V3 Map: map unavailable")
+                return
+            pose = self.latest_state.get("pose", {}) if isinstance(self.latest_state.get("pose"), dict) else {}
+            pose_x = float(pose.get("x", 0.0)) if pose else 0.0
+            pose_y = float(pose.get("y", 0.0)) if pose else 0.0
+            pose_yaw = float(pose.get("task_yaw", pose.get("yaw", 0.0))) if pose else 0.0
+            houses, boxes = self.build_map_display(pose)
+            widget.set_background_image(self.map_image)
+            widget.set_calibration(
+                self.map_calibration.get("affine_world_to_image"),
+                self.map_image_size(),
+                [],
+                self.map_calibration.get("homography_world_to_image"),
+            )
+            widget.set_image_layer_offset(*self.map_display_offset_px)
+            widget.set_house_boxes(boxes)
+            widget.update_houses([])
+            widget.update_uav(pose_x, pose_y, pose_yaw)
+            route_points: List[Dict[str, Any]] = []
+            state = self.llm_route2_state if isinstance(getattr(self, "llm_route2_state", None), dict) else {}
+            for candidate in state.get("candidate_observation_points", []) if isinstance(state.get("candidate_observation_points"), list) else []:
+                if isinstance(candidate, dict):
+                    item = dict(candidate)
+                    item["label"] = str(item.get("label", "") or f"{item.get('facade', '')}_obs")
+                    item["route_point_type"] = "observation_point"
+                    route_points.append(item)
+            for point in state.get("facade_scan_points", []) if isinstance(state.get("facade_scan_points"), list) else []:
+                if isinstance(point, dict):
+                    item = dict(point)
+                    item["label"] = str(item.get("scan_id", "") or f"scan_{len(route_points)}")
+                    item["route_point_type"] = "scan_point"
+                    route_points.append(item)
+            widget.set_route_plan({"route_points": route_points})
+            output_dir = self.route3_state_output_dir()
+            if output_dir is not None:
+                trace_rows = self.read_jsonl_artifact(output_dir / "movement_trace.jsonl")
+                trajectory = [row.get("current_pose", {}) for row in trace_rows[-400:] if isinstance(row.get("current_pose"), dict)]
+                widget.set_trajectory(trajectory)
+            self.llm_route3_map_status_var.set(
+                f"Route V3 Map: houses={len(houses)} route_points={len(route_points)} completed={len(self.llm_route3_completed_facades)}/4"
+            )
+        except tk.TclError:
+            pass
+        except Exception as exc:
+            LOGGER.warning("Refresh LLM route v3 map failed: %s", exc)
+            self.llm_route3_map_status_var.set(f"Route V3 Map: failed: {exc}")
+
+    def refresh_route3_support_views(self) -> None:
+        completed = len(getattr(self, "llm_route3_completed_facades", set()) or set())
+        blocked = len(getattr(self, "llm_route3_blocked_facades", set()) or set())
+        progress = 100.0 * float(min(4, completed + blocked)) / 4.0
+        try:
+            self.llm_route3_progress_var.set(max(0.0, min(100.0, progress)))
+            self.llm_route3_progress_text_var.set(f"Autonomy: completed={completed} blocked={blocked}")
+        except tk.TclError:
+            pass
+        self.refresh_route3_preview()
+        self.refresh_route3_analysis_view()
+        self.refresh_route3_rgb_display()
+        self.refresh_llm_route3_map()
+
+    def on_route3_start_full_search(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        if self.llm_route3_thread is not None and self.llm_route3_thread.is_alive():
+            self.llm_route3_status_var.set("LLM Route V3: already running.")
+            return
+        self.llm_route3_stop_event.clear()
+        self.llm_route3_pause_event.clear()
+        self.llm_route3_paused_var.set(False)
+        self.llm_route3_thread = threading.Thread(
+            target=lambda: self.route3_full_search_worker(session, single_facade=False, force_new=True),
+            daemon=True,
+        )
+        self.llm_route3_thread.start()
+
+    def on_route3_step_stage(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        if self.llm_route3_thread is not None and self.llm_route3_thread.is_alive():
+            self.llm_route3_status_var.set("LLM Route V3: wait for current worker.")
+            return
+        self.llm_route3_stop_event.clear()
+        self.llm_route3_pause_event.clear()
+        self.llm_route3_thread = threading.Thread(
+            target=lambda: self.route3_full_search_worker(session, single_facade=True, force_new=False),
+            daemon=True,
+        )
+        self.llm_route3_thread.start()
+
+    def on_route3_toggle_pause(self) -> None:
+        if self.llm_route3_pause_event.is_set():
+            self.llm_route3_pause_event.clear()
+            self.llm_route3_paused_var.set(False)
+            self.llm_route3_status_var.set("LLM Route V3: resumed.")
+        else:
+            self.llm_route3_pause_event.set()
+            self.llm_route3_paused_var.set(True)
+            session = self.session
+            if session is not None and session.started:
+                self.route3_hold(session, output_dir=self.route3_state_output_dir(), reason="pause_button")
+            self.llm_route3_status_var.set("LLM Route V3: paused.")
+
+    def on_route3_stop(self) -> None:
+        self.llm_route3_stop_event.set()
+        self.route_stop_event.set()
+        self.llm_route3_pause_event.clear()
+        session = self.session
+        if session is not None and session.started:
+            self.route3_hold(session, output_dir=self.route3_state_output_dir(), reason="stop_button")
+        self.llm_route3_status_var.set("LLM Route V3: stop requested.")
+
+    def on_route3_clear(self) -> None:
+        if self.llm_route3_thread is not None and self.llm_route3_thread.is_alive():
+            self.llm_route3_status_var.set("LLM Route V3: stop before clearing.")
+            return
+        self.llm_route3_state = {}
+        self.llm_route3_completed_facades = set()
+        self.llm_route3_blocked_facades = set()
+        self.llm_route3_stage_var.set("Stage: idle")
+        self.llm_route3_active_var.set("Active: n/a")
+        self.llm_route3_target_var.set("Target: n/a")
+        self.llm_route3_error_var.set("Error: n/a")
+        self.llm_route3_payload_var.set("Payload: hold")
+        self.llm_route3_status_var.set("LLM Route V3: cleared.")
+        self.refresh_route3_support_views()
+
+    def on_route3_validate_run(self) -> None:
+        output_dir = self.route3_state_output_dir()
+        if output_dir is None:
+            self.llm_route3_status_var.set("LLM Route V3: no run to validate.")
+            return
+        summary = self.route3_run_summary(output_dir, status=str(self.llm_route3_state.get("stage", "manual_validate") or "manual_validate"))
+        self.llm_route3_status_var.set(f"LLM Route V3: run summary -> {output_dir / 'autosearch_summary.json'}")
+        self.route3_log_event(output_dir, "manual_validate_run", summary)
+        self.refresh_route3_support_views()
 
     def on_llm_task_analyze(self) -> None:
         if self.route_thread is not None and self.route_thread.is_alive():

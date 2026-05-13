@@ -592,6 +592,7 @@ class AnalysisControlMixin:
             calibration.get("affine_world_to_image"),
             self.map_image_size(),
             anchors,
+            calibration.get("homography_world_to_image"),
         )
         self.stream_analysis_map_widget.set_image_layer_offset(*self.map_display_offset_px)
         self.stream_analysis_map_widget.set_house_boxes(boxes)

@@ -94,6 +94,7 @@ def main() -> None:
     assert candidates, "expected safe observation candidates"
     observation = candidates[0]
     assert observation["facade"] == "west", f"expected nearest west facade, got {observation['facade']}"
+    assert float(observation["z"]) >= 280.0, f"expected observation z >= 280cm, got {observation['z']}"
     all_facade_candidates = harness.route2_all_facade_observation_candidates("001", skip_completed=False)
     assert len(all_facade_candidates) == 4, f"expected four facade candidates, got {len(all_facade_candidates)}"
     assert {candidate["facade"] for candidate in all_facade_candidates} == {"south", "east", "north", "west"}
@@ -128,8 +129,9 @@ def main() -> None:
     alley_candidates = harness.route2_all_facade_observation_candidates("003", skip_completed=False)
     east_alley = next(candidate for candidate in alley_candidates if candidate["facade"] == "east")
     assert east_alley["status"] == "planned", east_alley
-    assert east_alley["observation_standoff_mode"] == "facade_center_projection_boundary_adjusted", east_alley
+    assert east_alley["observation_standoff_mode"] in {"facade_center_projection_boundary_adjusted", "neighbor_clearance_clamped"}, east_alley
     assert 1000.0 < float(east_alley["x"]) < 1140.0, east_alley
+    assert float(east_alley["standoff_cm"]) >= 120.0, east_alley
     assert not east_alley.get("observation_blocking_house_id"), east_alley
     assert east_alley["safe_interval_source"] == "facade_center_projection", east_alley
     harness.custom_bboxes = {
@@ -150,8 +152,18 @@ def main() -> None:
         850.0,
         {"house_id": "002", "min_x": 1140.0, "max_x": 2400.0, "min_y": -200.0, "max_y": 1200.0, "clearance_cm": 180.0},
     )
-    assert adjusted and adjusted["pose"]["x"] == 1138.0, adjusted
+    assert not adjusted, adjusted
+    adjusted = harness.route2_adjust_observation_to_blocking_boundary(
+        {"min_x": 0.0, "max_x": 1000.0, "min_y": 0.0, "max_y": 1000.0},
+        "east",
+        500.0,
+        300.0,
+        850.0,
+        {"house_id": "002", "min_x": 1300.0, "max_x": 2400.0, "min_y": -200.0, "max_y": 1200.0, "clearance_cm": 180.0},
+    )
+    assert adjusted and adjusted["pose"]["x"] == 1200.0, adjusted
     assert adjusted["adjustment"]["blocking_house_id"] == "002", adjusted
+    assert adjusted["adjustment"]["boundary_gap_cm"] == 100.0, adjusted
     harness.custom_bboxes = {}
     harness.map_calibration = {
         "affine_world_to_image": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
