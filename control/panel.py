@@ -97,6 +97,11 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.llm_route3_payload_var = tk.StringVar(value="Payload: hold")
         self.llm_route3_progress_text_var = tk.StringVar(value="Autonomy: 0%")
         self.llm_route3_progress_var = tk.DoubleVar(value=0.0)
+        self.llm_route3_task_status_var = tk.StringVar(value="Task Plan: n/a")
+        self.llm_route3_target_sequence_var = tk.StringVar(value="Targets: n/a")
+        self.llm_route3_current_status_var = tk.StringVar(value="Current: idle")
+        self.llm_route3_next_status_var = tk.StringVar(value="Next: n/a")
+        self.llm_route3_auto_refresh_var = tk.BooleanVar(value=False)
         self.llm_route3_paused_var = tk.BooleanVar(value=False)
         self.llm_route3_move_tick_ms_var = tk.StringVar(value="150")
         self.llm_route3_nav_step_cm_var = tk.StringVar(value="20")
@@ -280,6 +285,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.llm_route3_analysis_text: Optional[tk.Text] = None
         self.llm_route3_rgb_label: Optional[tk.Widget] = None
         self.llm_route3_rgb_photo: Optional[ImageTk.PhotoImage] = None
+        self.llm_route3_auto_refresh_job: Optional[str] = None
         self.llm_route3_state: Dict[str, Any] = {}
         self.llm_route3_completed_facades: set[str] = set()
         self.llm_route3_blocked_facades: set[str] = set()
@@ -1130,7 +1136,8 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         if self.house_target_combo is None:
             self.house_target_combo = combo
         tk.Label(route, text="Task").grid(row=0, column=2, sticky="w", padx=6, pady=6)
-        tk.Entry(route, textvariable=self.llm_task_text_var).grid(row=0, column=3, columnspan=3, sticky="ew", padx=6, pady=6)
+        tk.Entry(route, textvariable=self.llm_task_text_var).grid(row=0, column=3, columnspan=2, sticky="ew", padx=6, pady=6)
+        tk.Button(route, text="Analyze Task Plan", command=self.on_route3_analyze_task_plan).grid(row=0, column=5, sticky="ew", padx=6, pady=6)
 
         tk.Label(route, text="API").grid(row=1, column=0, sticky="w", padx=6, pady=6)
         api_combo = ttk.Combobox(
@@ -1201,6 +1208,8 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Label(status, textvariable=self.llm_route3_target_var, anchor="w").grid(row=0, column=1, sticky="ew", padx=(0, 12))
         tk.Label(status, textvariable=self.llm_route3_error_var, anchor="w").grid(row=0, column=2, sticky="w")
         tk.Label(status, textvariable=self.llm_route3_payload_var, anchor="w").grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        tk.Label(status, textvariable=self.llm_route3_task_status_var, anchor="w").grid(row=2, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        tk.Label(status, textvariable=self.llm_route3_target_sequence_var, anchor="w").grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 0))
 
         tk.Label(route, textvariable=self.llm_route3_status_var, anchor="w").grid(row=7, column=0, columnspan=6, sticky="ew", padx=6, pady=(0, 4))
         preview_frame = tk.Frame(route)
@@ -1285,8 +1294,16 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         map_toolbar = tk.Frame(map_frame)
         map_toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
         tk.Label(map_toolbar, textvariable=self.llm_route3_map_status_var, anchor="w").pack(side="left", fill="x", expand=True)
+        tk.Label(map_toolbar, textvariable=self.llm_route3_current_status_var, anchor="w").pack(side="left", padx=(8, 2))
+        tk.Label(map_toolbar, textvariable=self.llm_route3_next_status_var, anchor="w").pack(side="left", padx=(8, 2))
         tk.Label(map_toolbar, textvariable=self.llm_route3_progress_text_var, anchor="e").pack(side="left", padx=(8, 2))
         ttk.Progressbar(map_toolbar, variable=self.llm_route3_progress_var, maximum=100.0, length=150, mode="determinate").pack(side="left", padx=(0, 8))
+        tk.Checkbutton(
+            map_toolbar,
+            text="Auto Refresh",
+            variable=self.llm_route3_auto_refresh_var,
+            command=self.on_route3_auto_refresh_toggle,
+        ).pack(side="left", padx=(0, 8))
         tk.Button(map_toolbar, text="Refresh Map", command=self.refresh_llm_route3_map).pack(side="right", padx=6)
         self.load_map_resources(force=True)
         self.llm_route3_map_widget = OverheadMapWidget(map_frame, world_bounds=self.map_world_bounds, canvas_w=760, canvas_h=320)
@@ -1309,6 +1326,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
             self.llm_route3_analysis_text = None
             self.llm_route3_rgb_label = None
             self.llm_route3_rgb_photo = None
+            self.cancel_route3_auto_refresh()
             try:
                 window.destroy()
             except tk.TclError:

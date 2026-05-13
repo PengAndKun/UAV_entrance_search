@@ -48,6 +48,8 @@ LLM_ROUTE3_ESCAPE_REACH_TOL_CM = 15.0
 LLM_ROUTE3_PANORAMA_COVERAGE_THRESHOLD = 0.85
 LLM_ROUTE3_PANORAMA_MIN_YAW_DELTA_DEG = 15.0
 LLM_ROUTE3_PANORAMA_MAX_YAW_DELTA_DEG = 45.0
+LLM_ROUTE3_OBSERVATION_ATTEMPT_MAX = 6
+LLM_ROUTE3_AUTO_REFRESH_MS = 1000
 LLM_ROUTE2_DENSITY_SPACING_CM: Dict[str, float] = {
     "high": 80.0,
     "medium": 120.0,
@@ -104,6 +106,21 @@ LLM_ROUTE3_OBSERVATION_OBSTACLE_SCHEMA: Dict[str, Any] = {
     "recommend_raise": False,
     "recommended_observation_z_cm": LLM_ROUTE2_OBSERVATION_Z_CM,
     "reason": "Short explanation.",
+}
+LLM_ROUTE3_TASK_PLAN_SCHEMA: Dict[str, Any] = {
+    "target_house_id": "001",
+    "target_sequence": ["001"],
+    "ordered_targets": [
+        {"order": 1, "house_id": "001", "goal": "search_entry", "status": "pending"}
+    ],
+    "major_task": "Search the selected house entrance.",
+    "subtasks": [
+        {"order": 1, "facade": "west", "goal": "observe_analyze_scan_validate", "status": "pending"}
+    ],
+    "preferred_start_facade": "west",
+    "facade_priority": ["west", "south", "east", "north"],
+    "completion_criteria": "All reachable facades have RGB/VLM analysis, scan captures, and validation.",
+    "reason": "Short high-level task decomposition rationale.",
 }
 LLM_ROUTE_SCAN_POINTS_SCHEMA: Dict[str, Any] = {
     "scan_points": [

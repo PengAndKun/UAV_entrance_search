@@ -4508,6 +4508,7 @@ class RouteControlMixin:
         points: List[Dict[str, Any]],
         *,
         start_pose: Optional[Dict[str, Any]] = None,
+        next_observation_pose: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         remaining = [dict(point) for point in points if isinstance(point, dict)]
         if len(remaining) <= 1:
@@ -4515,7 +4516,66 @@ class RouteControlMixin:
                 item["continuous_order_index"] = idx
                 item["continuous_sort_source"] = "single_or_empty"
                 item["travel_delta_cm"] = 0.0
+                if isinstance(next_observation_pose, dict) and next_observation_pose:
+                    item["next_facade_hint"] = str(next_observation_pose.get("facade", "") or "")
+                    item["distance_to_next_observation_cm"] = round(
+                        math.hypot(
+                            float(item.get("x", 0.0)) - float(next_observation_pose.get("x", 0.0)),
+                            float(item.get("y", 0.0)) - float(next_observation_pose.get("y", 0.0)),
+                        ),
+                        2,
+                    )
             return remaining
+        if isinstance(next_observation_pose, dict) and next_observation_pose:
+            next_x = self._as_float_or_none(next_observation_pose.get("x"))
+            next_y = self._as_float_or_none(next_observation_pose.get("y"))
+            if next_x is not None and next_y is not None:
+                groups: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+                for item in remaining:
+                    key = (int(round(float(item.get("x", 0.0)) * 10.0)), int(round(float(item.get("y", 0.0)) * 10.0)))
+                    groups.setdefault(key, []).append(item)
+                ordered_groups = sorted(
+                    groups.values(),
+                    key=lambda group: (
+                        -math.hypot(
+                            float(group[0].get("x", 0.0)) - float(next_x),
+                            float(group[0].get("y", 0.0)) - float(next_y),
+                        ),
+                        min(int(item.get("local_scan_index", 0) or 0) for item in group),
+                    ),
+                )
+                ordered = []
+                for group in ordered_groups:
+                    ordered.extend(
+                        sorted(
+                            group,
+                            key=lambda item: (
+                                int(item.get("floor_index", 0) or 0),
+                                float(item.get("z", 0.0) or 0.0),
+                                int(item.get("local_scan_index", 0) or 0),
+                            ),
+                        )
+                    )
+                current = dict(start_pose or self.route2_scan_continuity_start_pose() or {})
+                if not current and ordered:
+                    current = dict(ordered[0])
+                previous_local_id = ""
+                next_facade = str(next_observation_pose.get("facade", "") or "")
+                for idx, item in enumerate(ordered):
+                    travel_delta = self.route2_scan_continuity_cost(current, item) if current else 0.0
+                    item["continuous_order_index"] = idx
+                    item["previous_local_scan_id"] = previous_local_id
+                    item["travel_delta_cm"] = round(float(travel_delta), 2)
+                    item["continuous_sort_source"] = "end_near_next_facade"
+                    item["sequence_goal"] = "end_near_next_facade"
+                    item["next_facade_hint"] = next_facade
+                    item["distance_to_next_observation_cm"] = round(
+                        math.hypot(float(item.get("x", 0.0)) - float(next_x), float(item.get("y", 0.0)) - float(next_y)),
+                        2,
+                    )
+                    previous_local_id = str(item.get("scan_id", "") or "")
+                    current = item
+                return ordered
         current = dict(start_pose or self.route2_scan_continuity_start_pose() or {})
         if not current:
             current = dict(remaining[0])
@@ -4999,6 +5059,334 @@ class RouteControlMixin:
         if output_dir is None:
             return
         self.write_json_artifact(output_dir / "autonomy_state.json", self.llm_route3_state)
+
+    def route3_default_facade_priority(self, task_text: str = "") -> List[str]:
+        text = str(task_text or "").lower()
+        aliases = {
+            "south": ("south", "\u5357"),
+            "east": ("east", "\u4e1c"),
+            "north": ("north", "\u5317"),
+            "west": ("west", "\u897f", "front", "\u6b63\u9762", "\u5165\u53e3\u9762"),
+        }
+        priority: List[str] = []
+        for facade, tokens in aliases.items():
+            if any(token in text for token in tokens) and facade not in priority:
+                priority.append(facade)
+        for facade in ("west", "south", "east", "north"):
+            if facade not in priority:
+                priority.append(facade)
+        return priority
+
+    def route3_house_registry_for_task_plan(self) -> Dict[str, Any]:
+        provider = getattr(self, "house_registry_for_llm_plan", None)
+        if callable(provider):
+            return provider()
+        records_provider = getattr(self, "house_records_for_route_planning", None)
+        records = records_provider() if callable(records_provider) else []
+        available: List[Dict[str, Any]] = []
+        for record in records if isinstance(records, list) else []:
+            if not isinstance(record, dict):
+                continue
+            house_id = str(record.get("id", record.get("house_id", "")) or "").strip()
+            if not house_id:
+                continue
+            numeric = str(int(house_id)) if house_id.isdigit() else house_id
+            name = str(record.get("name", f"House_{numeric}") or f"House_{numeric}")
+            available.append(
+                {
+                    "house_id": house_id,
+                    "house_name": name,
+                    "aliases": [house_id, numeric, name, name.lower(), f"house {numeric}", f"house_{numeric}", f"House_{numeric}"],
+                    "status": str(record.get("status", "") or ""),
+                    "center_x": record.get("x", record.get("center_x")),
+                    "center_y": record.get("y", record.get("center_y")),
+                    "radius_cm": record.get("radius_cm"),
+                }
+            )
+        selected = self.selected_route_target_house_id() if hasattr(self, "selected_route_target_house_id") else ""
+        return {"current_target_id": selected, "selected_target_id": selected, "available_houses": available}
+
+    def route3_explicit_house_sequence_from_text(self, task_text: str, registry: Dict[str, Any]) -> List[str]:
+        alias_map = self.build_task_alias_map(registry)
+        ordered: List[str] = []
+        text = str(task_text or "")
+        for match in re.finditer(r"(?:house|House|house_|\u623f\u5c4b|\u623f\u5b50)\s*0*(\d{1,3})", text):
+            house_id = self.resolve_plan_house_id(match.group(1), alias_map)
+            if house_id and house_id not in ordered:
+                ordered.append(house_id)
+        return ordered
+
+    def route3_task_target_entries_from_ids(self, house_ids: List[str], *, source: str = "route3_task") -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for house_id in house_ids:
+            raw_house_id = str(house_id or "").strip()
+            if not raw_house_id:
+                continue
+            hid = raw_house_id.zfill(3) if raw_house_id.isdigit() else raw_house_id
+            if any(str(item.get("house_id", "")) == hid for item in entries):
+                continue
+            entries.append(
+                {
+                    "order": len(entries) + 1,
+                    "house_id": hid,
+                    "house_alias": self.house_display_by_id.get(hid, hid) if hasattr(self, "house_display_by_id") else hid,
+                    "goal": "search_entry",
+                    "finish_condition": "target_entry_reached_or_no_entry_after_full_coverage",
+                    "status": "pending",
+                    "source": source,
+                }
+            )
+        return entries
+
+    def route3_task_plan_status_text(self, plan: Dict[str, Any]) -> str:
+        target_sequence = plan.get("target_sequence", []) if isinstance(plan.get("target_sequence"), list) else []
+        sequence_text = "->".join(str(item) for item in target_sequence[:6]) if target_sequence else str(plan.get("target_house_id", "-") or "-")
+        if len(target_sequence) > 6:
+            sequence_text += "..."
+        return (
+            f"Task Plan: targets={sequence_text} current={plan.get('target_house_id', '-')} "
+            f"start={plan.get('preferred_start_facade', '-')} order={','.join(plan.get('facade_priority', [])[:4])}"
+        )
+
+    def route3_target_sequence_status_text(self, plan: Dict[str, Any]) -> str:
+        targets = plan.get("ordered_targets", []) if isinstance(plan.get("ordered_targets"), list) else []
+        if not targets:
+            sequence = plan.get("target_sequence", []) if isinstance(plan.get("target_sequence"), list) else []
+            targets = self.route3_task_target_entries_from_ids([str(item) for item in sequence], source="target_sequence")
+        if not targets:
+            return "Targets: n/a"
+        chunks: List[str] = []
+        active = str(plan.get("target_house_id", "") or "")
+        for item in targets:
+            if not isinstance(item, dict):
+                continue
+            order = int(item.get("order", len(chunks) + 1) or (len(chunks) + 1))
+            house_id = str(item.get("house_id", "") or "").strip()
+            status = str(item.get("status", "pending") or "pending")
+            marker = "*" if house_id == active else ""
+            chunks.append(f"{order}.{house_id}{marker}:{status}")
+        return "Targets: " + "  ".join(chunks)
+
+    def route3_apply_task_plan_state(self, plan: Dict[str, Any]) -> None:
+        self.route3_update_state(
+            task_plan=plan,
+            target_house_id=str(plan.get("target_house_id", "") or ""),
+            task_subtasks=plan.get("subtasks", []),
+            preferred_start_facade=plan.get("preferred_start_facade", ""),
+            facade_priority=plan.get("facade_priority", []),
+            target_sequence=plan.get("target_sequence", []),
+            ordered_targets=plan.get("ordered_targets", []),
+            active_target_index=int(plan.get("active_target_index", 0) or 0),
+        )
+
+    def route3_sync_selected_target_from_plan(self, plan: Dict[str, Any]) -> str:
+        target_house_id = str(plan.get("target_house_id", "") or "").strip()
+        if not target_house_id:
+            return ""
+        try:
+            self.root.after(0, lambda hid=target_house_id: self.set_selected_route_target_house(hid))
+        except Exception:
+            try:
+                self.set_selected_route_target_house(target_house_id)
+            except Exception:
+                pass
+        return target_house_id
+
+    def route3_refresh_task_plan_labels(self, plan: Dict[str, Any]) -> None:
+        try:
+            self.llm_route3_task_status_var.set(self.route3_task_plan_status_text(plan))
+            self.llm_route3_target_sequence_var.set(self.route3_target_sequence_status_text(plan))
+        except Exception:
+            pass
+
+    def route3_normalize_task_plan(self, parsed: Dict[str, Any], target_house_id: str, task_text: str) -> Dict[str, Any]:
+        if not isinstance(parsed, dict):
+            parsed = {}
+        registry = self.route3_house_registry_for_task_plan()
+        alias_map = self.build_task_alias_map(registry)
+        explicit_sequence = self.route3_explicit_house_sequence_from_text(task_text, registry)
+        raw_selected_target = str(target_house_id or "").strip()
+        selected_target = self.resolve_plan_house_id(raw_selected_target, alias_map)
+        if not selected_target and raw_selected_target:
+            selected_target = raw_selected_target.zfill(3) if raw_selected_target.isdigit() else raw_selected_target
+        parsed_target = self.resolve_plan_house_id(parsed.get("target_house_id", ""), alias_map)
+        parsed_ordered_targets: List[Dict[str, Any]] = []
+        if isinstance(parsed.get("ordered_targets"), list):
+            parsed_multi = self.normalize_llm_task_plan(parsed, task_text, registry)
+            parsed_ordered_targets = [
+                dict(item)
+                for item in (parsed_multi.get("ordered_targets", []) if isinstance(parsed_multi.get("ordered_targets"), list) else [])
+                if isinstance(item, dict)
+            ]
+        if explicit_sequence:
+            ordered_targets = self.route3_task_target_entries_from_ids(explicit_sequence, source="explicit_task_text")
+            planner_target_source = "explicit_task_text"
+        elif parsed_ordered_targets:
+            ordered_targets = parsed_ordered_targets
+            planner_target_source = "llm_ordered_targets"
+        elif parsed_target:
+            ordered_targets = self.route3_task_target_entries_from_ids([parsed_target], source="llm_target_house_id")
+            planner_target_source = "llm_target_house_id"
+        elif selected_target:
+            ordered_targets = self.route3_task_target_entries_from_ids([selected_target], source="selected_target_house")
+            planner_target_source = "selected_target_house"
+        else:
+            local_plan = self.local_task_plan_from_text(task_text, registry)
+            ordered_targets = [
+                dict(item)
+                for item in (local_plan.get("ordered_targets", []) if isinstance(local_plan.get("ordered_targets"), list) else [])
+                if isinstance(item, dict)
+            ]
+            planner_target_source = "local_fallback"
+        target_sequence = [
+            str(item.get("house_id", "") or "").strip()
+            for item in ordered_targets
+            if isinstance(item, dict) and str(item.get("house_id", "") or "").strip()
+        ]
+        active_target_id = target_sequence[0] if target_sequence else (parsed_target or selected_target)
+        normalized_ordered_targets: List[Dict[str, Any]] = []
+        for index, item in enumerate(ordered_targets, start=1):
+            if not isinstance(item, dict):
+                continue
+            house_id = str(item.get("house_id", "") or "").strip()
+            if not house_id:
+                continue
+            normalized = dict(item)
+            normalized["order"] = index
+            if house_id == active_target_id and str(normalized.get("status", "pending") or "pending") == "pending":
+                normalized["status"] = "in_progress"
+            normalized_ordered_targets.append(normalized)
+        ordered_targets = normalized_ordered_targets
+        facade_priority: List[str] = []
+        raw_priority = parsed.get("facade_priority", parsed.get("preferred_facade_order", []))
+        if isinstance(raw_priority, list):
+            for item in raw_priority:
+                facade = str(item or "").strip().lower()
+                if facade in {"south", "east", "north", "west"} and facade not in facade_priority:
+                    facade_priority.append(facade)
+        preferred = str(parsed.get("preferred_start_facade", "") or "").strip().lower()
+        if preferred in {"south", "east", "north", "west"} and preferred not in facade_priority:
+            facade_priority.insert(0, preferred)
+        for facade in self.route3_default_facade_priority(task_text):
+            if facade not in facade_priority:
+                facade_priority.append(facade)
+        if preferred not in {"south", "east", "north", "west"}:
+            preferred = facade_priority[0] if facade_priority else "west"
+        raw_subtasks = parsed.get("subtasks", []) if isinstance(parsed.get("subtasks"), list) else []
+        subtasks: List[Dict[str, Any]] = []
+        for item in raw_subtasks:
+            if not isinstance(item, dict):
+                continue
+            facade = str(item.get("facade", "") or "").strip().lower()
+            if facade not in {"south", "east", "north", "west"}:
+                continue
+            subtasks.append(
+                {
+                    "order": len(subtasks) + 1,
+                    "facade": facade,
+                    "goal": str(item.get("goal", "observe_analyze_scan_validate") or "observe_analyze_scan_validate"),
+                    "status": str(item.get("status", "pending") or "pending"),
+                }
+            )
+        if not subtasks:
+            subtasks = [
+                {"order": index, "facade": facade, "goal": "observe_analyze_scan_validate", "status": "pending"}
+                for index, facade in enumerate(facade_priority, start=1)
+            ]
+        return {
+            "schema": "route3_task_plan_v1",
+            "target_house_id": str(active_target_id or ""),
+            "active_target_index": 0,
+            "target_sequence": target_sequence,
+            "ordered_targets": ordered_targets,
+            "target_source": planner_target_source,
+            "selected_target_house_id_before_analysis": str(target_house_id or ""),
+            "major_task": str(parsed.get("major_task", task_text) or task_text or "Search selected house entrance."),
+            "task_text": str(task_text or ""),
+            "subtasks": subtasks,
+            "preferred_start_facade": preferred,
+            "facade_priority": facade_priority,
+            "completion_criteria": str(
+                parsed.get("completion_criteria", "")
+                or "All reachable facades have RGB/VLM analysis, scan captures, and validation."
+            ),
+            "reason": str(parsed.get("reason", "") or "Normalized route3 task plan."),
+            "planner_source": str(parsed.get("planner_source", "llm_route3_task_analysis") or "llm_route3_task_analysis"),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def route3_analyze_task_plan(self, target_house_id: str, *, output_dir: Optional[Path] = None) -> Dict[str, Any]:
+        task_text = self.llm_task_text_var.get().strip()
+        registry = self.route3_house_registry_for_task_plan()
+        parsed: Dict[str, Any] = {}
+        response_payload: Dict[str, Any] = {}
+        if self.effective_llm_api_key() and self.effective_llm_model():
+            try:
+                context = {
+                    "selected_target_house_id": str(target_house_id or ""),
+                    "task_text": task_text,
+                    "available_facades": ["south", "east", "north", "west"],
+                    "house_registry": registry,
+                }
+                response_payload = self.call_configured_llm_text(
+                    system_prompt=(
+                        "You are the high-level task planner for an autonomous UAV house search. "
+                        "Split the user's task into ordered target houses, facade subtasks, a preferred start facade, "
+                        "and a facade priority order. The task text has priority when it explicitly names houses. "
+                        "Return strict compact JSON only."
+                    ),
+                    user_prompt=(
+                        "Plan the house search task. If the task text explicitly names one or more houses, use that "
+                        "as the target sequence and only use the selected target house when the text is ambiguous. "
+                        "Do not output low-level movement commands.\n"
+                        f"Context:\n{json.dumps(context, indent=2, ensure_ascii=False)}\n"
+                        f"Expected JSON:\n{json.dumps(LLM_ROUTE3_TASK_PLAN_SCHEMA, indent=2, ensure_ascii=False)}"
+                    ),
+                    max_output_tokens=700,
+                    json_schema=LLM_ROUTE3_TASK_PLAN_SCHEMA,
+                )
+                parsed = extract_json_object(str(response_payload.get("raw_text", "") or ""))
+            except Exception as exc:
+                LOGGER.warning("Route V3 task analysis fallback: %s", exc)
+                response_payload = {"error": str(exc), "fallback_used": True}
+        if not parsed:
+            explicit_targets = self.route3_explicit_house_sequence_from_text(task_text, registry)
+            fallback_target = explicit_targets[0] if explicit_targets else str(target_house_id or "")
+            local_targets = explicit_targets or ([fallback_target] if fallback_target else [])
+            local_ordered_targets = self.route3_task_target_entries_from_ids(local_targets, source="local_fallback_task_text" if explicit_targets else "selected_target_house")
+            parsed = {
+                "target_house_id": str(fallback_target or ""),
+                "ordered_targets": local_ordered_targets,
+                "major_task": task_text or "Search selected house entrance.",
+                "facade_priority": self.route3_default_facade_priority(task_text),
+                "preferred_start_facade": "",
+                "completion_criteria": "All reachable facades have RGB/VLM analysis, scan captures, and validation.",
+                "reason": "Local fallback task analysis.",
+                "planner_source": "local_fallback_no_or_failed_api",
+            }
+        plan = self.route3_normalize_task_plan(parsed, target_house_id, task_text)
+        self.route3_apply_task_plan_state(plan)
+        self.route3_sync_selected_target_from_plan(plan)
+        if output_dir is not None:
+            self.write_json_artifact(output_dir / "route3_task_plan.json", {"plan": plan, "llm_response": response_payload})
+            self.route3_log_event(output_dir, "task_plan_analysis", {"task_plan": plan, "llm_response": response_payload})
+            self.route3_write_state_artifact()
+        try:
+            self.root.after(0, lambda p=plan: self.route3_refresh_task_plan_labels(p))
+        except Exception:
+            pass
+        return plan
+
+    def route3_task_plan_valid(self, target_house_id: str) -> bool:
+        state = self.llm_route3_state if isinstance(getattr(self, "llm_route3_state", None), dict) else {}
+        plan = state.get("task_plan", {}) if isinstance(state.get("task_plan"), dict) else {}
+        return bool(plan and str(plan.get("target_house_id", "") or "") == str(target_house_id or ""))
+
+    def route3_ensure_task_plan(self, target_house_id: str, output_dir: Path) -> Dict[str, Any]:
+        if self.route3_task_plan_valid(target_house_id):
+            plan = self.llm_route3_state.get("task_plan", {})
+            return plan if isinstance(plan, dict) else {}
+        return self.route3_analyze_task_plan(target_house_id, output_dir=output_dir)
 
     def route3_log_event(self, output_dir: Optional[Path], event_type: str, payload: Dict[str, Any]) -> None:
         if output_dir is None:
@@ -5599,6 +5987,294 @@ class RouteControlMixin:
             "escape_waypoint": escape_waypoint,
             "obstacle_count": len(obstacles),
             "direct_blocker": direct_blocker,
+        }
+
+    def route3_navigation_plan_cost_cm(self, start_pose: Dict[str, float], plan: Dict[str, Any]) -> float:
+        if not isinstance(plan, dict) or plan.get("status") != "ok":
+            return float("inf")
+        waypoints = [item for item in plan.get("waypoints", []) if isinstance(item, dict)]
+        if not waypoints:
+            return 0.0
+        total = 0.0
+        previous = dict(start_pose)
+        for waypoint in waypoints:
+            total += math.hypot(float(waypoint.get("x", 0.0)) - float(previous.get("x", 0.0)), float(waypoint.get("y", 0.0)) - float(previous.get("y", 0.0)))
+            previous = waypoint
+        return float(total)
+
+    def route3_observation_attempts_for_facade(
+        self,
+        target_house_id: str,
+        facade: str,
+        base_candidate: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        hid = str(target_house_id or "").strip()
+        facade = str(facade or "").strip().lower()
+        bbox = self.house_world_bbox_for_id(hid)
+        if not hid or facade not in {"south", "east", "north", "west"} or not bbox:
+            return []
+        base = dict(base_candidate or {})
+        corridor_info = self.scan_corridor_standoff_by_facade(hid, bbox)
+        facade_info = corridor_info.get(facade, {}) if isinstance(corridor_info.get(facade), dict) else {}
+        axis_min, axis_max = self.route2_facade_axis_range(bbox, facade)
+        axis_center = self.route2_facade_center_axis(bbox, facade)
+        facade_length = abs(float(axis_max) - float(axis_min))
+        facade_depth = abs(float(bbox["max_y"]) - float(bbox["min_y"])) if facade in {"south", "north"} else abs(float(bbox["max_x"]) - float(bbox["min_x"]))
+        desired_standoff, observation_meta = self.route2_observation_standoff_cm(
+            facade_length_cm=facade_length,
+            facade_depth_cm=facade_depth,
+            facade_info=facade_info,
+        )
+        base_standoff = self._as_float_or_none(base.get("standoff_cm"))
+        base_standoff = float(base_standoff if base_standoff is not None else desired_standoff)
+        base_z = self._as_float_or_none(base.get("z"))
+        if base_z is None:
+            pose = self.current_route_pose()
+            pose_z = self._as_float_or_none(pose.get("z")) if pose else None
+            base_z = max(float(LLM_ROUTE2_OBSERVATION_Z_CM), float(pose_z if pose_z is not None else LLM_ROUTE2_OBSERVATION_Z_CM))
+        base_z = max(float(LLM_ROUTE2_OBSERVATION_Z_CM), min(float(LLM_ROUTE3_OBSTACLE_MAX_OBSERVATION_Z_CM), float(base_z)))
+        attempts: List[Dict[str, Any]] = []
+        seen: set[Tuple[int, int, int, int]] = set()
+
+        def add_attempt(axis_value: float, standoff: float, z_cm: float, source: str, *, seed: Optional[Dict[str, Any]] = None) -> None:
+            if len(attempts) >= int(LLM_ROUTE3_OBSERVATION_ATTEMPT_MAX):
+                return
+            seed = dict(seed or {})
+            if seed and self._as_float_or_none(seed.get("x")) is not None and self._as_float_or_none(seed.get("y")) is not None:
+                pose_payload = {
+                    "x": round(float(seed.get("x", 0.0)), 2),
+                    "y": round(float(seed.get("y", 0.0)), 2),
+                    "z": round(float(seed.get("z", z_cm) or z_cm), 2),
+                    "yaw_deg": round(float(seed.get("yaw_deg", seed.get("yaw", 0.0)) or 0.0), 2),
+                    "target_x": seed.get("target_x"),
+                    "target_y": seed.get("target_y"),
+                }
+                axis = self._as_float_or_none(seed.get("axis_value"))
+                if axis is None:
+                    axis = axis_value
+                selected_standoff = self._as_float_or_none(seed.get("standoff_cm"))
+                selected_standoff = float(selected_standoff if selected_standoff is not None else standoff)
+                meta = {key: value for key, value in seed.items() if str(key).startswith("observation_")}
+                boundary_adjustment = seed.get("observation_boundary_adjustment", {}) if isinstance(seed.get("observation_boundary_adjustment"), dict) else {}
+            else:
+                axis = float(axis_value)
+                selected_standoff = float(standoff)
+                meta = self.route2_observation_meta_for_standoff(observation_meta, facade_info, selected_standoff, source)
+                pose_payload = self.route2_facade_pose_from_axis(bbox, facade, axis, selected_standoff, z_cm)
+                boundary_adjustment = {}
+                blocking_obstacle = self.route2_observation_blocking_house(hid, float(pose_payload["x"]), float(pose_payload["y"]))
+                if blocking_obstacle:
+                    adjusted = self.route2_adjust_observation_to_blocking_boundary(
+                        bbox,
+                        facade,
+                        axis,
+                        z_cm,
+                        selected_standoff,
+                        blocking_obstacle,
+                    )
+                    if adjusted:
+                        pose_payload = adjusted.get("pose", pose_payload) if isinstance(adjusted.get("pose"), dict) else pose_payload
+                        selected_standoff = float(adjusted.get("standoff_cm", selected_standoff))
+                        meta = self.route2_observation_meta_for_standoff(
+                            observation_meta,
+                            facade_info,
+                            selected_standoff,
+                            f"{source}_boundary_adjusted",
+                        )
+                        boundary_adjustment = adjusted.get("adjustment", {}) if isinstance(adjusted.get("adjustment"), dict) else {}
+            key = (
+                int(round(float(pose_payload.get("x", 0.0)) * 10.0)),
+                int(round(float(pose_payload.get("y", 0.0)) * 10.0)),
+                int(round(float(pose_payload.get("z", z_cm)) * 10.0)),
+                int(round(float(pose_payload.get("yaw_deg", 0.0)) * 10.0)),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            bounds_report = self.route2_observation_map_bounds_report(float(pose_payload["x"]), float(pose_payload["y"]))
+            blocking = self.route2_observation_blocking_house(hid, float(pose_payload["x"]), float(pose_payload["y"]))
+            status = "planned" if not blocking and bool(bounds_report.get("in_bounds", True)) else "blocked"
+            attempt = {
+                **pose_payload,
+                "label": f"{hid}_{facade}_obs_{len(attempts) + 1}",
+                "route_point_type": "observation_point",
+                "house_id": hid,
+                "facade": facade,
+                "facade_id": self.route2_facade_id(hid, facade),
+                "axis_value": round(float(axis), 2),
+                "axis_center_cm": round(float(axis_center), 2),
+                "axis_center_error_cm": round(abs(float(axis) - float(axis_center)), 2),
+                "standoff_cm": round(float(selected_standoff), 2),
+                **meta,
+                "observation_attempt_index": len(attempts),
+                "observation_attempt_source": source,
+                "observation_map_bounds": bounds_report,
+                "observation_boundary_adjustment": boundary_adjustment,
+                "observation_blocking_house_id": str(blocking.get("house_id", "") or ""),
+                "observation_block_reason": "non_target_house" if blocking else ("" if bounds_report.get("in_bounds", True) else "map_boundary"),
+                "status": status,
+            }
+            attempts.append(attempt)
+
+        add_attempt(float(base.get("axis_value", axis_center) or axis_center), base_standoff, base_z, "base_candidate", seed=base if base else None)
+        add_attempt(axis_center, base_standoff, base_z, "center_projection")
+        add_attempt(float(axis_min) + (float(axis_max) - float(axis_min)) / 3.0, base_standoff, base_z, "left_third_projection")
+        add_attempt(float(axis_min) + 2.0 * (float(axis_max) - float(axis_min)) / 3.0, base_standoff, base_z, "right_third_projection")
+        far_standoff = min(float(LLM_ROUTE2_OBSERVATION_MAX_STANDOFF_CM), max(base_standoff + 350.0, base_standoff * 1.25))
+        add_attempt(axis_center, far_standoff, base_z, "far_center_projection")
+        elevated_z = min(float(LLM_ROUTE3_OBSTACLE_MAX_OBSERVATION_Z_CM), base_z + float(LLM_ROUTE3_OBSTACLE_RAISE_STEP_CM))
+        add_attempt(axis_center, base_standoff, elevated_z, "elevated_center_projection")
+        return attempts
+
+    def route3_task_facade_priority(self) -> List[str]:
+        state = self.llm_route3_state if isinstance(getattr(self, "llm_route3_state", None), dict) else {}
+        plan = state.get("task_plan", {}) if isinstance(state.get("task_plan"), dict) else {}
+        raw = plan.get("facade_priority", state.get("facade_priority", [])) if isinstance(plan, dict) else []
+        priority: List[str] = []
+        if isinstance(raw, list):
+            for item in raw:
+                facade = str(item or "").strip().lower()
+                if facade in {"south", "east", "north", "west"} and facade not in priority:
+                    priority.append(facade)
+        for facade in ("west", "south", "east", "north"):
+            if facade not in priority:
+                priority.append(facade)
+        return priority
+
+    def route3_rank_observation_candidates(
+        self,
+        target_house_id: str,
+        candidates: List[Dict[str, Any]],
+        completed: set[str],
+        blocked: set[str],
+        *,
+        start_pose: Optional[Dict[str, float]] = None,
+    ) -> List[Dict[str, Any]]:
+        current = dict(start_pose or self.route3_current_pose() or self.current_route_pose() or {})
+        priority = self.route3_task_facade_priority()
+        priority_index = {facade: idx for idx, facade in enumerate(priority)}
+        base_by_facade: Dict[str, Dict[str, Any]] = {}
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            facade = str(candidate.get("facade", "") or "").strip().lower()
+            if facade in {"south", "east", "north", "west"} and facade not in base_by_facade:
+                base_by_facade[facade] = candidate
+        ranked: List[Dict[str, Any]] = []
+        for facade in ("south", "east", "north", "west"):
+            if facade in completed or facade in blocked:
+                continue
+            base = base_by_facade.get(facade, {})
+            attempts = self.route3_observation_attempts_for_facade(target_house_id, facade, base)
+            ranked_attempts: List[Dict[str, Any]] = []
+            for attempt in attempts:
+                item = dict(attempt)
+                pose = self.route3_target_pose_from_point(item)
+                if not current:
+                    item["route3_navigation_status"] = "unknown_no_current_pose"
+                    item["route3_navigation_cost_cm"] = float(item.get("observation_selection_score", item.get("distance_to_uav_cm", 0.0)) or 0.0)
+                    ranked_attempts.append(item)
+                    continue
+                plan = self.route3_plan_navigation_waypoints(current, pose, target_house_id, grid_cm=float(LLM_ROUTE3_ASTAR_GRID_CM))
+                item["route3_navigation_plan"] = plan
+                item["route3_navigation_status"] = str(plan.get("status", "blocked") or "blocked")
+                item["route3_navigation_reason"] = str(plan.get("reason", "") or "")
+                if plan.get("status") == "ok":
+                    item["route3_navigation_cost_cm"] = round(self.route3_navigation_plan_cost_cm(current, plan), 2)
+                    item["status"] = "planned"
+                else:
+                    item["route3_navigation_cost_cm"] = float("inf")
+                    item["status"] = "blocked"
+                    item["observation_block_reason"] = str(plan.get("reason", item.get("observation_block_reason", "navigation_blocked")) or "navigation_blocked")
+                ranked_attempts.append(item)
+            ranked_attempts.sort(
+                key=lambda item: (
+                    0 if item.get("route3_navigation_status") == "ok" else 1,
+                    float(item.get("route3_navigation_cost_cm", float("inf"))),
+                    int(item.get("observation_attempt_index", 999) or 999),
+                )
+            )
+            feasible = next((item for item in ranked_attempts if item.get("route3_navigation_status") == "ok"), None)
+            selected = dict(feasible or (ranked_attempts[0] if ranked_attempts else base))
+            rank_penalty = 25.0 * float(priority_index.get(facade, len(priority)))
+            nav_cost = float(selected.get("route3_navigation_cost_cm", selected.get("distance_to_uav_cm", 0.0)) or 0.0)
+            if not math.isfinite(nav_cost):
+                nav_cost = 1_000_000.0
+            selected["route3_observation_rank_score"] = round(float(nav_cost + rank_penalty), 2)
+            selected["route3_facade_priority_index"] = priority_index.get(facade, len(priority))
+            selected["selected_observation_attempt"] = dict(feasible or selected)
+            selected["observation_attempts"] = ranked_attempts
+            selected["observation_attempt_count"] = len(ranked_attempts)
+            if feasible is None:
+                selected["status"] = "blocked"
+                selected["route3_navigation_status"] = str(selected.get("route3_navigation_status", "blocked") or "blocked")
+            ranked.append(selected)
+        ranked.sort(
+            key=lambda item: (
+                0 if item.get("route3_navigation_status") == "ok" and item.get("status") != "blocked" else 1,
+                float(item.get("route3_observation_rank_score", 1_000_000.0)),
+                int(item.get("route3_facade_priority_index", 99) or 99),
+            )
+        )
+        return ranked
+
+    def route3_ordered_observation_attempts(self, selected: Dict[str, Any]) -> List[Dict[str, Any]]:
+        attempts = [dict(item) for item in selected.get("observation_attempts", []) if isinstance(item, dict)]
+        primary = selected.get("selected_observation_attempt", {}) if isinstance(selected.get("selected_observation_attempt"), dict) else {}
+        ordered: List[Dict[str, Any]] = []
+        seen: set[Tuple[int, int, int]] = set()
+
+        def add(item: Dict[str, Any]) -> None:
+            if not item:
+                return
+            key = (
+                int(round(float(item.get("x", 0.0)) * 10.0)),
+                int(round(float(item.get("y", 0.0)) * 10.0)),
+                int(round(float(item.get("z", 0.0)) * 10.0)),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            ordered.append(dict(item))
+
+        add(primary)
+        for item in attempts:
+            if item.get("route3_navigation_status") == "ok" or item.get("status") != "blocked":
+                add(item)
+        for item in attempts:
+            add(item)
+        return ordered
+
+    def route3_prepare_next_facade_hint(
+        self,
+        target_house_id: str,
+        completed: set[str],
+        blocked: set[str],
+        *,
+        exclude_facade: str = "",
+        start_pose: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        completed_for_hint = set(completed)
+        if exclude_facade:
+            completed_for_hint.add(str(exclude_facade).strip().lower())
+        raw_candidates = self.route2_all_facade_observation_candidates(target_house_id, skip_completed=False)
+        ranked = self.route3_rank_observation_candidates(
+            target_house_id,
+            raw_candidates,
+            completed_for_hint,
+            blocked,
+            start_pose=start_pose,
+        )
+        feasible = next((item for item in ranked if item.get("route3_navigation_status") == "ok" and item.get("status") != "blocked"), None)
+        if not feasible:
+            return {"target_facade": "", "reason": "no_feasible_next_facade", "ranked_facade_candidates": ranked}
+        observation = feasible.get("selected_observation_attempt", feasible)
+        return {
+            "target_facade": str(feasible.get("facade", "") or ""),
+            "observation_point": observation,
+            "navigation_cost_cm": feasible.get("route3_navigation_cost_cm", feasible.get("route3_observation_rank_score")),
+            "reason": "nearest feasible next facade hint",
+            "ranked_facade_candidates": ranked,
         }
 
     def route3_hold(self, session: flight.DroneFlightSession, *, output_dir: Optional[Path] = None, reason: str = "hold") -> Dict[str, Any]:
@@ -6455,7 +7131,9 @@ class RouteControlMixin:
         output_dir, facade_dir, house_id, facade = self.route2_facade_paths()
         if output_dir is None or facade_dir is None:
             raise RuntimeError("missing facade output directory")
-        points = self.route2_order_scan_points_continuously(points)
+        next_hint = state.get("next_facade_hint", {}) if isinstance(state.get("next_facade_hint"), dict) else {}
+        next_observation = next_hint.get("observation_point", {}) if isinstance(next_hint.get("observation_point"), dict) else {}
+        points = self.route2_order_scan_points_continuously(points, next_observation_pose=next_observation)
         points = self.route2_assign_global_scan_ids(output_dir, house_id, facade, points)
         validation = self.scan_point_validation_report(house_id, points)
         search_plan = {
@@ -6464,6 +7142,7 @@ class RouteControlMixin:
             "facade": facade,
             "facade_id": self.route2_facade_id(house_id, facade),
             "observation_point": state.get("observation_point", {}),
+            "next_facade_hint": next_hint,
             "facade_analysis": analysis,
             "scan_points": points,
             "scan_point_validation_report": validation,
@@ -6586,14 +7265,16 @@ class RouteControlMixin:
             and str(candidate.get("facade", "") or "") not in blocked
             and str(candidate.get("status", "") or "") != "blocked"
             and not str(candidate.get("observation_blocking_house_id", "") or "")
+            and str(candidate.get("route3_navigation_status", "ok") or "ok") == "ok"
         ]
         fallback = {
             "next_action": "select_facade" if available else "done",
             "target_facade": str(available[0].get("facade", "") or "") if available else "",
-            "reason": "fallback nearest safe uncompleted facade",
+            "reason": "fallback nearest feasible uncompleted facade",
             "rescan_required": False,
             "stop_condition_met": not bool(available),
             "planner_source": "rule_fallback",
+            "ranked_candidates_considered": len(candidates),
         }
         if not available or not self.effective_llm_api_key():
             return fallback
@@ -6630,6 +7311,13 @@ class RouteControlMixin:
             chosen = str(parsed.get("target_facade", "") or "").strip().lower()
             valid_facades = {str(item.get("facade", "") or "") for item in available}
             if chosen in valid_facades:
+                nearest = str(available[0].get("facade", "") or "") if available else chosen
+                if chosen != nearest:
+                    parsed["llm_requested_facade"] = chosen
+                    parsed["target_facade"] = nearest
+                    parsed["rank_correction_reason"] = "nearest feasible observation point has priority over LLM facade preference"
+                    parsed["planner_source"] = "llm_high_level_rank_corrected"
+                    return parsed
                 parsed["planner_source"] = "llm_high_level"
                 return parsed
         except Exception as exc:
@@ -6669,12 +7357,22 @@ class RouteControlMixin:
     def route3_run_summary(self, output_dir: Path, *, status: str) -> Dict[str, Any]:
         capture_rows = self.read_jsonl_artifact(output_dir / "lidar_capture_log.jsonl")
         execution_rows = self.read_jsonl_artifact(output_dir / "scan_execution_log.jsonl")
+        attempted_facades = set(self.llm_route3_completed_facades) | set(self.llm_route3_blocked_facades)
+        blocked_reasons = self.llm_route3_state.get("blocked_facade_reasons", {}) if isinstance(self.llm_route3_state.get("blocked_facade_reasons"), dict) else {}
+        missing_facade_rgb: List[str] = []
+        for facade in ("south", "east", "north", "west"):
+            facade_dir = output_dir / "facade_observations" / self.route2_facade_id(str(self.llm_route3_state.get("target_house_id", "") or ""), facade)
+            if facade in attempted_facades and not ((facade_dir / "coarse_rgb.png").exists() or (facade_dir / "coarse_rgb_panorama.png").exists()):
+                missing_facade_rgb.append(facade)
         summary = {
             "schema": "facade_autosearch_v3_summary",
             "status": status,
             "target_house_id": str(self.llm_route3_state.get("target_house_id", "") or ""),
             "completed_facades": sorted(self.llm_route3_completed_facades),
             "blocked_facades": sorted(self.llm_route3_blocked_facades),
+            "attempted_facades": sorted(attempted_facades),
+            "blocked_facade_reasons": blocked_reasons,
+            "missing_facade_rgb": missing_facade_rgb,
             "capture_count": len(capture_rows),
             "scan_execution_count": len(execution_rows),
             "output_dir": str(output_dir),
@@ -6684,12 +7382,30 @@ class RouteControlMixin:
         return summary
 
     def route3_full_search_worker(self, session: flight.DroneFlightSession, *, single_facade: bool = False, force_new: bool = False) -> None:
-        target_house_id = self.selected_route_target_house_id()
-        if not target_house_id:
+        selected_target_house_id = self.selected_route_target_house_id()
+        if not selected_target_house_id:
             self.root.after(0, lambda: self.llm_route3_status_var.set("LLM Route V3: select a target house first."))
             return
         self.route3_set_control_lock(True)
-        output_dir = self.route3_initialize_run(target_house_id, force_new=force_new)
+        target_house_id = selected_target_house_id
+        output_dir: Path
+        try:
+            self.route3_set_stage("TASK_ANALYSIS", output_dir=None, message=f"analyzing task for selected house={selected_target_house_id}")
+            task_plan = self.route3_analyze_task_plan(selected_target_house_id, output_dir=None)
+            resolved_target = str(task_plan.get("target_house_id", "") or selected_target_house_id).strip()
+            if resolved_target and resolved_target != target_house_id:
+                target_house_id = resolved_target
+            output_dir = self.route3_initialize_run(target_house_id, force_new=force_new)
+            self.route3_apply_task_plan_state(task_plan)
+            self.route3_update_state(output_dir=str(output_dir), target_house_id=target_house_id)
+            self.write_json_artifact(output_dir / "route3_task_plan.json", {"plan": task_plan, "llm_response": {}})
+            self.route3_log_event(output_dir, "task_plan_analysis", {"task_plan": task_plan, "selected_target_house_id": selected_target_house_id})
+            self.route3_write_state_artifact()
+        except Exception as exc:
+            LOGGER.warning("Route V3 task analysis failed during start: %s", exc)
+            output_dir = self.route3_initialize_run(target_house_id, force_new=force_new)
+            self.route3_set_stage("TASK_ANALYSIS", output_dir=output_dir, message=f"task analysis fallback for house={target_house_id}")
+            self.route3_ensure_task_plan(target_house_id, output_dir)
         self.route3_set_stage("PLAN_4_FACADES", output_dir=output_dir, message=f"planning facade candidates for house={target_house_id}")
         self.sync_capture_options_to_session(session)
         self.route3_enable_physics_movement(session)
@@ -6701,44 +7417,144 @@ class RouteControlMixin:
                 if len(completed | blocked) >= 4:
                     status = "done"
                     break
-                candidates = self.route2_all_facade_observation_candidates(target_house_id, skip_completed=False)
-                self.route3_update_state(candidate_observation_points=candidates, completed_facades=sorted(completed), blocked_facades=sorted(blocked))
+                raw_candidates = self.route2_all_facade_observation_candidates(target_house_id, skip_completed=False)
+                ranked_candidates = self.route3_rank_observation_candidates(
+                    target_house_id,
+                    raw_candidates,
+                    completed,
+                    blocked,
+                    start_pose=self.route3_current_pose(session),
+                )
+                feasible_candidates = [
+                    item for item in ranked_candidates
+                    if isinstance(item, dict)
+                    and str(item.get("route3_navigation_status", "") or "") == "ok"
+                    and str(item.get("status", "") or "") != "blocked"
+                ]
+                current_status = {
+                    "stage": str(self.llm_route3_state.get("stage", "") or ""),
+                    "completed_facades": sorted(completed),
+                    "blocked_facades": sorted(blocked),
+                    "feasible_facades": [str(item.get("facade", "") or "") for item in feasible_candidates],
+                }
+                next_status = {
+                    "facade": str(feasible_candidates[0].get("facade", "") or "") if feasible_candidates else "",
+                    "observation": feasible_candidates[0].get("selected_observation_attempt", {}) if feasible_candidates else {},
+                    "navigation_cost_cm": feasible_candidates[0].get("route3_navigation_cost_cm") if feasible_candidates else None,
+                }
+                self.route3_update_state(
+                    candidate_observation_points=raw_candidates,
+                    ranked_facade_candidates=ranked_candidates,
+                    current_exploration_status=current_status,
+                    next_exploration_status=next_status,
+                    completed_facades=sorted(completed),
+                    blocked_facades=sorted(blocked),
+                )
                 self.route3_write_state_artifact()
-                decision = self.route3_decide_next_facade(target_house_id, candidates, completed, blocked)
+                if not feasible_candidates:
+                    newly_blocked = [
+                        str(item.get("facade", "") or "")
+                        for item in ranked_candidates
+                        if str(item.get("facade", "") or "") not in completed and str(item.get("facade", "") or "") not in blocked
+                    ]
+                    blocked_reasons = dict(self.llm_route3_state.get("blocked_facade_reasons", {}) if isinstance(self.llm_route3_state.get("blocked_facade_reasons"), dict) else {})
+                    for item in ranked_candidates:
+                        facade_name = str(item.get("facade", "") or "")
+                        if facade_name in newly_blocked:
+                            self.llm_route3_blocked_facades.add(facade_name)
+                            blocked_reasons[facade_name] = {
+                                "reason": str(item.get("observation_block_reason", item.get("route3_navigation_reason", "no_feasible_observation")) or "no_feasible_observation"),
+                                "observation_attempt_count": int(item.get("observation_attempt_count", 0) or 0),
+                                "observation_attempts": item.get("observation_attempts", []),
+                            }
+                    self.route3_update_state(blocked_facades=sorted(self.llm_route3_blocked_facades), blocked_facade_reasons=blocked_reasons)
+                    self.route3_write_state_artifact()
+                    status = "done"
+                    break
+                decision = self.route3_decide_next_facade(target_house_id, ranked_candidates, completed, blocked)
                 self.route3_log_event(output_dir, "high_level_decision", decision)
                 facade = str(decision.get("target_facade", "") or "").strip().lower()
                 if not facade or bool(decision.get("stop_condition_met", False)):
                     status = "done"
                     break
-                selected = next((dict(item) for item in candidates if str(item.get("facade", "") or "") == facade), {})
+                selected = next((dict(item) for item in ranked_candidates if str(item.get("facade", "") or "") == facade), {})
                 if not selected:
                     self.llm_route3_blocked_facades.add(facade)
                     continue
                 self.route3_set_stage("SELECT_NEXT_FACADE", output_dir=output_dir, facade=facade, message=f"selected facade={facade}")
                 self.llm_route2_state = {"target_house_id": target_house_id, "output_dir": str(output_dir)}
-                self.apply_route2_observation_plan(target_house_id, selected, candidates, status_label="v3 selected")
                 facade_dir = self.route2_facade_dir(output_dir, target_house_id, facade)
-                observation = self.route2_selected_state().get("observation_point", selected)
-                obs_pose = self.route3_target_pose_from_point(observation)
-                self.route3_set_stage("NAV_TO_OBS", output_dir=output_dir, facade=facade, target=obs_pose, message=f"navigating to {facade} observation")
-                nav_result = self.route3_navigate_to_pose_with_movement(
-                    session,
-                    obs_pose,
-                    output_dir=output_dir,
-                    stage="NAV_TO_OBS",
-                    facade=facade,
-                    target_id=f"{target_house_id}_{facade}_obs",
-                    target_house_id=target_house_id,
+                observation_attempts = self.route3_ordered_observation_attempts(selected)
+                self.route3_update_state(
+                    observation_attempts={**(self.llm_route3_state.get("observation_attempts", {}) if isinstance(self.llm_route3_state.get("observation_attempts"), dict) else {}), facade: observation_attempts},
+                    selected_observation_attempt={},
                 )
-                self.route3_log_event(output_dir, "navigation_result", nav_result)
+                observation: Dict[str, Any] = {}
+                obs_pose: Dict[str, float] = {}
+                nav_result: Dict[str, Any] = {}
+                for attempt_index, attempt in enumerate(observation_attempts, start=1):
+                    if self.llm_route3_stop_event.is_set():
+                        break
+                    attempt_status = str(attempt.get("status", "") or "")
+                    if attempt_status == "blocked" and str(attempt.get("route3_navigation_status", "") or "") != "ok":
+                        self.route3_log_event(
+                            output_dir,
+                            "observation_attempt_skipped",
+                            {"facade": facade, "attempt_index": attempt_index, "attempt": attempt, "reason": attempt.get("observation_block_reason", "blocked_attempt")},
+                        )
+                        continue
+                    self.apply_route2_observation_plan(target_house_id, attempt, ranked_candidates, status_label=f"v3 selected attempt {attempt_index}/{len(observation_attempts)}")
+                    observation = self.route2_selected_state().get("observation_point", attempt)
+                    obs_pose = self.route3_target_pose_from_point(observation)
+                    self.route3_update_state(
+                        selected_observation_attempt=observation,
+                        current_exploration_status={
+                            "stage": "NAV_TO_OBS",
+                            "facade": facade,
+                            "observation_attempt_index": attempt_index,
+                            "observation_attempt_count": len(observation_attempts),
+                            "target_pose": obs_pose,
+                        },
+                    )
+                    self.route3_set_stage(
+                        "NAV_TO_OBS",
+                        output_dir=output_dir,
+                        facade=facade,
+                        target=obs_pose,
+                        message=f"navigating to {facade} observation attempt {attempt_index}/{len(observation_attempts)}",
+                    )
+                    nav_result = self.route3_navigate_to_pose_with_movement(
+                        session,
+                        obs_pose,
+                        output_dir=output_dir,
+                        stage="NAV_TO_OBS",
+                        facade=facade,
+                        target_id=f"{target_house_id}_{facade}_obs_attempt_{attempt_index}",
+                        target_house_id=target_house_id,
+                    )
+                    self.route3_log_event(
+                        output_dir,
+                        "observation_attempt_navigation_result",
+                        {"facade": facade, "attempt_index": attempt_index, "attempt": attempt, "navigation": nav_result},
+                    )
+                    if nav_result.get("status") == "ok":
+                        break
                 if nav_result.get("status") != "ok":
                     self.llm_route3_blocked_facades.add(facade)
-                    self.route3_update_state(blocked_facades=sorted(self.llm_route3_blocked_facades))
+                    blocked_reasons = dict(self.llm_route3_state.get("blocked_facade_reasons", {}) if isinstance(self.llm_route3_state.get("blocked_facade_reasons"), dict) else {})
+                    blocked_reasons[facade] = {
+                        "reason": str(nav_result.get("reason", "observation_navigation_failed") or "observation_navigation_failed"),
+                        "observation_attempt_count": len(observation_attempts),
+                        "observation_attempts": observation_attempts,
+                        "last_navigation_result": nav_result,
+                    }
+                    self.route3_update_state(blocked_facades=sorted(self.llm_route3_blocked_facades), blocked_facade_reasons=blocked_reasons)
                     self.route3_write_state_artifact()
                     self.route3_set_stage("DECIDE_NEXT", output_dir=output_dir, facade=facade, error=nav_result, message=f"{facade} observation navigation blocked")
                     if single_facade:
                         break
                     continue
+                self.route3_log_event(output_dir, "navigation_result", nav_result)
                 if self.llm_route3_stop_event.is_set():
                     break
                 self.route3_set_stage("CAPTURE_RGB", output_dir=output_dir, facade=facade, target=obs_pose, message=f"capturing {facade} RGB")
@@ -6797,6 +7613,26 @@ class RouteControlMixin:
                 self.route2_analyze_facade_vlm_worker()
                 self.root.after(0, self.refresh_route3_support_views)
 
+                next_hint = self.route3_prepare_next_facade_hint(
+                    target_house_id,
+                    completed,
+                    blocked,
+                    exclude_facade=facade,
+                    start_pose=self.route3_current_pose(session) or obs_pose,
+                )
+                self.route2_update_state(next_facade_hint=next_hint)
+                self.route3_update_state(
+                    next_facade_hint=next_hint,
+                    next_exploration_status={
+                        "facade": str(next_hint.get("target_facade", "") or ""),
+                        "observation": next_hint.get("observation_point", {}),
+                        "navigation_cost_cm": next_hint.get("navigation_cost_cm"),
+                        "reason": next_hint.get("reason", ""),
+                    },
+                )
+                self.route3_write_state_artifact()
+                self.route3_log_event(output_dir, "next_facade_hint", next_hint)
+
                 self.route3_set_stage("PLAN_SCAN", output_dir=output_dir, facade=facade, message=f"planning {facade} scan")
                 plan_result = self.route3_plan_facade_scan_current()
                 points = [point for point in plan_result.get("points", []) if isinstance(point, dict)]
@@ -6817,6 +7653,16 @@ class RouteControlMixin:
                         break
                     scan_id = str(point.get("scan_id", "") or f"{facade}_{idx}")
                     target_pose = self.route3_target_pose_from_point(point)
+                    self.route3_update_state(
+                        current_exploration_status={
+                            "stage": "NAV_TO_SCAN_POINT",
+                            "facade": facade,
+                            "point_index": idx,
+                            "point_total": total,
+                            "scan_id": scan_id,
+                            "target_pose": target_pose,
+                        }
+                    )
                     self.route3_set_stage(
                         "NAV_TO_SCAN_POINT",
                         output_dir=output_dir,
@@ -6974,9 +7820,14 @@ class RouteControlMixin:
             widget.update_uav(pose_x, pose_y, pose_yaw)
             route_points: List[Dict[str, Any]] = []
             state = self.llm_route2_state if isinstance(getattr(self, "llm_route2_state", None), dict) else {}
-            for candidate in state.get("candidate_observation_points", []) if isinstance(state.get("candidate_observation_points"), list) else []:
+            route3_state = self.llm_route3_state if isinstance(getattr(self, "llm_route3_state", None), dict) else {}
+            candidates_for_map = route3_state.get("ranked_facade_candidates", [])
+            if not isinstance(candidates_for_map, list) or not candidates_for_map:
+                candidates_for_map = state.get("candidate_observation_points", []) if isinstance(state.get("candidate_observation_points"), list) else []
+            for candidate in candidates_for_map:
                 if isinstance(candidate, dict):
-                    item = dict(candidate)
+                    selected_attempt = candidate.get("selected_observation_attempt", {}) if isinstance(candidate.get("selected_observation_attempt"), dict) else {}
+                    item = dict(selected_attempt or candidate)
                     item["label"] = str(item.get("label", "") or f"{item.get('facade', '')}_obs")
                     item["route_point_type"] = "observation_point"
                     route_points.append(item)
@@ -7005,15 +7856,101 @@ class RouteControlMixin:
         completed = len(getattr(self, "llm_route3_completed_facades", set()) or set())
         blocked = len(getattr(self, "llm_route3_blocked_facades", set()) or set())
         progress = 100.0 * float(min(4, completed + blocked)) / 4.0
+        state = self.llm_route3_state if isinstance(getattr(self, "llm_route3_state", None), dict) else {}
+        current_status = state.get("current_exploration_status", {}) if isinstance(state.get("current_exploration_status"), dict) else {}
+        next_status = state.get("next_exploration_status", {}) if isinstance(state.get("next_exploration_status"), dict) else {}
         try:
             self.llm_route3_progress_var.set(max(0.0, min(100.0, progress)))
             self.llm_route3_progress_text_var.set(f"Autonomy: completed={completed} blocked={blocked}")
+            if current_status:
+                facade = str(current_status.get("facade", state.get("current_facade", "")) or state.get("current_facade", "") or "-")
+                stage = str(current_status.get("stage", state.get("stage", "")) or state.get("stage", "") or "-")
+                point_index = current_status.get("point_index")
+                point_total = current_status.get("point_total")
+                suffix = f" {point_index}/{point_total}" if point_index is not None and point_total is not None else ""
+                self.llm_route3_current_status_var.set(f"Current: {stage} {facade}{suffix}")
+            else:
+                self.llm_route3_current_status_var.set(f"Current: {state.get('stage', 'idle')} {state.get('current_facade', '')}")
+            next_facade = str(next_status.get("facade", next_status.get("target_facade", "")) or "")
+            obs = next_status.get("observation", next_status.get("observation_point", {})) if isinstance(next_status, dict) else {}
+            if next_facade and isinstance(obs, dict):
+                self.llm_route3_next_status_var.set(
+                    f"Next: {next_facade} obs=({float(obs.get('x', 0.0)):.0f},{float(obs.get('y', 0.0)):.0f})"
+                )
+            else:
+                self.llm_route3_next_status_var.set("Next: n/a")
+            plan = state.get("task_plan", {}) if isinstance(state.get("task_plan"), dict) else {}
+            if plan:
+                self.route3_refresh_task_plan_labels(plan)
         except tk.TclError:
             pass
         self.refresh_route3_preview()
         self.refresh_route3_analysis_view()
         self.refresh_route3_rgb_display()
         self.refresh_llm_route3_map()
+
+    def schedule_route3_auto_refresh(self) -> None:
+        if not bool(self.llm_route3_auto_refresh_var.get()):
+            self.cancel_route3_auto_refresh()
+            return
+        self.cancel_route3_auto_refresh()
+
+        def tick() -> None:
+            self.llm_route3_auto_refresh_job = None
+            if not bool(self.llm_route3_auto_refresh_var.get()):
+                return
+            self.refresh_route3_support_views()
+            try:
+                self.llm_route3_auto_refresh_job = self.root.after(int(LLM_ROUTE3_AUTO_REFRESH_MS), tick)
+            except tk.TclError:
+                self.llm_route3_auto_refresh_job = None
+
+        try:
+            self.llm_route3_auto_refresh_job = self.root.after(int(LLM_ROUTE3_AUTO_REFRESH_MS), tick)
+        except tk.TclError:
+            self.llm_route3_auto_refresh_job = None
+
+    def cancel_route3_auto_refresh(self) -> None:
+        job = getattr(self, "llm_route3_auto_refresh_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+        self.llm_route3_auto_refresh_job = None
+
+    def on_route3_auto_refresh_toggle(self) -> None:
+        if bool(self.llm_route3_auto_refresh_var.get()):
+            self.refresh_route3_support_views()
+            self.schedule_route3_auto_refresh()
+        else:
+            self.cancel_route3_auto_refresh()
+
+    def on_route3_analyze_task_plan(self) -> None:
+        target_house_id = self.selected_route_target_house_id()
+        if not target_house_id:
+            self.llm_route3_status_var.set("LLM Route V3: select a target house first.")
+            return
+        self.llm_route3_status_var.set("LLM Route V3: analyzing task plan.")
+        try:
+            plan = self.route3_analyze_task_plan(target_house_id, output_dir=None)
+            resolved_target = str(plan.get("target_house_id", "") or target_house_id).strip()
+            output_dir = self.route3_state_output_dir()
+            expected_prefix = f"house_{resolved_target or target_house_id}_"
+            if output_dir is None or not output_dir.name.startswith(expected_prefix):
+                output_dir = self.route3_initialize_run(resolved_target or target_house_id, force_new=False)
+            self.route3_apply_task_plan_state(plan)
+            self.route3_update_state(output_dir=str(output_dir), target_house_id=resolved_target or target_house_id)
+            self.write_json_artifact(output_dir / "route3_task_plan.json", {"plan": plan, "llm_response": {}})
+            self.route3_log_event(output_dir, "task_plan_analysis", {"task_plan": plan, "selected_target_house_id": target_house_id})
+            self.route3_write_state_artifact()
+            self.llm_route3_status_var.set(
+                f"LLM Route V3: task plan targets={'->'.join(plan.get('target_sequence', []) or [plan.get('target_house_id', target_house_id)])}"
+            )
+            self.refresh_route3_support_views()
+        except Exception as exc:
+            LOGGER.warning("Route V3 task plan analyze failed: %s", exc)
+            self.llm_route3_status_var.set(f"LLM Route V3: task plan failed: {exc}")
 
     def on_route3_start_full_search(self) -> None:
         session = self.active_session()
@@ -7080,6 +8017,10 @@ class RouteControlMixin:
         self.llm_route3_target_var.set("Target: n/a")
         self.llm_route3_error_var.set("Error: n/a")
         self.llm_route3_payload_var.set("Payload: hold")
+        self.llm_route3_task_status_var.set("Task Plan: n/a")
+        self.llm_route3_target_sequence_var.set("Targets: n/a")
+        self.llm_route3_current_status_var.set("Current: idle")
+        self.llm_route3_next_status_var.set("Next: n/a")
         self.llm_route3_status_var.set("LLM Route V3: cleared.")
         self.refresh_route3_support_views()
 

@@ -204,6 +204,103 @@ def main() -> None:
     assert [point["scan_id"] for point in ordered] == ["a", "c", "b"], ordered
     assert ordered[1]["previous_local_scan_id"] == "a", ordered
     assert ordered[1]["travel_delta_cm"] < ordered[2]["travel_delta_cm"], ordered
+    next_aware = harness.route2_order_scan_points_continuously(
+        [
+            {"scan_id": "far", "x": 0.0, "y": 0.0, "z": 300.0, "floor_index": 1, "local_scan_index": 0},
+            {"scan_id": "near_low", "x": 1000.0, "y": 0.0, "z": 300.0, "floor_index": 1, "local_scan_index": 1},
+            {"scan_id": "near_high", "x": 1000.0, "y": 0.0, "z": 600.0, "floor_index": 2, "local_scan_index": 2},
+        ],
+        start_pose={"x": 500.0, "y": -500.0, "z": 300.0},
+        next_observation_pose={"facade": "east", "x": 1300.0, "y": 0.0, "z": 300.0},
+    )
+    assert [point["scan_id"] for point in next_aware] == ["far", "near_low", "near_high"], next_aware
+    assert next_aware[-1]["next_facade_hint"] == "east", next_aware
+    assert next_aware[0]["distance_to_next_observation_cm"] > next_aware[-1]["distance_to_next_observation_cm"], next_aware
+
+    harness.custom_bboxes = {
+        "001": {"min_x": 0.0, "max_x": 1000.0, "min_y": 0.0, "max_y": 800.0, "center_x": 500.0, "center_y": 400.0},
+        "013": {"min_x": 580.0, "max_x": 590.0, "min_y": 1600.0, "max_y": 1700.0, "center_x": 585.0, "center_y": 1650.0},
+    }
+    harness.latest_state = {"pose": {"x": 500.0, "y": -800.0, "z": 300.0, "task_yaw": 90.0}}
+    base_north = {"house_id": "001", "facade": "north", "axis_value": 500.0, "standoff_cm": 850.0, "x": 500.0, "y": 1650.0, "z": 300.0, "yaw_deg": -90.0}
+    attempts = harness.route3_observation_attempts_for_facade("001", "north", base_north)
+    assert len(attempts) >= 3, attempts
+    ranked = harness.route3_rank_observation_candidates("001", [base_north], set(), set(), start_pose={"x": 500.0, "y": -800.0, "z": 300.0, "yaw": 90.0})
+    north_rank = next(item for item in ranked if item["facade"] == "north")
+    assert north_rank["route3_navigation_status"] == "ok", north_rank
+    assert north_rank["observation_attempt_count"] >= 2, north_rank
+    assert north_rank["selected_observation_attempt"]["status"] == "planned", north_rank
+
+    harness.custom_bboxes = {
+        "001": {"min_x": 0.0, "max_x": 1000.0, "min_y": 0.0, "max_y": 1000.0, "center_x": 500.0, "center_y": 500.0},
+    }
+    harness.latest_state = {"pose": {"x": 2300.0, "y": 500.0, "z": 300.0, "task_yaw": 180.0}}
+    facade_candidates = harness.route2_all_facade_observation_candidates("001", skip_completed=False)
+    ranked_candidates = harness.route3_rank_observation_candidates("001", facade_candidates, set(), set(), start_pose={"x": 2300.0, "y": 500.0, "z": 300.0, "yaw": 180.0})
+    assert ranked_candidates[0]["facade"] == "east", ranked_candidates
+
+    harness.custom_bboxes = {
+        "001": {"min_x": 0.0, "max_x": 1000.0, "min_y": 0.0, "max_y": 1000.0, "center_x": 500.0, "center_y": 500.0},
+        "002": {"min_x": 1500.0, "max_x": 2400.0, "min_y": 0.0, "max_y": 800.0, "center_x": 1950.0, "center_y": 400.0},
+    }
+    fallback_task = harness.route3_normalize_task_plan({}, "001", "Search house 1 entrance")
+    assert fallback_task["target_house_id"] == "001", fallback_task
+    assert len(fallback_task["facade_priority"]) == 4, fallback_task
+    explicit_override_task = harness.route3_normalize_task_plan({}, "002", "Search house 1 entrance")
+    assert explicit_override_task["target_house_id"] == "001", explicit_override_task
+    assert explicit_override_task["target_sequence"] == ["001"], explicit_override_task
+    assert explicit_override_task["target_source"] == "explicit_task_text", explicit_override_task
+    ambiguous_count_task = harness.route3_normalize_task_plan({}, "002", "Search 2 targets")
+    assert ambiguous_count_task["target_house_id"] == "002", ambiguous_count_task
+    assert ambiguous_count_task["target_source"] == "selected_target_house", ambiguous_count_task
+    multi_target_task = harness.route3_normalize_task_plan(
+        {
+            "ordered_targets": [
+                {"order": 1, "house_id": "002", "goal": "search_entry"},
+                {"order": 2, "house_id": "001", "goal": "search_entry"},
+            ],
+            "preferred_start_facade": "south",
+        },
+        "003",
+        "Search selected houses",
+    )
+    assert multi_target_task["target_house_id"] == "002", multi_target_task
+    assert multi_target_task["target_sequence"] == ["002", "001"], multi_target_task
+    assert multi_target_task["target_source"] == "llm_ordered_targets", multi_target_task
+
+    harness.effective_llm_api_key = lambda: "test-key"
+    harness.call_configured_llm_text = lambda **_kwargs: {
+        "raw_text": '{"next_action":"select_facade","target_facade":"west","reason":"llm preferred west","rescan_required":false,"stop_condition_met":false}'
+    }
+    rank_corrected = harness.route3_decide_next_facade(
+        "001",
+        [
+            {"facade": "east", "status": "planned", "route3_navigation_status": "ok"},
+            {"facade": "west", "status": "planned", "route3_navigation_status": "ok"},
+        ],
+        set(),
+        set(),
+    )
+    assert rank_corrected["target_facade"] == "east", rank_corrected
+    assert rank_corrected["llm_requested_facade"] == "west", rank_corrected
+    assert rank_corrected["planner_source"] == "llm_high_level_rank_corrected", rank_corrected
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_dir = Path(temp_dir)
+        west_dir = output_dir / "facade_observations" / "001_west"
+        west_dir.mkdir(parents=True)
+        (west_dir / "coarse_rgb.png").write_bytes(b"stub")
+        harness.llm_route3_state = {
+            "target_house_id": "001",
+            "output_dir": str(output_dir),
+            "blocked_facade_reasons": {"north": {"reason": "target_inside_obstacle", "observation_attempt_count": 3}},
+        }
+        harness.llm_route3_completed_facades = {"west"}
+        harness.llm_route3_blocked_facades = {"north"}
+        summary = harness.route3_run_summary(output_dir, status="done_with_blocked")
+        assert summary["attempted_facades"] == ["north", "west"], summary
+        assert summary["blocked_facade_reasons"]["north"]["observation_attempt_count"] == 3, summary
+        assert summary["missing_facade_rgb"] == ["north"], summary
 
     observation = {
         "observation_boundary_adjustment": {"source": "blocking_house_clearance_boundary"},
