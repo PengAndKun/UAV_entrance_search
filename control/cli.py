@@ -31,6 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rgb_enhance_gamma", type=float, default=flight.DEFAULT_RGB_ENHANCE_GAMMA)
     parser.add_argument("--rgb_enhance_gain", type=float, default=flight.DEFAULT_RGB_ENHANCE_GAIN)
     parser.add_argument("--rgb_source_order", choices=["rgb", "bgr"], default=flight.DEFAULT_RGB_SOURCE_ORDER)
+    parser.add_argument("--first_person_camera_config", default=flight.DEFAULT_FIRST_PERSON_CAMERA_CONFIG)
+    parser.add_argument("--native_viewport_camera_config", default=flight.DEFAULT_NATIVE_VIEWPORT_CAMERA_CONFIG)
     parser.add_argument("--temp_capture_dir", default=flight.DEFAULT_TEMP_CAPTURE_DIR)
     parser.add_argument("--temp_capture_lidar_dir", default=flight.DEFAULT_TEMP_CAPTURE_LIDAR_DIR)
     parser.add_argument("--stream_capture_dir", default=flight.DEFAULT_STREAM_CAPTURE_DIR)

@@ -1,0 +1,18 @@
+{
+  "camera_id": 0,
+  "location": [
+    391.619,
+    7.572,
+    288.131
+  ],
+  "rotation": [
+    3.396,
+    97.784,
+    -0.001
+  ],
+  "fov": "90.000000",
+  "schema_version": 1,
+  "camera_role": "native_viewport",
+  "drone_name": "BP_Drone01_2",
+  "saved_at": "2026-05-14T15:19:33.880"
+}

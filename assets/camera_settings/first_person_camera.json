@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "camera_role": "drone_front",
+  "camera_id": 1,
+  "drone_name": "BP_Drone01_2",
+  "relative_location": [
+    -520.0,
+    0.0,
+    150.0
+  ],
+  "relative_rotation": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "saved_at": "2026-05-14T15:17:24.609"
+}

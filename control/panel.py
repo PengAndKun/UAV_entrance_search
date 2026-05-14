@@ -134,6 +134,14 @@ class RunDroneFlightPanel(
             value=str(getattr(args, "keyboard_interval_ms", DEFAULT_KEYBOARD_INTERVAL_MS))
         )
         self.keyboard_status_var = tk.StringVar(value="Keyboard: idle")
+        self.fpv_camera_x_var = tk.StringVar(value="0")
+        self.fpv_camera_y_var = tk.StringVar(value="0")
+        self.fpv_camera_z_var = tk.StringVar(value="0")
+        self.fpv_camera_roll_var = tk.StringVar(value="0")
+        self.fpv_camera_pitch_var = tk.StringVar(value="0")
+        self.fpv_camera_yaw_var = tk.StringVar(value="0")
+        self.fpv_camera_status_var = tk.StringVar(value="FPV Camera: idle")
+        self.fpv_camera_info_var = tk.StringVar(value="Camera Info: not loaded")
         self.initial_pose_var = tk.StringVar(value=" ".join(str(value) for value in args.initial_pos))
 
         self.sequence_var = tk.StringVar(value="")
@@ -198,7 +206,10 @@ class RunDroneFlightPanel(
         self.movement_mode_state = args.movement_mode
         self.movement_toggle_button: Optional[tk.Button] = None
         self.keyboard_pressed_symbols: set[str] = set()
+        self.camera_toggle_key_down = False
         self.keyboard_loop_after_id: Optional[str] = None
+        self.fpv_camera_window: Optional[tk.Toplevel] = None
+        self.fpv_camera_info_text: Optional[tk.Text] = None
         self.preview_window: Optional[tk.Toplevel] = None
         self.preview_label: Optional[tk.Label] = None
         self.preview_photo: Optional[ImageTk.PhotoImage] = None
@@ -594,6 +605,12 @@ class RunDroneFlightPanel(
             tk.Button(move, text=label, command=lambda s=symbol: self.send_move_symbol(s)).grid(
                 row=row_idx, column=col_idx, sticky="ew", padx=6, pady=4
             )
+        tk.Button(move, text="Toggle View (Z)", command=self.on_toggle_camera_view).grid(
+            row=3, column=2, sticky="ew", padx=6, pady=4
+        )
+        tk.Button(move, text="FPV Camera", command=self.open_first_person_camera_window).grid(
+            row=3, column=3, sticky="ew", padx=6, pady=4
+        )
         keyboard_row = tk.Frame(move)
         keyboard_row.grid(row=4, column=0, columnspan=4, sticky="ew", padx=0, pady=(2, 6))
         tk.Checkbutton(
@@ -1399,6 +1416,11 @@ class RunDroneFlightPanel(
             return "stop"
         return None
 
+    def _camera_view_toggle_from_event(self, event: tk.Event) -> bool:
+        char = str(getattr(event, "char", "") or "").lower()
+        keysym = str(getattr(event, "keysym", "") or "").lower()
+        return char == "z" or keysym == "z"
+
     def should_capture_movement_key(self, event: tk.Event, symbol: str) -> bool:
         if not self._event_widget_accepts_text(event):
             return True
@@ -1426,6 +1448,16 @@ class RunDroneFlightPanel(
                 self.on_stop_stream_capture()
             return "break"
 
+        if (
+            self.keyboard_enabled_var.get()
+            and self._camera_view_toggle_from_event(event)
+            and not self._event_widget_accepts_text(event)
+        ):
+            if not self.camera_toggle_key_down:
+                self.camera_toggle_key_down = True
+                self.on_toggle_camera_view()
+            return "break"
+
         symbol = self._movement_symbol_from_event(event)
         if symbol is None:
             return None
@@ -1451,6 +1483,14 @@ class RunDroneFlightPanel(
         return "break"
 
     def _on_keyboard_release(self, event: tk.Event):
+        if (
+            self.keyboard_enabled_var.get()
+            and self._camera_view_toggle_from_event(event)
+            and not self._event_widget_accepts_text(event)
+        ):
+            self.camera_toggle_key_down = False
+            return "break"
+
         symbol = self._movement_symbol_from_event(event)
         if symbol is None or symbol == "x":
             return None
@@ -1498,6 +1538,8 @@ class RunDroneFlightPanel(
             rgb_enhance_gamma=float(self.args.rgb_enhance_gamma),
             rgb_enhance_gain=float(self.args.rgb_enhance_gain),
             rgb_source_order=self.rgb_source_order_var.get().strip() or flight.DEFAULT_RGB_SOURCE_ORDER,
+            first_person_camera_config=str(getattr(self.args, "first_person_camera_config", flight.DEFAULT_FIRST_PERSON_CAMERA_CONFIG)),
+            native_viewport_camera_config=str(getattr(self.args, "native_viewport_camera_config", flight.DEFAULT_NATIVE_VIEWPORT_CAMERA_CONFIG)),
             temp_capture_dir=str(getattr(self.args, "temp_capture_dir", flight.DEFAULT_TEMP_CAPTURE_DIR)),
             temp_capture_lidar_dir=str(getattr(self.args, "temp_capture_lidar_dir", flight.DEFAULT_TEMP_CAPTURE_LIDAR_DIR)),
             stream_capture_dir=str(getattr(self.args, "stream_capture_dir", flight.DEFAULT_STREAM_CAPTURE_DIR)),
@@ -1572,9 +1614,14 @@ class RunDroneFlightPanel(
         commanded_yaw = commanded.get("task_yaw", commanded.get("yaw", "n/a"))
         actual_yaw = pose.get("task_yaw", pose.get("yaw", "n/a")) if pose else "n/a"
         yaw_error = pose_error.get("yaw_deg", "n/a")
+        camera_view = str(
+            self.latest_state.get("camera_view_mode", flight.DEFAULT_CAMERA_VIEW_MODE)
+            or flight.DEFAULT_CAMERA_VIEW_MODE
+        )
         self.control_var.set(
             f"Movement enabled={1 if self.movement_enabled_state else 0} "
             f"mode={self.movement_mode_state} "
+            f"view={camera_view} "
             f"commanded_yaw={self._fmt_float(commanded_yaw)} "
             f"actual_yaw={self._fmt_float(actual_yaw)} "
             f"yaw_error={self._fmt_float(yaw_error)}"

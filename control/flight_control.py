@@ -95,6 +95,374 @@ class FlightControlMixin:
             lambda: session.set_movement_mode(self.movement_mode_state),
         )
 
+    def on_toggle_camera_view(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        self.call_async("Toggling camera view", session.toggle_camera_view_mode)
+
+    def first_person_camera_variables(self) -> List[tk.StringVar]:
+        return [
+            self.fpv_camera_x_var,
+            self.fpv_camera_y_var,
+            self.fpv_camera_z_var,
+            self.fpv_camera_roll_var,
+            self.fpv_camera_pitch_var,
+            self.fpv_camera_yaw_var,
+        ]
+
+    def set_first_person_camera_variables(self, location: List[float], rotation: List[float]) -> None:
+        values = list(location[:3]) + list(rotation[:3])
+        for var, value in zip(self.first_person_camera_variables(), values):
+            try:
+                var.set(f"{float(value):.1f}")
+            except Exception:
+                var.set("0.0")
+
+    def load_first_person_camera_from_state(self) -> None:
+        cfg = self.latest_state.get("first_person_camera")
+        if not isinstance(cfg, dict):
+            cfg = {}
+        location = cfg.get("relative_location") or cfg.get("default_location") or [0.0, 0.0, 0.0]
+        rotation = cfg.get("relative_rotation") or cfg.get("default_rotation") or [0.0, 0.0, 0.0]
+        try:
+            self.set_first_person_camera_variables([float(v) for v in location[:3]], [float(v) for v in rotation[:3]])
+            self.fpv_camera_status_var.set("FPV Camera: loaded current state")
+        except Exception:
+            self.set_first_person_camera_variables([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+            self.fpv_camera_status_var.set("FPV Camera: state unavailable")
+
+    def nudge_first_person_camera_value(self, var: tk.StringVar, delta: float) -> None:
+        try:
+            value = float(var.get().strip())
+        except Exception:
+            value = 0.0
+        var.set(f"{value + float(delta):.1f}")
+
+    def first_person_camera_payload_from_ui(self) -> Optional[Dict[str, Any]]:
+        try:
+            values = [float(var.get().strip()) for var in self.first_person_camera_variables()]
+        except Exception as exc:
+            self.fpv_camera_status_var.set(f"FPV Camera: invalid number ({exc})")
+            return None
+        return {
+            "relative_location": values[:3],
+            "relative_rotation": values[3:6],
+        }
+
+    def open_first_person_camera_window(self) -> None:
+        if self.fpv_camera_window is not None and self.fpv_camera_window.winfo_exists():
+            self.fpv_camera_window.lift()
+            return
+        self.load_first_person_camera_from_state()
+        window = tk.Toplevel(self.root)
+        self.fpv_camera_window = window
+        window.title("First Person Camera Adjustment")
+        window.geometry("760x620")
+        window.protocol("WM_DELETE_WINDOW", self.close_first_person_camera_window)
+        window.grid_columnconfigure(1, weight=1)
+        window.grid_rowconfigure(12, weight=1)
+
+        tk.Label(window, text="Relative Location (cm)").grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(8, 2))
+        rows = [
+            ("X forward/back", self.fpv_camera_x_var, 10.0),
+            ("Y left/right", self.fpv_camera_y_var, 10.0),
+            ("Z vertical (+up)", self.fpv_camera_z_var, 5.0),
+        ]
+        for index, (label, var, step) in enumerate(rows, start=1):
+            tk.Label(window, text=label).grid(row=index, column=0, sticky="w", padx=8, pady=3)
+            tk.Entry(window, textvariable=var, width=12).grid(row=index, column=1, sticky="ew", padx=4, pady=3)
+            tk.Button(window, text="-", width=4, command=lambda v=var, s=step: self.nudge_first_person_camera_value(v, -s)).grid(row=index, column=2, padx=2, pady=3)
+            tk.Button(window, text="+", width=4, command=lambda v=var, s=step: self.nudge_first_person_camera_value(v, s)).grid(row=index, column=3, padx=(2, 8), pady=3)
+
+        tk.Label(window, text="Relative Rotation (deg)").grid(row=4, column=0, columnspan=4, sticky="w", padx=8, pady=(12, 2))
+        rot_rows = [
+            ("Roll", self.fpv_camera_roll_var, 2.0),
+            ("Pitch", self.fpv_camera_pitch_var, 2.0),
+            ("Yaw", self.fpv_camera_yaw_var, 2.0),
+        ]
+        for offset, (label, var, step) in enumerate(rot_rows, start=5):
+            tk.Label(window, text=label).grid(row=offset, column=0, sticky="w", padx=8, pady=3)
+            tk.Entry(window, textvariable=var, width=12).grid(row=offset, column=1, sticky="ew", padx=4, pady=3)
+            tk.Button(window, text="-", width=4, command=lambda v=var, s=step: self.nudge_first_person_camera_value(v, -s)).grid(row=offset, column=2, padx=2, pady=3)
+            tk.Button(window, text="+", width=4, command=lambda v=var, s=step: self.nudge_first_person_camera_value(v, s)).grid(row=offset, column=3, padx=(2, 8), pady=3)
+
+        actions = tk.Frame(window)
+        actions.grid(row=8, column=0, columnspan=4, sticky="ew", padx=8, pady=(14, 6))
+        tk.Button(actions, text="Apply First View", command=self.apply_first_person_camera).pack(side="left", padx=(0, 6))
+        tk.Button(actions, text="Load Current", command=self.load_first_person_camera_from_state).pack(side="left", padx=6)
+        tk.Button(actions, text="Reset Default", command=self.reset_first_person_camera).pack(side="left", padx=6)
+        tk.Button(actions, text="Sync UE Window", command=self.sync_first_person_viewport).pack(side="left", padx=6)
+        tk.Button(actions, text="Refresh Camera Info", command=self.refresh_first_person_camera_info).pack(side="left", padx=6)
+        view_actions = tk.Frame(window)
+        view_actions.grid(row=9, column=0, columnspan=4, sticky="ew", padx=8, pady=(0, 6))
+        tk.Button(view_actions, text="Save FPV JSON", command=self.save_first_person_camera_config).pack(side="left", padx=(0, 6))
+        tk.Button(view_actions, text="Save UE Window View", command=self.save_native_viewport_camera_config).pack(side="left", padx=6)
+        tk.Button(view_actions, text="Apply Saved UE View", command=self.apply_native_viewport_camera_config).pack(side="left", padx=6)
+        tk.Label(window, textvariable=self.fpv_camera_status_var, anchor="w").grid(
+            row=10,
+            column=0,
+            columnspan=4,
+            sticky="ew",
+            padx=8,
+            pady=(0, 8),
+        )
+        tk.Label(window, textvariable=self.fpv_camera_info_var, anchor="w").grid(
+            row=11,
+            column=0,
+            columnspan=4,
+            sticky="ew",
+            padx=8,
+            pady=(0, 4),
+        )
+        info_frame = tk.Frame(window)
+        info_frame.grid(row=12, column=0, columnspan=4, sticky="nsew", padx=8, pady=(0, 8))
+        info_frame.grid_rowconfigure(0, weight=1)
+        info_frame.grid_columnconfigure(0, weight=1)
+        info_text = tk.Text(info_frame, height=12, wrap="none", font=("Consolas", 9))
+        info_y = tk.Scrollbar(info_frame, orient="vertical", command=info_text.yview)
+        info_x = tk.Scrollbar(info_frame, orient="horizontal", command=info_text.xview)
+        info_text.configure(yscrollcommand=info_y.set, xscrollcommand=info_x.set)
+        info_text.grid(row=0, column=0, sticky="nsew")
+        info_y.grid(row=0, column=1, sticky="ns")
+        info_x.grid(row=1, column=0, sticky="ew")
+        info_text.configure(state="disabled")
+        self.fpv_camera_info_text = info_text
+        self.refresh_first_person_camera_info()
+
+    def close_first_person_camera_window(self) -> None:
+        window = self.fpv_camera_window
+        self.fpv_camera_window = None
+        self.fpv_camera_info_text = None
+        if window is not None:
+            try:
+                window.destroy()
+            except Exception:
+                pass
+
+    def format_first_person_camera_info(self, info: Dict[str, Any]) -> str:
+        if not isinstance(info, dict):
+            return "No camera info."
+        lines = [
+            f"drone_name: {info.get('drone_name', 'n/a')}",
+            f"player_list: {info.get('player_list', [])}",
+            f"cam_list: {info.get('cam_list', [])}",
+            f"agent/front camera id: {info.get('agent_cam_id', 'n/a')}  <-- fixed drone front camera",
+            f"native UE window camera id: {info.get('native_viewport_camera_id', 'n/a')}",
+            f"camera_view_mode: {info.get('camera_view_mode', 'n/a')}",
+            f"drone_location: {info.get('drone_location', [])}",
+            f"drone_rotation: {info.get('drone_rotation', [])}",
+            f"default_relative_location: {info.get('relative_location_default', [])}",
+            f"default_relative_rotation: {info.get('relative_rotation_default', [])}",
+            f"fpv json: {info.get('first_person_camera_config_path', '')} exists={info.get('first_person_camera_config_exists', False)}",
+            f"ue window json: {info.get('native_viewport_camera_config_path', '')} exists={info.get('native_viewport_camera_config_exists', False)}",
+            "",
+            "cameras:",
+        ]
+        for cam in info.get("cameras", []) if isinstance(info.get("cameras"), list) else []:
+            roles = ", ".join(cam.get("roles", []) or [])
+            distance = cam.get("distance_to_drone_cm")
+            try:
+                distance_text = f"{float(distance):.1f} cm"
+            except Exception:
+                distance_text = "n/a"
+            lines.extend(
+                [
+                    f"  camera {cam.get('id')}: {roles or '-'}",
+                    f"    location: {cam.get('location', [])}",
+                    f"    rotation: {cam.get('rotation', [])}",
+                    f"    fov: {cam.get('fov', '')}",
+                    f"    distance_to_drone: {distance_text}",
+                ]
+            )
+        lines.extend(["", "raw:", json.dumps(info, indent=2, ensure_ascii=False)])
+        return "\n".join(lines)
+
+    def update_first_person_camera_info_text(self, info: Dict[str, Any]) -> None:
+        text = self.format_first_person_camera_info(info)
+        widget = self.fpv_camera_info_text
+        if widget is not None and widget.winfo_exists():
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("1.0", text)
+            widget.configure(state="disabled")
+        front_id = info.get("agent_cam_id", "n/a") if isinstance(info, dict) else "n/a"
+        native_id = info.get("native_viewport_camera_id", "n/a") if isinstance(info, dict) else "n/a"
+        self.fpv_camera_info_var.set(f"Camera Info: front cam={front_id}, UE window cam={native_id}")
+
+    def refresh_first_person_camera_info(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        self.fpv_camera_info_var.set("Camera Info: refreshing...")
+
+        def worker() -> None:
+            self.manual_request_inflight = True
+            try:
+                result = self.safe("Refreshing camera info", session.get_camera_debug_info)
+                if isinstance(result, dict):
+                    self.root.after(0, lambda r=result: self.update_first_person_camera_info_text(r))
+            finally:
+                self.manual_request_inflight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def sync_first_person_viewport(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        self.camera_toggle_key_down = False
+        self.fpv_camera_status_var.set("FPV Camera: syncing UE window...")
+
+        def worker() -> None:
+            self.manual_request_inflight = True
+            try:
+                result = self.safe("Syncing UE window to FPV camera", session.sync_first_person_viewport)
+                if isinstance(result, dict):
+                    self.root.after(0, lambda r=result: self.apply_state(r))
+                    self.root.after(0, lambda: self.fpv_camera_status_var.set("FPV Camera: UE window synced"))
+                    debug = result.get("camera_debug")
+                    if isinstance(debug, dict):
+                        self.root.after(0, lambda d=debug: self.update_first_person_camera_info_text(d))
+            finally:
+                self.manual_request_inflight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def save_first_person_camera_config(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        payload = self.first_person_camera_payload_from_ui()
+        if payload is None:
+            return
+        self.camera_toggle_key_down = False
+        self.fpv_camera_status_var.set("FPV Camera: saving JSON...")
+
+        def worker() -> None:
+            self.manual_request_inflight = True
+            try:
+                result = self.safe("Saving FPV camera JSON", lambda p=payload: session.set_first_person_camera(p))
+                if isinstance(result, dict):
+                    self.root.after(0, lambda r=result: self.apply_state(r))
+                    saved = result.get("first_person_camera_config") if isinstance(result.get("first_person_camera_config"), dict) else {}
+                    path = saved.get("path", "")
+                    self.root.after(0, lambda p=path: self.fpv_camera_status_var.set(f"FPV Camera: saved JSON {p}"))
+                    debug = result.get("camera_debug")
+                    if isinstance(debug, dict):
+                        self.root.after(0, lambda d=debug: self.update_first_person_camera_info_text(d))
+            finally:
+                self.manual_request_inflight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def save_native_viewport_camera_config(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        self.camera_toggle_key_down = False
+        self.fpv_camera_status_var.set("FPV Camera: saving UE window view...")
+
+        def worker() -> None:
+            self.manual_request_inflight = True
+            try:
+                result = self.safe("Saving UE window camera 0 view", session.save_native_viewport_camera_config)
+                if isinstance(result, dict):
+                    self.root.after(0, lambda r=result: self.apply_state(r))
+                    saved = result.get("native_viewport_camera_config") if isinstance(result.get("native_viewport_camera_config"), dict) else {}
+                    path = saved.get("path", "")
+                    self.root.after(0, lambda p=path: self.fpv_camera_status_var.set(f"FPV Camera: saved UE view {p}"))
+                    debug = result.get("camera_debug")
+                    if isinstance(debug, dict):
+                        self.root.after(0, lambda d=debug: self.update_first_person_camera_info_text(d))
+            finally:
+                self.manual_request_inflight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_native_viewport_camera_config(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        self.camera_toggle_key_down = False
+        self.fpv_camera_status_var.set("FPV Camera: applying saved UE window view...")
+
+        def worker() -> None:
+            self.manual_request_inflight = True
+            try:
+                result = self.safe("Applying saved UE window camera 0 view", session.apply_native_viewport_camera_config_state)
+                if isinstance(result, dict):
+                    self.root.after(0, lambda r=result: self.apply_state(r))
+                    applied = result.get("native_viewport_camera_config") if isinstance(result.get("native_viewport_camera_config"), dict) else {}
+                    if applied.get("applied"):
+                        status = f"FPV Camera: applied UE view {applied.get('path', '')}"
+                    else:
+                        status = f"FPV Camera: no saved UE view {applied.get('path', '')}"
+                    self.root.after(0, lambda s=status: self.fpv_camera_status_var.set(s))
+                    debug = result.get("camera_debug")
+                    if isinstance(debug, dict):
+                        self.root.after(0, lambda d=debug: self.update_first_person_camera_info_text(d))
+            finally:
+                self.manual_request_inflight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_first_person_camera(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        payload = self.first_person_camera_payload_from_ui()
+        if payload is None:
+            return
+        self.camera_toggle_key_down = False
+        self.fpv_camera_status_var.set("FPV Camera: applying...")
+
+        def worker() -> None:
+            self.manual_request_inflight = True
+            try:
+                result = self.safe("Setting FPV first-person camera", lambda p=payload: session.set_first_person_camera(p))
+                if isinstance(result, dict):
+                    self.root.after(0, lambda r=result: self.apply_state(r))
+                    saved = result.get("first_person_camera_config") if isinstance(result.get("first_person_camera_config"), dict) else {}
+                    path = saved.get("path", "")
+                    self.root.after(0, lambda p=path: self.fpv_camera_status_var.set(f"FPV Camera: applied first_person; saved {p}"))
+                    debug = result.get("camera_debug")
+                    if isinstance(debug, dict):
+                        self.root.after(0, lambda d=debug: self.update_first_person_camera_info_text(d))
+            finally:
+                self.manual_request_inflight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def reset_first_person_camera(self) -> None:
+        session = self.active_session()
+        if session is None:
+            return
+        cfg = self.latest_state.get("first_person_camera") if isinstance(self.latest_state.get("first_person_camera"), dict) else {}
+        self.set_first_person_camera_variables(
+            [float(v) for v in (cfg.get("default_location") or [0.0, 0.0, 0.0])[:3]],
+            [float(v) for v in (cfg.get("default_rotation") or [0.0, 0.0, 0.0])[:3]],
+        )
+        self.camera_toggle_key_down = False
+        self.fpv_camera_status_var.set("FPV Camera: resetting...")
+
+        def worker() -> None:
+            self.manual_request_inflight = True
+            try:
+                result = self.safe("Resetting FPV first-person camera", session.reset_first_person_camera)
+                if isinstance(result, dict):
+                    self.root.after(0, lambda r=result: self.apply_state(r))
+                    deleted = result.get("first_person_camera_config") if isinstance(result.get("first_person_camera_config"), dict) else {}
+                    path = deleted.get("path", "")
+                    self.root.after(0, lambda p=path: self.fpv_camera_status_var.set(f"FPV Camera: reset first_person; JSON cleared {p}"))
+                    debug = result.get("camera_debug")
+                    if isinstance(debug, dict):
+                        self.root.after(0, lambda d=debug: self.update_first_person_camera_info_text(d))
+            finally:
+                self.manual_request_inflight = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def latest_yaw_deg(self) -> Optional[float]:
         pose = self.latest_state.get("pose", {}) if isinstance(self.latest_state.get("pose"), dict) else {}
         if not pose:

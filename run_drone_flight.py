@@ -81,6 +81,18 @@ DEFAULT_OPEN3D_VOXEL_CM = DEFAULT_LIDAR_RECON_VOXEL_CM
 DEFAULT_OPEN3D_NORMAL_RADIUS_CM = 30.0
 DEFAULT_OPEN3D_NORMAL_MAX_NN = 30
 DEFAULT_FORCE_KILL_UNREAL_ON_STOP = True
+CAMERA_VIEW_FIRST_PERSON = "first_person"
+CAMERA_VIEW_THIRD_PERSON = "third_person"
+CAMERA_VIEW_MODES = {CAMERA_VIEW_FIRST_PERSON, CAMERA_VIEW_THIRD_PERSON}
+DEFAULT_CAMERA_VIEW_MODE = CAMERA_VIEW_FIRST_PERSON
+# Follow-camera defaults copied from the older UAV-Flow teleop path. The UE
+# blueprint expects relative rotation as roll/pitch/yaw here.
+THIRD_PERSON_CAMERA_RELATIVE_LOCATION = [-220.0, 0.0, 90.0]
+THIRD_PERSON_CAMERA_RELATIVE_ROTATION = [0.0, -12.0, 0.0]
+NATIVE_VIEWPORT_CAMERA_ID = 0
+DEFAULT_CAMERA_SETTINGS_DIR = "assets/camera_settings"
+DEFAULT_FIRST_PERSON_CAMERA_CONFIG = f"{DEFAULT_CAMERA_SETTINGS_DIR}/first_person_camera.json"
+DEFAULT_NATIVE_VIEWPORT_CAMERA_CONFIG = f"{DEFAULT_CAMERA_SETTINGS_DIR}/native_viewport_camera.json"
 DEFAULT_ACTION_PLAN = [
     ("hover", [0.0, 0.0, 0.0, 0.0]),
     ("up", [0.0, 0.0, 0.5, 0.0]),
@@ -615,6 +627,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Gain used for RGB output enhancement")
     parser.add_argument("--rgb_source_order", choices=["rgb", "bgr"], default=DEFAULT_RGB_SOURCE_ORDER,
                         help="Color channel order returned by UnrealCV before display/save")
+    parser.add_argument("--first_person_camera_config", default=DEFAULT_FIRST_PERSON_CAMERA_CONFIG,
+                        help="JSON file used to persist/apply the drone front camera relative pose")
+    parser.add_argument("--native_viewport_camera_config", default=DEFAULT_NATIVE_VIEWPORT_CAMERA_CONFIG,
+                        help="JSON file used to persist/apply the UE window camera 0 world pose")
     parser.add_argument("--temp_capture_dir", default=DEFAULT_TEMP_CAPTURE_DIR,
                         help="Directory for controller Temp Capture bundles")
     parser.add_argument("--temp_capture_lidar_dir", default=DEFAULT_TEMP_CAPTURE_LIDAR_DIR,
@@ -696,6 +712,21 @@ def resolve_project_output_path(value: Any, default_value: str) -> Path:
     if not path.is_absolute():
         path = Path(__file__).resolve().parent / path
     return path
+
+
+def read_json_file(path: Path) -> Dict[str, Any]:
+    try:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        return {"error": str(exc), "path": str(path)}
+
+
+def write_json_file(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def sanitize_capture_task_title(title: Any, default_value: str = "stream_task") -> str:
@@ -2223,15 +2254,226 @@ def step_drone_flight_env(env: Any, actions: List[Any]) -> Tuple[Any, Any, bool,
     return env.step(actions)
 
 
-def set_drone_camera(env: Any, drone_name: str) -> None:
+def _camera_triplet(values: Any, fallback: List[float]) -> List[float]:
+    try:
+        candidate = [float(value) for value in list(values)[:3]]
+        if len(candidate) == 3:
+            return candidate
+    except Exception:
+        pass
+    return [float(value) for value in fallback[:3]]
+
+
+def default_drone_camera_relative_pose(env: Any, drone_name: str) -> Tuple[List[float], List[float]]:
     agent_cfg = env.unwrapped.agents.get(drone_name, {})
-    rel_loc = agent_cfg.get("relative_location", [0, 0, 0])
-    rel_rot = agent_cfg.get("relative_rotation", [0, 0, 0])
+    rel_loc = _camera_triplet(agent_cfg.get("relative_location", [0, 0, 0]), [0.0, 0.0, 0.0])
+    rel_rot = _camera_triplet(agent_cfg.get("relative_rotation", [0, 0, 0]), [0.0, 0.0, 0.0])
+    return rel_loc, rel_rot
+
+
+def set_drone_first_person_camera(
+    env: Any,
+    drone_name: str,
+    *,
+    relative_location: Optional[List[float]] = None,
+    relative_rotation: Optional[List[float]] = None,
+) -> Tuple[List[float], List[float]]:
+    default_loc, default_rot = default_drone_camera_relative_pose(env, drone_name)
+    rel_loc = _camera_triplet(relative_location, default_loc) if relative_location is not None else default_loc
+    rel_rot = _camera_triplet(relative_rotation, default_rot) if relative_rotation is not None else default_rot
     env.unwrapped.unrealcv.set_cam(drone_name, rel_loc, rel_rot)
+    return rel_loc, rel_rot
 
 
-def bind_drone_view(env: Any, drone_name: str) -> None:
-    set_drone_camera(env, drone_name)
+def set_drone_camera(
+    env: Any,
+    drone_name: str,
+    view_mode: str = DEFAULT_CAMERA_VIEW_MODE,
+    *,
+    first_person_location: Optional[List[float]] = None,
+    first_person_rotation: Optional[List[float]] = None,
+) -> None:
+    mode = str(view_mode or DEFAULT_CAMERA_VIEW_MODE).strip().lower()
+    if mode == CAMERA_VIEW_THIRD_PERSON:
+        env.unwrapped.unrealcv.set_cam(
+            drone_name,
+            THIRD_PERSON_CAMERA_RELATIVE_LOCATION,
+            THIRD_PERSON_CAMERA_RELATIVE_ROTATION,
+        )
+        return
+    set_drone_first_person_camera(
+        env,
+        drone_name,
+        relative_location=first_person_location,
+        relative_rotation=first_person_rotation,
+    )
+
+
+def sync_native_viewport_to_drone_camera(
+    env: Any,
+    drone_name: str,
+    *,
+    target_cam_id: int = NATIVE_VIEWPORT_CAMERA_ID,
+) -> Dict[str, Any]:
+    """Mirror the active drone capture camera into the native UE window camera.
+
+    In this packaged scene, ``vbp <drone> set_cam`` updates the UnrealCV capture
+    camera, while the visible UE game window can stay on camera 0. Copying the
+    capture camera pose into camera 0 keeps the game window aligned with the
+    controller's first/third-person mode and FPV offsets.
+    """
+    cam_id = env.unwrapped.agents.get(drone_name, {}).get("cam_id")
+    if cam_id is None or int(cam_id) < 0:
+        return {"synced": False, "reason": "missing_source_camera"}
+    source_cam_id = int(cam_id)
+    target_cam_id = int(target_cam_id)
+    unrealcv = env.unwrapped.unrealcv
+    location = [float(value) for value in unrealcv.get_cam_location(source_cam_id)]
+    rotation = [float(value) for value in unrealcv.get_cam_rotation(source_cam_id)]
+    if source_cam_id != target_cam_id:
+        unrealcv.set_location(target_cam_id, location)
+        unrealcv.set_cam_rotation(target_cam_id, rotation)
+    return {
+        "synced": True,
+        "source_camera_id": source_cam_id,
+        "target_camera_id": target_cam_id,
+        "location": location,
+        "rotation": rotation,
+    }
+
+
+def read_camera_world_pose(env: Any, camera_id: int) -> Dict[str, Any]:
+    unrealcv = env.unwrapped.unrealcv
+    camera_id = int(camera_id)
+    location = [float(value) for value in unrealcv.get_cam_location(camera_id)]
+    rotation = [float(value) for value in unrealcv.get_cam_rotation(camera_id)]
+    try:
+        fov = str(unrealcv.get_cam_fov(camera_id))
+    except Exception:
+        fov = ""
+    return {
+        "camera_id": camera_id,
+        "location": location,
+        "rotation": rotation,
+        "fov": fov,
+    }
+
+
+def apply_camera_world_pose(env: Any, payload: Dict[str, Any], *, default_camera_id: int = NATIVE_VIEWPORT_CAMERA_ID) -> Dict[str, Any]:
+    camera_id = int(payload.get("camera_id", default_camera_id))
+    location = _camera_triplet(payload.get("location"), [0.0, 0.0, 0.0])
+    rotation = _camera_triplet(payload.get("rotation"), [0.0, 0.0, 0.0])
+    env.unwrapped.unrealcv.set_location(camera_id, location)
+    env.unwrapped.unrealcv.set_cam_rotation(camera_id, rotation)
+    return {
+        "applied": True,
+        "camera_id": camera_id,
+        "location": location,
+        "rotation": rotation,
+        "fov": str(payload.get("fov", "")),
+    }
+
+
+def drone_camera_debug_info(env: Any, drone_name: str) -> Dict[str, Any]:
+    unrealcv = env.unwrapped.unrealcv
+    agent_cfg = env.unwrapped.agents.get(drone_name, {})
+    raw_cam_id = agent_cfg.get("cam_id")
+    try:
+        agent_cam_id: Optional[int] = int(raw_cam_id)
+    except Exception:
+        agent_cam_id = None
+
+    drone_location: List[float] = []
+    drone_rotation: List[float] = []
+    try:
+        drone_location = [float(value) for value in unrealcv.get_obj_location(drone_name)]
+    except Exception:
+        drone_location = []
+    try:
+        drone_rotation = [float(value) for value in unrealcv.get_obj_rotation(drone_name)]
+    except Exception:
+        drone_rotation = []
+
+    try:
+        camera_config = unrealcv.get_camera_config()
+    except Exception:
+        camera_config = {}
+    if not isinstance(camera_config, dict):
+        camera_config = {}
+
+    camera_ids: Set[int] = set()
+    for key in camera_config.keys():
+        try:
+            camera_ids.add(int(key))
+        except Exception:
+            pass
+    if agent_cam_id is not None and agent_cam_id >= 0:
+        camera_ids.add(agent_cam_id)
+    camera_ids.add(int(NATIVE_VIEWPORT_CAMERA_ID))
+
+    cameras: List[Dict[str, Any]] = []
+    for camera_id in sorted(camera_ids):
+        cfg = camera_config.get(camera_id, camera_config.get(str(camera_id), {}))
+        if not isinstance(cfg, dict):
+            cfg = {}
+        location = cfg.get("location", [])
+        rotation = cfg.get("rotation", [])
+        fov = cfg.get("fov", "")
+        try:
+            location = [float(value) for value in unrealcv.get_cam_location(camera_id)]
+        except Exception:
+            try:
+                location = [float(value) for value in list(location)[:3]]
+            except Exception:
+                location = []
+        try:
+            rotation = [float(value) for value in unrealcv.get_cam_rotation(camera_id)]
+        except Exception:
+            try:
+                rotation = [float(value) for value in list(rotation)[:3]]
+            except Exception:
+                rotation = []
+        try:
+            fov = str(unrealcv.get_cam_fov(camera_id))
+        except Exception:
+            fov = str(fov)
+
+        distance_cm: Optional[float] = None
+        if len(location) >= 3 and len(drone_location) >= 3:
+            distance_cm = float(math.sqrt(sum((float(location[i]) - float(drone_location[i])) ** 2 for i in range(3))))
+        roles: List[str] = []
+        if agent_cam_id is not None and camera_id == agent_cam_id:
+            roles.append("DRONE_FRONT / agent cam_id")
+        if camera_id == int(NATIVE_VIEWPORT_CAMERA_ID):
+            roles.append("UE_WINDOW_NATIVE / camera 0")
+        cameras.append(
+            {
+                "id": int(camera_id),
+                "location": location,
+                "rotation": rotation,
+                "fov": fov,
+                "distance_to_drone_cm": distance_cm,
+                "roles": roles,
+            }
+        )
+
+    return {
+        "drone_name": drone_name,
+        "player_list": list(getattr(env.unwrapped, "player_list", [])),
+        "cam_list": list(getattr(env.unwrapped, "cam_list", [])),
+        "agent_cam_id": agent_cam_id,
+        "native_viewport_camera_id": int(NATIVE_VIEWPORT_CAMERA_ID),
+        "front_camera_id": agent_cam_id,
+        "drone_location": drone_location,
+        "drone_rotation": drone_rotation,
+        "relative_location_default": _camera_triplet(agent_cfg.get("relative_location", [0, 0, 0]), [0.0, 0.0, 0.0]),
+        "relative_rotation_default": _camera_triplet(agent_cfg.get("relative_rotation", [0, 0, 0]), [0.0, 0.0, 0.0]),
+        "cameras": cameras,
+    }
+
+
+def bind_drone_view(env: Any, drone_name: str, view_mode: str = DEFAULT_CAMERA_VIEW_MODE) -> None:
+    set_drone_camera(env, drone_name, view_mode=view_mode)
     env.unwrapped.unrealcv.set_viewport(drone_name)
 
 
@@ -2800,6 +3042,11 @@ class DroneFlightSession:
             self.movement_mode = DEFAULT_MOVEMENT_MODE
         self.commanded_pose: Optional[List[float]] = None
         self.last_actual_pose: Optional[List[float]] = None
+        self.camera_view_mode = DEFAULT_CAMERA_VIEW_MODE
+        self.first_person_camera_location: Optional[List[float]] = None
+        self.first_person_camera_rotation: Optional[List[float]] = None
+        self.last_first_person_camera_config: Dict[str, Any] = {}
+        self.last_native_viewport_camera_config: Dict[str, Any] = {}
         self.map_touch_calibration: Dict[str, Any] = {}
         self.api_lock = threading.RLock()
         self.last_action = "idle"
@@ -2823,6 +3070,15 @@ class DroneFlightSession:
         np.random.seed(self.args.seed)
         self.run_dir = make_output_dir(self.args.output_dir)
         self.env, self.drone_name, self.last_observation = prepare_drone_env(self.args)
+        self.camera_view_mode = DEFAULT_CAMERA_VIEW_MODE
+        self.first_person_camera_location = None
+        self.first_person_camera_rotation = None
+        loaded_camera_config = self.load_first_person_camera_config(apply=True)
+        if loaded_camera_config.get("loaded"):
+            try:
+                self.last_observation = read_drone_observation(self.env, str(self.drone_name))
+            except Exception as exc:
+                loaded_camera_config["observation_refresh_error"] = str(exc)
         self.last_actual_pose = self.get_pose_list()
         if getattr(self.args, "keep_reset_pose", False):
             self.commanded_pose = list(self.last_actual_pose)
@@ -2831,7 +3087,9 @@ class DroneFlightSession:
         if self.last_observation is not None:
             save_color_observation_for_args(self.args, self.last_observation, self.run_dir / "step_0000_reset.png")
         self.last_action = "started"
-        return self.get_state(message="Session started")
+        state = self.get_state(message="Session started")
+        state["first_person_camera_config_load"] = loaded_camera_config
+        return state
 
     def require_started(self) -> Tuple[Any, str]:
         if not self.started:
@@ -2875,6 +3133,11 @@ class DroneFlightSession:
                 self.movement_enabled = False
                 self.commanded_pose = None
                 self.last_actual_pose = None
+                self.camera_view_mode = DEFAULT_CAMERA_VIEW_MODE
+                self.first_person_camera_location = None
+                self.first_person_camera_rotation = None
+                self.last_first_person_camera_config = {}
+                self.last_native_viewport_camera_config = {}
                 self.map_touch_calibration = {}
                 self.last_action = "force_stopped" if force_kill else "closed"
         finally:
@@ -2898,6 +3161,340 @@ class DroneFlightSession:
             self.commanded_pose = self.get_pose_list()
         self.last_action = f"movement_mode_{movement_mode}"
         return self.get_state(message=f"Movement mode={movement_mode}")
+
+    @serialized_unrealcv_method
+    def set_camera_view_mode(self, view_mode: str) -> Dict[str, Any]:
+        normalized = str(view_mode or DEFAULT_CAMERA_VIEW_MODE).strip().lower()
+        if normalized not in CAMERA_VIEW_MODES:
+            raise ValueError(f"camera view mode must be one of {sorted(CAMERA_VIEW_MODES)}")
+        env, drone_name = self.require_started()
+        viewport_camera: Dict[str, Any] = {}
+        switch_target_camera_id: Optional[int] = None
+        used_saved_native_viewport = False
+        if normalized == CAMERA_VIEW_FIRST_PERSON:
+            set_drone_first_person_camera(
+                env,
+                drone_name,
+                relative_location=self.first_person_camera_location,
+                relative_rotation=self.first_person_camera_rotation,
+            )
+            env.unwrapped.unrealcv.set_viewport(drone_name)
+            viewport_camera = sync_native_viewport_to_drone_camera(env, drone_name)
+            switch_target_camera_id = env.unwrapped.agents.get(drone_name, {}).get("cam_id")
+        else:
+            switch_target_camera_id = NATIVE_VIEWPORT_CAMERA_ID
+            applied_saved_view = self.apply_native_viewport_camera_config()
+            if applied_saved_view.get("applied"):
+                viewport_camera = {
+                    **applied_saved_view,
+                    "switch_policy": "restore_saved_camera_0_pose",
+                    "target_camera_id": NATIVE_VIEWPORT_CAMERA_ID,
+                }
+                used_saved_native_viewport = True
+            else:
+                set_drone_camera(env, drone_name, view_mode=normalized)
+                env.unwrapped.unrealcv.set_viewport(drone_name)
+                viewport_camera = sync_native_viewport_to_drone_camera(env, drone_name)
+                viewport_camera["switch_policy"] = "fallback_sync_drone_third_person_to_camera_0"
+                viewport_camera["target_camera_id"] = NATIVE_VIEWPORT_CAMERA_ID
+        self.camera_view_mode = normalized
+        self.last_action = f"camera_view_{normalized}"
+        state = self.get_state(message=f"Camera view={normalized}")
+        state["native_viewport_camera"] = viewport_camera
+        state["camera_switch_target_camera_id"] = switch_target_camera_id
+        state["camera_switch_used_saved_native_viewport"] = used_saved_native_viewport
+        return state
+
+    def toggle_camera_view_mode(self) -> Dict[str, Any]:
+        next_mode = (
+            CAMERA_VIEW_THIRD_PERSON
+            if self.camera_view_mode == CAMERA_VIEW_FIRST_PERSON
+            else CAMERA_VIEW_FIRST_PERSON
+        )
+        state = self.set_camera_view_mode(next_mode)
+        state["camera_toggle_key"] = "z"
+        state["camera_toggle_target"] = next_mode
+        return state
+
+    def first_person_camera_state(self) -> Dict[str, Any]:
+        if not self.started:
+            default_loc = [0.0, 0.0, 0.0]
+            default_rot = [0.0, 0.0, 0.0]
+        else:
+            env, drone_name = self.require_started()
+            default_loc, default_rot = default_drone_camera_relative_pose(env, drone_name)
+        loc = list(self.first_person_camera_location) if self.first_person_camera_location is not None else list(default_loc)
+        rot = list(self.first_person_camera_rotation) if self.first_person_camera_rotation is not None else list(default_rot)
+        config_path = self.first_person_camera_config_path()
+        return {
+            "default_location": default_loc,
+            "default_rotation": default_rot,
+            "relative_location": loc,
+            "relative_rotation": rot,
+            "has_override": self.first_person_camera_location is not None or self.first_person_camera_rotation is not None,
+            "config_path": str(config_path),
+            "config_exists": config_path.exists(),
+        }
+
+    def first_person_camera_config_path(self) -> Path:
+        return resolve_project_output_path(
+            getattr(self.args, "first_person_camera_config", DEFAULT_FIRST_PERSON_CAMERA_CONFIG),
+            DEFAULT_FIRST_PERSON_CAMERA_CONFIG,
+        )
+
+    def native_viewport_camera_config_path(self) -> Path:
+        return resolve_project_output_path(
+            getattr(self.args, "native_viewport_camera_config", DEFAULT_NATIVE_VIEWPORT_CAMERA_CONFIG),
+            DEFAULT_NATIVE_VIEWPORT_CAMERA_CONFIG,
+        )
+
+    def load_first_person_camera_config(self, *, apply: bool = False) -> Dict[str, Any]:
+        path = self.first_person_camera_config_path()
+        payload = read_json_file(path)
+        if not payload:
+            result = {"loaded": False, "path": str(path), "reason": "missing"}
+            self.last_first_person_camera_config = result
+            return result
+        if payload.get("error"):
+            result = {"loaded": False, "path": str(path), "error": payload.get("error")}
+            self.last_first_person_camera_config = result
+            return result
+        try:
+            default_loc = [0.0, 0.0, 0.0]
+            default_rot = [0.0, 0.0, 0.0]
+            if self.started:
+                env, drone_name = self.require_started()
+                default_loc, default_rot = default_drone_camera_relative_pose(env, drone_name)
+            rel_loc = _camera_triplet(payload.get("relative_location"), default_loc)
+            rel_rot = _camera_triplet(payload.get("relative_rotation"), default_rot)
+        except Exception as exc:
+            result = {"loaded": False, "path": str(path), "error": str(exc)}
+            self.last_first_person_camera_config = result
+            return result
+        self.first_person_camera_location = rel_loc
+        self.first_person_camera_rotation = rel_rot
+        applied = False
+        if apply and self.started:
+            env, drone_name = self.require_started()
+            set_drone_first_person_camera(env, drone_name, relative_location=rel_loc, relative_rotation=rel_rot)
+            applied = True
+        result = {
+            "loaded": True,
+            "applied": applied,
+            "path": str(path),
+            "relative_location": rel_loc,
+            "relative_rotation": rel_rot,
+            "camera_id": payload.get("camera_id"),
+            "saved_at": payload.get("saved_at", ""),
+        }
+        self.last_first_person_camera_config = result
+        return result
+
+    def save_first_person_camera_config(self) -> Dict[str, Any]:
+        env, drone_name = self.require_started()
+        path = self.first_person_camera_config_path()
+        cam_id = env.unwrapped.agents.get(drone_name, {}).get("cam_id")
+        try:
+            saved_cam_id: Any = int(cam_id)
+        except Exception:
+            saved_cam_id = cam_id
+        default_loc, default_rot = default_drone_camera_relative_pose(env, drone_name)
+        rel_loc = list(self.first_person_camera_location) if self.first_person_camera_location is not None else default_loc
+        rel_rot = list(self.first_person_camera_rotation) if self.first_person_camera_rotation is not None else default_rot
+        payload = {
+            "schema_version": 1,
+            "camera_role": "drone_front",
+            "camera_id": saved_cam_id,
+            "drone_name": drone_name,
+            "relative_location": [float(value) for value in rel_loc[:3]],
+            "relative_rotation": [float(value) for value in rel_rot[:3]],
+            "saved_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        write_json_file(path, payload)
+        result = {"saved": True, "path": str(path), **payload}
+        self.last_first_person_camera_config = result
+        return result
+
+    @serialized_unrealcv_method
+    def save_first_person_camera_config_state(self) -> Dict[str, Any]:
+        result = self.save_first_person_camera_config()
+        state = self.get_state(message=f"Saved FPV camera config: {result.get('path')}")
+        state["first_person_camera_config"] = result
+        state["camera_debug"] = self.get_camera_debug_info()
+        return state
+
+    def delete_first_person_camera_config(self) -> Dict[str, Any]:
+        path = self.first_person_camera_config_path()
+        deleted = False
+        try:
+            if path.exists():
+                path.unlink()
+                deleted = True
+        except Exception as exc:
+            return {"deleted": False, "path": str(path), "error": str(exc)}
+        result = {"deleted": deleted, "path": str(path)}
+        self.last_first_person_camera_config = result
+        return result
+
+    def load_native_viewport_camera_config(self) -> Dict[str, Any]:
+        path = self.native_viewport_camera_config_path()
+        payload = read_json_file(path)
+        if not payload:
+            result = {"loaded": False, "path": str(path), "reason": "missing"}
+            self.last_native_viewport_camera_config = result
+            return result
+        if payload.get("error"):
+            result = {"loaded": False, "path": str(path), "error": payload.get("error")}
+            self.last_native_viewport_camera_config = result
+            return result
+        try:
+            camera_id = int(payload.get("camera_id", NATIVE_VIEWPORT_CAMERA_ID))
+            location = _camera_triplet(payload.get("location"), [0.0, 0.0, 0.0])
+            rotation = _camera_triplet(payload.get("rotation"), [0.0, 0.0, 0.0])
+        except Exception as exc:
+            result = {"loaded": False, "path": str(path), "error": str(exc)}
+            self.last_native_viewport_camera_config = result
+            return result
+        result = {
+            "loaded": True,
+            "path": str(path),
+            "camera_id": camera_id,
+            "location": location,
+            "rotation": rotation,
+            "fov": str(payload.get("fov", "")),
+            "saved_at": payload.get("saved_at", ""),
+        }
+        self.last_native_viewport_camera_config = result
+        return result
+
+    def apply_native_viewport_camera_config(self) -> Dict[str, Any]:
+        env, _drone_name = self.require_started()
+        config = self.load_native_viewport_camera_config()
+        if not config.get("loaded"):
+            return {"applied": False, **config}
+        applied = apply_camera_world_pose(env, config, default_camera_id=NATIVE_VIEWPORT_CAMERA_ID)
+        result = {**config, **applied, "applied": True}
+        self.last_native_viewport_camera_config = result
+        return result
+
+    @serialized_unrealcv_method
+    def apply_native_viewport_camera_config_state(self) -> Dict[str, Any]:
+        result = self.apply_native_viewport_camera_config()
+        if result.get("applied"):
+            self.camera_view_mode = CAMERA_VIEW_THIRD_PERSON
+            self.last_action = "native_viewport_camera_apply"
+        state = self.get_state(
+            message=(
+                f"Applied saved UE window camera 0 view: {result.get('path')}"
+                if result.get("applied")
+                else f"No saved UE window camera 0 view: {result.get('path')}"
+            )
+        )
+        state["native_viewport_camera_config"] = result
+        state["camera_debug"] = self.get_camera_debug_info()
+        return state
+
+    @serialized_unrealcv_method
+    def save_native_viewport_camera_config(self) -> Dict[str, Any]:
+        env, drone_name = self.require_started()
+        path = self.native_viewport_camera_config_path()
+        pose = read_camera_world_pose(env, NATIVE_VIEWPORT_CAMERA_ID)
+        pose.update(
+            {
+                "schema_version": 1,
+                "camera_role": "native_viewport",
+                "drone_name": drone_name,
+                "saved_at": datetime.now().isoformat(timespec="milliseconds"),
+            }
+        )
+        write_json_file(path, pose)
+        result = {"saved": True, "path": str(path), **pose}
+        self.last_native_viewport_camera_config = result
+        state = self.get_state(message=f"Saved UE window camera 0 view: {path}")
+        state["native_viewport_camera_config"] = result
+        state["camera_debug"] = self.get_camera_debug_info()
+        return state
+
+    @serialized_unrealcv_method
+    def get_camera_debug_info(self) -> Dict[str, Any]:
+        env, drone_name = self.require_started()
+        debug = drone_camera_debug_info(env, drone_name)
+        debug["camera_view_mode"] = self.camera_view_mode
+        debug["first_person_camera"] = self.first_person_camera_state()
+        fpv_path = self.first_person_camera_config_path()
+        native_path = self.native_viewport_camera_config_path()
+        debug["first_person_camera_config_path"] = str(fpv_path)
+        debug["first_person_camera_config_exists"] = fpv_path.exists()
+        debug["native_viewport_camera_config_path"] = str(native_path)
+        debug["native_viewport_camera_config_exists"] = native_path.exists()
+        debug["last_first_person_camera_config"] = self.last_first_person_camera_config
+        debug["last_native_viewport_camera_config"] = self.last_native_viewport_camera_config
+        return debug
+
+    @serialized_unrealcv_method
+    def set_first_person_camera(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        env, drone_name = self.require_started()
+        default_loc, default_rot = default_drone_camera_relative_pose(env, drone_name)
+        rel_loc = _camera_triplet(payload.get("relative_location", payload.get("location")), default_loc)
+        rel_rot = _camera_triplet(payload.get("relative_rotation", payload.get("rotation")), default_rot)
+        self.first_person_camera_location = rel_loc
+        self.first_person_camera_rotation = rel_rot
+        applied_loc, applied_rot = set_drone_first_person_camera(
+            env,
+            drone_name,
+            relative_location=self.first_person_camera_location,
+            relative_rotation=self.first_person_camera_rotation,
+        )
+        self.last_action = "first_person_camera_set"
+        saved_config = self.save_first_person_camera_config()
+        state = self.get_state(message=f"FPV first-person camera loc={applied_loc} rot={applied_rot}")
+        state["applied_camera_role"] = "drone_front_camera"
+        state["first_person_camera_config"] = saved_config
+        state["camera_debug"] = self.get_camera_debug_info()
+        return state
+
+    @serialized_unrealcv_method
+    def reset_first_person_camera(self) -> Dict[str, Any]:
+        env, drone_name = self.require_started()
+        self.first_person_camera_location = None
+        self.first_person_camera_rotation = None
+        applied_loc, applied_rot = set_drone_first_person_camera(env, drone_name)
+        self.last_action = "first_person_camera_reset"
+        deleted_config = self.delete_first_person_camera_config()
+        state = self.get_state(message=f"FPV first-person camera reset loc={applied_loc} rot={applied_rot}")
+        state["applied_camera_role"] = "drone_front_camera"
+        state["first_person_camera_config"] = deleted_config
+        state["camera_debug"] = self.get_camera_debug_info()
+        return state
+
+    def sync_active_camera_view(self, env: Any, drone_name: str) -> Dict[str, Any]:
+        set_drone_camera(
+            env,
+            drone_name,
+            view_mode=self.camera_view_mode,
+            first_person_location=self.first_person_camera_location,
+            first_person_rotation=self.first_person_camera_rotation,
+        )
+        return sync_native_viewport_to_drone_camera(env, drone_name)
+
+    @serialized_unrealcv_method
+    def sync_first_person_viewport(self) -> Dict[str, Any]:
+        env, drone_name = self.require_started()
+        applied_loc, applied_rot = set_drone_first_person_camera(
+            env,
+            drone_name,
+            relative_location=self.first_person_camera_location,
+            relative_rotation=self.first_person_camera_rotation,
+        )
+        env.unwrapped.unrealcv.set_viewport(drone_name)
+        viewport_camera = sync_native_viewport_to_drone_camera(env, drone_name)
+        self.camera_view_mode = CAMERA_VIEW_FIRST_PERSON
+        self.last_action = "first_person_viewport_sync"
+        state = self.get_state(message=f"UE window synced to FPV camera loc={applied_loc} rot={applied_rot}")
+        state["applied_camera_view_mode"] = CAMERA_VIEW_FIRST_PERSON
+        state["native_viewport_camera"] = viewport_camera
+        state["camera_debug"] = self.get_camera_debug_info()
+        return state
 
     def get_pose_list(self) -> List[float]:
         with self.api_lock:
@@ -2951,6 +3548,8 @@ class DroneFlightSession:
                 "pose_error": error,
                 "movement_enabled": self.movement_enabled,
                 "movement_mode": self.movement_mode,
+                "camera_view_mode": self.camera_view_mode,
+                "first_person_camera": self.first_person_camera_state(),
                 "last_action": self.last_action,
                 "step_count": self.total_step,
                 "run_dir": str(self.run_dir) if self.run_dir is not None else "",
