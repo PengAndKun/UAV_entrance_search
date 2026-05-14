@@ -5,10 +5,18 @@ from .analysis_control import AnalysisControlMixin
 from .flight_control import FlightControlMixin
 from .lidar_analysis_control import LidarAnalysisControlMixin
 from .map_control import MapControlMixin
+from .obstacle_avoidance_control import ObstacleAvoidanceControlMixin
 from .route_control import RouteControlMixin
 
 
-class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin, AnalysisControlMixin, LidarAnalysisControlMixin):
+class RunDroneFlightPanel(
+    FlightControlMixin,
+    MapControlMixin,
+    RouteControlMixin,
+    AnalysisControlMixin,
+    LidarAnalysisControlMixin,
+    ObstacleAvoidanceControlMixin,
+):
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.session: Optional[flight.DroneFlightSession] = None
@@ -155,6 +163,13 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.lidar_stream_analysis_status_var = tk.StringVar(value="Lidar Analysis: idle")
         self.stream_player_status_var = tk.StringVar(value="Stream Player: idle")
         self.stream_player_image_mode_var = tk.StringVar(value="rgb")
+        self.obstacle_avoidance_data_dir_var = tk.StringVar(value=str(PROJECT_ROOT / "obstacle_avoidance_data"))
+        self.obstacle_avoidance_session_var = tk.StringVar(value="obstacle_avoidance")
+        self.obstacle_avoidance_interval_s_var = tk.StringVar(value="0.5")
+        self.obstacle_avoidance_risk_var = tk.StringVar(value="SAFE")
+        self.obstacle_avoidance_expert_action_var = tk.StringVar(value="hold")
+        self.obstacle_avoidance_collision_var = tk.BooleanVar(value=False)
+        self.obstacle_avoidance_status_var = tk.StringVar(value="Obstacle Avoidance: idle")
         self.stream_analysis_status_var = tk.StringVar(value="Analysis: idle")
         self.stream_analysis_stream_dir_var = tk.StringVar(value="")
         self.stream_analysis_weights_var = tk.StringVar(value="")
@@ -235,6 +250,13 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.lidar_analysis_rebuild_thread: Optional[threading.Thread] = None
         self.lidar_analysis_export_thread: Optional[threading.Thread] = None
         self.lidar_analysis_open3d_thread: Optional[threading.Thread] = None
+        self.obstacle_avoidance_window: Optional[tk.Toplevel] = None
+        self.obstacle_avoidance_report_text: Optional[tk.Text] = None
+        self.obstacle_avoidance_capture_thread: Optional[threading.Thread] = None
+        self.obstacle_avoidance_task_thread: Optional[threading.Thread] = None
+        self.obstacle_avoidance_stop_event = threading.Event()
+        self.obstacle_avoidance_session_dir: Optional[Path] = None
+        self.obstacle_avoidance_frame_index = 0
         self.map_window: Optional[tk.Toplevel] = None
         self.map_widget: Optional[OverheadMapWidget] = None
         self.map_refresh_inflight = False
@@ -657,6 +679,7 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         tk.Button(stream, text="Open Player", command=self.open_stream_player_window).grid(row=1, column=2, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Play Latest", command=self.play_latest_stream_capture).grid(row=1, column=3, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Analyze Stream", command=self.open_stream_analysis_window).grid(row=1, column=4, sticky="w", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Obstacle Avoidance", command=self.open_obstacle_avoidance_window).grid(row=1, column=5, columnspan=2, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Start Lidar Capture", command=self.on_start_lidar_stream_capture).grid(row=2, column=0, padx=6, pady=(0, 6))
         tk.Button(stream, text="Stop Lidar Capture", command=self.on_stop_lidar_stream_capture).grid(row=2, column=1, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Analyze Lidar", command=self.open_lidar_analysis_window).grid(row=2, column=2, sticky="w", padx=6, pady=(0, 6))
@@ -1648,6 +1671,14 @@ class RunDroneFlightPanel(FlightControlMixin, MapControlMixin, RouteControlMixin
         self.close_lidar_analysis_window()
         self.stream_capture_stop_event.set()
         self.lidar_stream_capture_stop_event.set()
+        self.obstacle_avoidance_stop_event.set()
+        if self.obstacle_avoidance_window is not None:
+            try:
+                self.obstacle_avoidance_window.destroy()
+            except Exception:
+                pass
+            self.obstacle_avoidance_window = None
+            self.obstacle_avoidance_report_text = None
         self.sequence_stop_event.set()
         self.route_stop_event.set()
         session = self.session

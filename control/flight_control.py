@@ -20,6 +20,9 @@ class FlightControlMixin:
         self.stop_keyboard_control(send_hold=False)
         self.stream_capture_stop_event.set()
         self.lidar_stream_capture_stop_event.set()
+        obstacle_stop_event = getattr(self, "obstacle_avoidance_stop_event", None)
+        if obstacle_stop_event is not None:
+            obstacle_stop_event.set()
         self.route_stop_event.set()
         route3_stop_event = getattr(self, "llm_route3_stop_event", None)
         if route3_stop_event is not None:
