@@ -5,6 +5,8 @@ from .analysis_control import AnalysisControlMixin
 from .flight_control import FlightControlMixin
 from .lidar_analysis_control import LidarAnalysisControlMixin
 from .map_control import MapControlMixin
+from .obstacle_avoidance_2_control import ObstacleAvoidance2ControlMixin
+from .obstacle_avoidance_llm_control import ObstacleAvoidanceLLMControlMixin
 from .obstacle_avoidance_control import ObstacleAvoidanceControlMixin
 from .route_control import RouteControlMixin
 
@@ -16,6 +18,8 @@ class RunDroneFlightPanel(
     AnalysisControlMixin,
     LidarAnalysisControlMixin,
     ObstacleAvoidanceControlMixin,
+    ObstacleAvoidance2ControlMixin,
+    ObstacleAvoidanceLLMControlMixin,
 ):
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -174,10 +178,47 @@ class RunDroneFlightPanel(
         self.obstacle_avoidance_data_dir_var = tk.StringVar(value=str(PROJECT_ROOT / "obstacle_avoidance_data"))
         self.obstacle_avoidance_session_var = tk.StringVar(value="obstacle_avoidance")
         self.obstacle_avoidance_interval_s_var = tk.StringVar(value="0.5")
+        self.obstacle_avoidance_stage_var = tk.StringVar(value="manual_expert")
+        self.obstacle_avoidance_scenario_var = tk.StringVar(value="S0")
+        self.obstacle_avoidance_method_var = tk.StringVar(value="manual_keyboard")
+        self.obstacle_avoidance_run_id_var = tk.StringVar(value="001")
+        self.obstacle_avoidance_geometry_label_var = tk.StringVar(value="unknown")
+        self.obstacle_avoidance_operator_note_var = tk.StringVar(value="")
         self.obstacle_avoidance_risk_var = tk.StringVar(value="SAFE")
         self.obstacle_avoidance_expert_action_var = tk.StringVar(value="hold")
         self.obstacle_avoidance_collision_var = tk.BooleanVar(value=False)
         self.obstacle_avoidance_status_var = tk.StringVar(value="Obstacle Avoidance: idle")
+        self.obstacle_plan_json_path_var = tk.StringVar(
+            value=str(PROJECT_ROOT / "obstacle_avoidance_data" / "plans" / "obstacle_avoidance_plans.json")
+        )
+        self.obstacle_plan_project_var = tk.StringVar(value="default_route_episodes")
+        self.obstacle_plan_project_name_var = tk.StringVar(value="Default 10 route episodes")
+        self.obstacle_plan_environment_var = tk.StringVar(value="default_unreal_scene")
+        self.obstacle_plan_method_var = tk.StringVar(value="geometry_rule_v0")
+        self.obstacle_plan_selected_episode_var = tk.StringVar(value="")
+        self.obstacle_plan_runner_status_var = tk.StringVar(value="Plan runner: idle")
+        self.obstacle_plan_episode_enabled_var = tk.BooleanVar(value=True)
+        self.obstacle_plan_start_pose_var = tk.StringVar(value="")
+        self.obstacle_plan_goal_pose_var = tk.StringVar(value="")
+        self.obstacle_plan_scenario_var = tk.StringVar(value="")
+        self.obstacle_plan_obstacle_hint_var = tk.StringVar(value="unknown")
+        self.obstacle_plan_operator_note_var = tk.StringVar(value="")
+        self.obstacle_avoidance_2_data_dir_var = tk.StringVar(value=str(PROJECT_ROOT / "obstacle_avoidance_2_data"))
+        self.obstacle_avoidance_2_plan_json_var = tk.StringVar(
+            value=str(PROJECT_ROOT / "obstacle_avoidance_2_data" / "plans" / "obstacle_avoidance_2_plans.json")
+        )
+        self.obstacle_avoidance_2_project_var = tk.StringVar(value="route_obstacle_collection_v2")
+        self.obstacle_avoidance_2_project_name_var = tk.StringVar(value="OA2 default route obstacle collection")
+        self.obstacle_avoidance_2_environment_var = tk.StringVar(value="default_unreal_scene")
+        self.obstacle_avoidance_2_method_var = tk.StringVar(value="geometry_rule_v0")
+        self.obstacle_avoidance_2_status_var = tk.StringVar(value="Obstacle Avoidance 2: idle")
+        self.obstacle_avoidance_2_episode_id_var = tk.StringVar(value="")
+        self.obstacle_avoidance_2_enabled_var = tk.BooleanVar(value=True)
+        self.obstacle_avoidance_2_start_pose_var = tk.StringVar(value="")
+        self.obstacle_avoidance_2_goal_pose_var = tk.StringVar(value="")
+        self.obstacle_avoidance_2_scenario_var = tk.StringVar(value="")
+        self.obstacle_avoidance_2_obstacle_hint_var = tk.StringVar(value="unknown")
+        self.obstacle_avoidance_2_note_var = tk.StringVar(value="")
         self.stream_analysis_status_var = tk.StringVar(value="Analysis: idle")
         self.stream_analysis_stream_dir_var = tk.StringVar(value="")
         self.stream_analysis_weights_var = tk.StringVar(value="")
@@ -696,7 +737,9 @@ class RunDroneFlightPanel(
         tk.Button(stream, text="Open Player", command=self.open_stream_player_window).grid(row=1, column=2, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Play Latest", command=self.play_latest_stream_capture).grid(row=1, column=3, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Analyze Stream", command=self.open_stream_analysis_window).grid(row=1, column=4, sticky="w", padx=6, pady=(0, 6))
-        tk.Button(stream, text="Obstacle Avoidance", command=self.open_obstacle_avoidance_window).grid(row=1, column=5, columnspan=2, sticky="w", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Obstacle Avoidance", command=self.open_obstacle_avoidance_window).grid(row=1, column=5, sticky="w", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Obstacle Avoidance 2", command=self.open_obstacle_avoidance_2_window).grid(row=1, column=6, sticky="w", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Obstacle Avoidance LLM", command=self.open_obstacle_avoidance_llm_window).grid(row=1, column=7, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Start Lidar Capture", command=self.on_start_lidar_stream_capture).grid(row=2, column=0, padx=6, pady=(0, 6))
         tk.Button(stream, text="Stop Lidar Capture", command=self.on_stop_lidar_stream_capture).grid(row=2, column=1, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Analyze Lidar", command=self.open_lidar_analysis_window).grid(row=2, column=2, sticky="w", padx=6, pady=(0, 6))
@@ -706,7 +749,7 @@ class RunDroneFlightPanel(
         ttk.Combobox(
             stream,
             textvariable=self.lidar_capture_processing_var,
-            values=("smooth", "full"),
+            values=("smooth", "minimal", "full"),
             state="readonly",
             width=8,
         ).grid(row=2, column=6, sticky="w", padx=(0, 8), pady=(0, 6))

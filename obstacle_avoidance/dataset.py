@@ -86,16 +86,36 @@ def build_dataset(
             collision_labels.append(collision)
             failed_labels.append(collision)
             action_vectors.append(list(metadata["action_vector"]))
+            pointcloud_summary = event.get("pointcloud_summary") if isinstance(event.get("pointcloud_summary"), dict) else {}
+            candidate_scores = event.get("candidate_action_scores") if isinstance(event.get("candidate_action_scores"), dict) else {}
             index_rows.append(
                 {
                     "dataset_row": len(index_rows),
                     "event_path": str(events_path),
                     "event_row": row_index,
+                    "session_id": event.get("session_id", events_path.parent.name),
+                    "episode_id": event.get("episode_id", ""),
+                    "episode_index": event.get("episode_index", ""),
+                    "collection_stage": event.get("collection_stage", ""),
+                    "scenario_id": event.get("scenario_id", ""),
+                    "method": event.get("method", ""),
                     "capture_dir": event.get("capture_dir", ""),
                     "rgb_path": event.get("rgb_path", ""),
                     "pointcloud_path": event.get("pointcloud_path", event.get("point_cloud_world_standard_m_npy_path", "")),
+                    "start_pose": event.get("start_pose", {}),
+                    "goal_pose": event.get("goal_pose", {}),
+                    "distance_to_goal_cm": event.get("distance_to_goal_cm", ""),
+                    "post_distance_to_goal_cm": event.get("post_distance_to_goal_cm", ""),
+                    "route_progress": event.get("route_progress", ""),
+                    "post_route_progress": event.get("post_route_progress", ""),
+                    "path_deviation_cm": event.get("path_deviation_cm", ""),
+                    "episode_outcome": event.get("episode_outcome", ""),
                     "risk_state": metadata["risk_state"],
                     "expert_action": metadata["expert_action"],
+                    "obstacle_geometry": pointcloud_summary.get("obstacle_geometry", event.get("obstacle_geometry", "")),
+                    "shield_state": event.get("shield_state", ""),
+                    "selected_action_reason": event.get("selected_action_reason", ""),
+                    "candidate_action_scores": candidate_scores,
                     "collision_state": bool(collision),
                     "avoidance_failed": bool(collision),
                 }

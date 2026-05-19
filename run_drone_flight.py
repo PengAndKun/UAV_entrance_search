@@ -74,6 +74,7 @@ DEFAULT_LIDAR_DEPTH_MIN_CM = DEFAULT_DEPTH_MIN_CM
 DEFAULT_LIDAR_DEPTH_MAX_CM = DEFAULT_DEPTH_MAX_CM
 DEFAULT_LIDAR_DEPTH_PROJECTION = "auto"
 DEFAULT_LIDAR_CAPTURE_PROCESSING = "smooth"
+LIDAR_CAPTURE_PROCESSING_MODES = {"smooth", "minimal", "full"}
 DEFAULT_LIDAR_RECON_VOXEL_CM = 8.0
 DEFAULT_LIDAR_RECON_MAX_POINTS = 500000
 DEFAULT_LIDAR_RECON_WRITE_EVERY = 5
@@ -651,8 +652,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Maximum depth in cm retained in Temp Capture Lidar point clouds")
     parser.add_argument("--lidar_depth_projection", choices=["auto", "plane", "ray"], default=DEFAULT_LIDAR_DEPTH_PROJECTION,
                         help="Depth backprojection for standard Lidar clouds; auto uses plane depth for UnrealCV depth npy")
-    parser.add_argument("--lidar_capture_processing", choices=["smooth", "full"], default=DEFAULT_LIDAR_CAPTURE_PROCESSING,
-                        help="Lidar stream processing mode: smooth stores raw frames first; full writes point clouds every frame")
+    parser.add_argument("--lidar_capture_processing", choices=sorted(LIDAR_CAPTURE_PROCESSING_MODES), default=DEFAULT_LIDAR_CAPTURE_PROCESSING,
+                        help="Lidar stream processing mode: smooth stores raw frames first; minimal stores RGB/depth sector summaries; full writes point clouds every frame")
     parser.add_argument("--force_kill_unreal_on_stop", dest="force_kill_unreal_on_stop", action="store_true",
                         default=DEFAULT_FORCE_KILL_UNREAL_ON_STOP,
                         help="Force-kill packaged Unreal processes when stopping a session")
@@ -860,6 +861,142 @@ def summarize_depth_image(
     }
 
 
+def summarize_depth_obstacle_sectors(
+    depth_image: Any,
+    *,
+    min_depth_cm: float = DEFAULT_DEPTH_MIN_CM,
+    max_depth_cm: float = DEFAULT_DEPTH_MAX_CM,
+    danger_depth_cm: float = 250.0,
+    clear_depth_cm: float = 650.0,
+) -> Dict[str, Any]:
+    depth = coerce_depth_planar_image(depth_image)
+    h, w = depth.shape[:2]
+    finite = np.isfinite(depth)
+    valid = finite & (depth >= float(min_depth_cm)) & (depth <= float(max_depth_cm))
+
+    def region(x0: float, x1: float, y0: float, y1: float) -> np.ndarray:
+        xa, xb = int(w * x0), int(w * x1)
+        ya, yb = int(h * y0), int(h * y1)
+        return depth[max(0, ya):min(h, yb), max(0, xa):min(w, xb)]
+
+    def stats(values: np.ndarray) -> Tuple[float, float, int]:
+        mask = np.isfinite(values) & (values >= float(min_depth_cm)) & (values <= float(max_depth_cm))
+        selected = values[mask]
+        if selected.size == 0:
+            return 0.0, 0.0, 0
+        return float(np.min(selected)), float(np.mean(selected)), int(selected.size)
+
+    front_region = region(0.38, 0.62, 0.34, 0.78)
+    left_region = region(0.04, 0.38, 0.28, 0.86)
+    right_region = region(0.62, 0.96, 0.28, 0.86)
+    up_region = region(0.28, 0.72, 0.04, 0.36)
+    down_region = region(0.28, 0.72, 0.64, 0.96)
+
+    front_min, front_mean, front_count = stats(front_region)
+    left_min, _left_mean, left_count = stats(left_region)
+    right_min, _right_mean, right_count = stats(right_region)
+    up_min, _up_mean, up_count = stats(up_region)
+    down_min, _down_mean, down_count = stats(down_region)
+    all_valid = depth[valid]
+    nearest = float(np.min(all_valid)) if all_valid.size else 0.0
+
+    def robust_sector_clear(values: np.ndarray, *, min_value: float) -> Tuple[bool, float, float]:
+        mask = np.isfinite(values) & (values >= float(min_depth_cm)) & (values <= float(max_depth_cm))
+        selected = values[mask]
+        if selected.size == 0 or min_value <= 0.0:
+            return True, 0.0, 0.0
+        p05 = float(np.percentile(selected, 5))
+        close_fraction = float(np.count_nonzero(selected < float(danger_depth_cm))) / float(selected.size)
+        if min_value >= float(danger_depth_cm):
+            return True, p05, close_fraction
+        # The lower front-camera sector often contains a few foreground edge
+        # pixels after overflying a fence. Treat sparse close pixels as safe for
+        # controlled descent, while preserving the raw minimum for diagnostics.
+        if p05 >= float(danger_depth_cm) and close_fraction <= 0.05 and min_value >= float(min_depth_cm) * 8.0:
+            return True, p05, close_fraction
+        return False, p05, close_fraction
+
+    def obstacle_extent_from_depth() -> Tuple[float, float, float]:
+        if front_min <= 0.0:
+            return 0.0, 0.0, 0.0
+        x0, x1 = int(w * 0.20), int(w * 0.80)
+        y0, y1 = int(h * 0.18), int(h * 0.88)
+        roi = depth[max(0, y0):min(h, y1), max(0, x0):min(w, x1)]
+        roi_valid = np.isfinite(roi) & (roi >= float(min_depth_cm)) & (roi <= float(max_depth_cm))
+        close_limit = min(float(clear_depth_cm), max(float(danger_depth_cm), front_min + 120.0))
+        obstacle = roi_valid & (roi <= close_limit)
+        if int(np.count_nonzero(obstacle)) < 12:
+            return 0.0, 0.0, 0.0
+        ys, xs = np.nonzero(obstacle)
+        depth_ref = float(np.median(roi[obstacle]))
+        if not math.isfinite(depth_ref) or depth_ref <= 0.0:
+            depth_ref = front_min
+        pixel_width = float(xs.max() - xs.min() + 1)
+        pixel_height = float(ys.max() - ys.min() + 1)
+        # Approximate standard 90 degree camera projection. These estimates are
+        # for rule selection (wide fence vs narrow tree/pole), not metric mapping.
+        view_width_cm = 2.0 * depth_ref
+        view_height_cm = 2.0 * depth_ref * (float(h) / max(1.0, float(w)))
+        width_cm = view_width_cm * pixel_width / max(1.0, float(w))
+        height_cm = view_height_cm * pixel_height / max(1.0, float(h))
+        return float(width_cm), float(height_cm), 0.0
+
+    obstacle_width_cm, obstacle_height_cm, obstacle_thickness_cm = obstacle_extent_from_depth()
+
+    def clear(value: float) -> bool:
+        return bool(value <= 0.0 or value >= float(danger_depth_cm))
+
+    down_swept_clear, down_p05_depth_cm, down_close_fraction = robust_sector_clear(down_region, min_value=down_min)
+
+    obstacle_geometry = "none"
+    if front_min > 0.0 and front_min < float(clear_depth_cm):
+        top_close = up_min > 0.0 and up_min < float(danger_depth_cm)
+        bottom_close = bool(not down_swept_clear)
+        side_count = left_count + right_count
+        sparse = front_count < max(24, int(0.015 * h * w))
+        if sparse:
+            obstacle_geometry = "thin_structure"
+        elif bottom_close and not top_close:
+            obstacle_geometry = "low_obstacle"
+        elif top_close and not bottom_close:
+            obstacle_geometry = "overhang_beam"
+        elif side_count > front_count * 0.8:
+            obstacle_geometry = "vertical_wall"
+        else:
+            obstacle_geometry = "unknown"
+
+    return {
+        "available": bool(all_valid.size),
+        "source_mode": "depth_sector_minimal",
+        "point_count": 0,
+        "front_min_depth_cm": round(front_min, 3),
+        "front_mean_depth_cm": round(front_mean, 3),
+        "corridor_count": int(front_count),
+        "left_min_depth_cm": round(left_min, 3),
+        "right_min_depth_cm": round(right_min, 3),
+        "up_min_depth_cm": round(up_min, 3),
+        "down_min_depth_cm": round(down_min, 3),
+        "nearest_distance_cm": round(nearest, 3),
+        "obstacle_geometry": obstacle_geometry,
+        "obstacle_width_cm": round(obstacle_width_cm, 3),
+        "obstacle_height_cm": round(obstacle_height_cm, 3),
+        "obstacle_thickness_cm": round(obstacle_thickness_cm, 3),
+        "left_swept_clear": clear(left_min),
+        "right_swept_clear": clear(right_min),
+        "up_swept_clear": clear(up_min),
+        "down_swept_clear": bool(down_swept_clear),
+        "forward_swept_clear": clear(front_min),
+        "backoff_swept_clear": True,
+        "local_map_age_ms": 0,
+        "image_width": int(w),
+        "image_height": int(h),
+        "valid_depth_count": int(all_valid.size),
+        "invalid_depth_count": int(depth.size - int(np.count_nonzero(valid))),
+        "down_p05_depth_cm": round(down_p05_depth_cm, 3),
+        "down_close_fraction": round(down_close_fraction, 5),
+    }
+
+
 def render_depth_preview(
     depth_image: Any,
     *,
@@ -962,7 +1099,7 @@ def normalize_lidar_depth_projection(value: Any) -> str:
 
 def normalize_lidar_capture_processing(value: Any) -> str:
     mode = str(value or DEFAULT_LIDAR_CAPTURE_PROCESSING).strip().lower()
-    if mode not in {"smooth", "full"}:
+    if mode not in LIDAR_CAPTURE_PROCESSING_MODES:
         return DEFAULT_LIDAR_CAPTURE_PROCESSING
     return mode
 
@@ -1163,6 +1300,115 @@ def build_standard_point_clouds_from_depth(
         }
     )
     return camera_cloud_standard_m, world_cloud_standard_m, base_summary
+
+
+def build_pixel_aligned_standard_point_cloud_products(
+    rgb_image: np.ndarray,
+    depth_image: Any,
+    camera_cloud_standard_m: np.ndarray,
+    standard_summary: Dict[str, Any],
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    depth_cm = coerce_depth_planar_image(depth_image)
+    h, w = depth_cm.shape[:2]
+    rgb = np.asarray(rgb_image)
+    if rgb.ndim != 3 or rgb.shape[2] < 3:
+        raise ValueError(f"RGB image must be HxWx3, got shape {rgb.shape}")
+    rgb_resized = False
+    if rgb.shape[0] != h or rgb.shape[1] != w:
+        rgb = cv2.resize(rgb[:, :, :3], (w, h), interpolation=cv2.INTER_LINEAR)
+        rgb_resized = True
+    else:
+        rgb = rgb[:, :, :3]
+
+    min_depth = float(standard_summary.get("min_depth_cm", DEFAULT_LIDAR_DEPTH_MIN_CM))
+    max_depth = float(standard_summary.get("max_depth_cm", DEFAULT_LIDAR_DEPTH_MAX_CM))
+    if not math.isfinite(max_depth) or max_depth <= min_depth:
+        max_depth = DEFAULT_LIDAR_DEPTH_MAX_CM
+    valid = np.isfinite(depth_cm) & (depth_cm >= min_depth) & (depth_cm <= max_depth)
+    valid_count = int(np.count_nonzero(valid))
+    camera_points = np.asarray(camera_cloud_standard_m, dtype=np.float32)
+    if camera_points.ndim != 2 or camera_points.shape[1] != 6:
+        camera_points = np.zeros((0, 6), dtype=np.float32)
+    if camera_points.shape[0] != valid_count:
+        usable = min(camera_points.shape[0], valid_count)
+        valid_flat_indices = np.flatnonzero(valid)
+        valid = np.zeros_like(valid, dtype=bool)
+        if usable > 0:
+            valid.reshape(-1)[valid_flat_indices[:usable]] = True
+        camera_points = camera_points[:usable]
+        valid_count = usable
+
+    aligned_image = np.full((h, w, 6), np.nan, dtype=np.float32)
+    aligned_image[:, :, 3:6] = np.clip(rgb.astype(np.float32), 0.0, 255.0)
+    if valid_count > 0:
+        aligned_image[valid, :] = camera_points
+    ys, xs = np.indices((h, w), dtype=np.float32)
+    if valid_count > 0:
+        pixel_cloud = np.column_stack((xs[valid], ys[valid], camera_points)).astype(np.float32, copy=False)
+    else:
+        pixel_cloud = np.zeros((0, 8), dtype=np.float32)
+
+    return aligned_image, pixel_cloud, {
+        "available": bool(valid_count > 0),
+        "alignment_mode": "rgb_depth_pixel_backprojection",
+        "pixel_coordinate_frame": "image_uv",
+        "point_coordinate_frame": "camera_standard_m",
+        "coordinate_units": "m",
+        "image_width": int(w),
+        "image_height": int(h),
+        "valid_pixel_count": int(valid_count),
+        "invalid_pixel_count": int(h * w - valid_count),
+        "rgb_resized_for_depth": bool(rgb_resized),
+        "aligned_image_shape": [int(v) for v in aligned_image.shape],
+        "pixel_cloud_shape": [int(v) for v in pixel_cloud.shape],
+        "depth_projection_selected": standard_summary.get("depth_projection_selected", standard_summary.get("depth_projection", "")),
+    }
+
+
+def render_rgb_depth_alignment_preview(
+    rgb_image: np.ndarray,
+    depth_image: Any,
+    *,
+    min_depth_cm: float = DEFAULT_LIDAR_DEPTH_MIN_CM,
+    max_depth_cm: float = DEFAULT_LIDAR_DEPTH_MAX_CM,
+) -> np.ndarray:
+    depth = coerce_depth_planar_image(depth_image)
+    h, w = depth.shape[:2]
+    rgb = np.asarray(rgb_image)
+    if rgb.ndim != 3 or rgb.shape[2] < 3:
+        canvas = np.zeros((h, w, 3), dtype=np.uint8)
+        canvas[:] = (12, 14, 18)
+        return canvas
+    if rgb.shape[0] != h or rgb.shape[1] != w:
+        rgb = cv2.resize(rgb[:, :, :3], (w, h), interpolation=cv2.INTER_LINEAR)
+    else:
+        rgb = rgb[:, :, :3]
+    rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8, copy=False)
+
+    preview_min = max(0.0, float(min_depth_cm))
+    preview_max = float(max_depth_cm)
+    if not math.isfinite(preview_max) or preview_max <= preview_min:
+        finite = depth[np.isfinite(depth)]
+        preview_max = float(np.max(finite)) if finite.size else preview_min + 1.0
+    valid = np.isfinite(depth) & (depth >= preview_min) & (depth <= preview_max)
+    clipped = np.clip(np.nan_to_num(depth, nan=preview_max, posinf=preview_max, neginf=preview_min), preview_min, preview_max)
+    normalized = 1.0 - ((clipped - preview_min) / max(1e-6, preview_max - preview_min))
+    depth_u8 = np.clip(normalized * 255.0, 0.0, 255.0).astype(np.uint8)
+    depth_color = cv2.cvtColor(cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO), cv2.COLOR_BGR2RGB)
+    overlay = rgb_u8.copy()
+    overlay[valid] = np.clip(0.55 * rgb_u8[valid].astype(np.float32) + 0.45 * depth_color[valid].astype(np.float32), 0, 255).astype(np.uint8)
+    overlay[~valid] = (0.45 * rgb_u8[~valid]).astype(np.uint8)
+    cv2.putText(
+        overlay,
+        "RGB + depth aligned pixels",
+        (12, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (245, 245, 245),
+        1,
+        cv2.LINE_AA,
+    )
+    return overlay
 
 
 def build_colored_point_clouds_from_depth(
@@ -1730,6 +1976,12 @@ def save_lidar_capture_outputs(
         max_depth_cm=max_depth_cm,
         lidar_depth_projection=lidar_depth_projection,
     )
+    aligned_image, aligned_pixel_cloud, alignment_summary = build_pixel_aligned_standard_point_cloud_products(
+        rgb_image,
+        depth_image,
+        camera_standard_m,
+        standard_summary,
+    )
     camera_npy_path = output_dir / "point_cloud_camera.npy"
     world_npy_path = output_dir / "point_cloud_world.npy"
     camera_ply_path = output_dir / "point_cloud_camera.ply"
@@ -1738,7 +1990,10 @@ def save_lidar_capture_outputs(
     world_standard_m_npy_path = output_dir / "point_cloud_world_standard_m.npy"
     camera_standard_m_ply_path = output_dir / "point_cloud_camera_standard_m.ply"
     world_standard_m_ply_path = output_dir / "point_cloud_world_standard_m.ply"
+    aligned_image_npy_path = output_dir / "point_cloud_image_aligned_standard_m.npy"
+    aligned_pixels_npy_path = output_dir / "point_cloud_pixels_aligned_standard_m.npy"
     preview_path = output_dir / "point_cloud_preview.png"
+    alignment_preview_path = output_dir / "rgb_depth_alignment_preview.png"
     camera_info_path = output_dir / "camera_info.json"
     diagnostics_path = output_dir / "projection_diagnostics.json"
 
@@ -1746,6 +2001,8 @@ def save_lidar_capture_outputs(
     np.save(world_npy_path, world_cloud)
     np.save(camera_standard_m_npy_path, camera_standard_m)
     np.save(world_standard_m_npy_path, world_standard_m)
+    np.save(aligned_image_npy_path, aligned_image)
+    np.save(aligned_pixels_npy_path, aligned_pixel_cloud)
     write_colored_point_cloud_ply(camera_ply_path, camera_cloud)
     write_colored_point_cloud_ply(world_ply_path, world_cloud)
     write_colored_point_cloud_ply(camera_standard_m_ply_path, camera_standard_m)
@@ -1756,6 +2013,14 @@ def save_lidar_capture_outputs(
             title="Point cloud preview: standard camera meters",
         )
     ).save(preview_path)
+    Image.fromarray(
+        render_rgb_depth_alignment_preview(
+            rgb_image,
+            depth_image,
+            min_depth_cm=min_depth_cm,
+            max_depth_cm=max_depth_cm,
+        )
+    ).save(alignment_preview_path)
     try:
         open3d_dir = output_dir / "open3d"
         camera_open3d_outputs = save_open3d_point_cloud_outputs(
@@ -1825,6 +2090,7 @@ def save_lidar_capture_outputs(
         "standard_camera_m_stats": point_cloud_xyz_stats(camera_standard_m),
         "standard_world_m_stats": point_cloud_xyz_stats(world_standard_m),
         "projection_comparison": standard_summary.get("projection_comparison", {}),
+        "pointcloud_alignment": alignment_summary,
         "coordinate_conventions": standard_summary.get("coordinate_conventions", {}),
     }
     diagnostics_path.write_text(json.dumps(diagnostics_payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1846,6 +2112,7 @@ def save_lidar_capture_outputs(
             "projection_corrected": True,
             "coordinate_frame": "standard_zup",
             "coordinate_units": "m",
+            "pointcloud_alignment": alignment_summary,
             "coordinate_conventions": {
                 "camera_legacy": "CV: x right, y down, z forward; units cm",
                 "world_legacy": "Unreal world coordinates; units cm",
@@ -1865,7 +2132,10 @@ def save_lidar_capture_outputs(
         "point_cloud_world_standard_m_npy_path": str(world_standard_m_npy_path),
         "point_cloud_camera_standard_m_ply_path": str(camera_standard_m_ply_path),
         "point_cloud_world_standard_m_ply_path": str(world_standard_m_ply_path),
+        "point_cloud_image_aligned_standard_m_npy_path": str(aligned_image_npy_path),
+        "point_cloud_pixels_aligned_standard_m_npy_path": str(aligned_pixels_npy_path),
         "point_cloud_preview_path": str(preview_path),
+        "rgb_depth_alignment_preview_path": str(alignment_preview_path),
         "camera_info_path": str(camera_info_path),
         "projection_diagnostics_path": str(diagnostics_path),
         "open3d_camera": camera_open3d_outputs,
@@ -1873,6 +2143,7 @@ def save_lidar_capture_outputs(
         "open3d_camera_standard_m": camera_standard_open3d_outputs,
         "open3d_world_standard_m": world_standard_open3d_outputs,
         "point_count": int(standard_summary["point_count"]),
+        "aligned_valid_pixel_count": int(alignment_summary["valid_pixel_count"]),
         "legacy_point_count": int(summary["point_count"]),
         "invalid_depth_count": int(standard_summary["invalid_depth_count"]),
         "source_mode": "depth_backprojected_lidar",
@@ -1885,6 +2156,7 @@ def save_lidar_capture_outputs(
         "depth_projection_requested": standard_summary["depth_projection_requested"],
         "depth_projection_selected": standard_summary["depth_projection_selected"],
         "projection_corrected": True,
+        "pointcloud_alignment": alignment_summary,
         "coordinate_frame": "standard_zup",
         "coordinate_units": "m",
     }
@@ -4076,6 +4348,7 @@ class DroneFlightSession:
         extra_pose: Optional[Dict[str, Any]] = None,
         controller_action: Optional[Dict[str, Any]] = None,
         raw_capture_only: bool = False,
+        minimal_capture: bool = False,
     ) -> Dict[str, Any]:
         capture_dir.mkdir(parents=True, exist_ok=True)
         rgb = read_drone_observation(env, drone_name)
@@ -4111,7 +4384,47 @@ class DroneFlightSession:
             max_depth_cm=float(getattr(self.args, "lidar_depth_max_cm", DEFAULT_LIDAR_DEPTH_MAX_CM)),
         )
         camera_info = read_drone_camera_info(env, drone_name, rgb=rgb_image, depth=depth)
-        if raw_capture_only:
+        if minimal_capture:
+            camera_info_payload = dict(camera_info)
+            depth_obstacle_summary = summarize_depth_obstacle_sectors(
+                depth,
+                min_depth_cm=float(getattr(self.args, "lidar_depth_min_cm", DEFAULT_LIDAR_DEPTH_MIN_CM)),
+                max_depth_cm=float(getattr(self.args, "lidar_depth_max_cm", DEFAULT_LIDAR_DEPTH_MAX_CM)),
+            )
+            camera_info_payload.update(
+                {
+                    "min_depth_cm": float(getattr(self.args, "lidar_depth_min_cm", DEFAULT_LIDAR_DEPTH_MIN_CM)),
+                    "max_depth_cm": float(getattr(self.args, "lidar_depth_max_cm", DEFAULT_LIDAR_DEPTH_MAX_CM)),
+                    "depth_input_mode": "unrealcv_depth_npy",
+                    "depth_projection_requested": str(getattr(self.args, "lidar_depth_projection", DEFAULT_LIDAR_DEPTH_PROJECTION)),
+                    "depth_projection_selected": "none_depth_sector_minimal",
+                    "coordinate_frame": "image_depth_sector",
+                    "coordinate_units": "cm",
+                }
+            )
+            camera_info_path.write_text(json.dumps(camera_info_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            lidar_outputs = {
+                "point_count": 0,
+                "invalid_depth_count": int(depth_obstacle_summary.get("invalid_depth_count", 0)),
+                "source_mode": "depth_sector_minimal",
+                "point_cloud_shape": [0, 6],
+                "min_depth_cm": float(getattr(self.args, "lidar_depth_min_cm", DEFAULT_LIDAR_DEPTH_MIN_CM)),
+                "max_depth_cm": float(getattr(self.args, "lidar_depth_max_cm", DEFAULT_LIDAR_DEPTH_MAX_CM)),
+                "depth_input_mode": "unrealcv_depth_npy",
+                "depth_projection": "none_depth_sector_minimal",
+                "depth_projection_selected": "none_depth_sector_minimal",
+                "projection_corrected": False,
+                "coordinate_frame": "image_depth_sector",
+                "coordinate_units": "cm",
+                "camera_info_path": str(camera_info_path),
+                "depth_obstacle_summary": depth_obstacle_summary,
+                "raw_capture_only": False,
+                "minimal_capture": True,
+                "postprocess_status": "minimal_done",
+                "postprocess_started_at": "",
+                "postprocess_finished_at": datetime.now().isoformat(timespec="milliseconds"),
+            }
+        elif raw_capture_only:
             camera_info_payload = dict(camera_info)
             camera_info_payload.update(
                 {
@@ -4317,6 +4630,7 @@ class DroneFlightSession:
             },
             controller_action=action_detail,
             raw_capture_only=(processing_mode == "smooth"),
+            minimal_capture=(processing_mode == "minimal"),
         )
 
     @serialized_unrealcv_method

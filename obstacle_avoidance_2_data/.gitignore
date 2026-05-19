@@ -1,0 +1,5 @@
+*
+!.gitignore
+!plans/
+plans/*
+!plans/obstacle_avoidance_2_plans.json

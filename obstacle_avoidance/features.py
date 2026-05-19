@@ -13,6 +13,25 @@ try:
 except Exception:  # pragma: no cover - keeps offline dataset tools usable in minimal envs.
     flight = None  # type: ignore[assignment]
 
+try:
+    from .geometry_v0 import CANDIDATE_ACTIONS, GEOMETRY_TYPES, score_candidate_actions, summarize_geometry_v0
+except Exception:  # pragma: no cover - feature extraction should still load for legacy datasets.
+    CANDIDATE_ACTIONS = (
+        "forward",
+        "slow_forward",
+        "left",
+        "right",
+        "up",
+        "down",
+        "backoff",
+        "hold",
+        "yaw_left",
+        "yaw_right",
+    )
+    GEOMETRY_TYPES = ("none", "vertical_wall", "overhang_beam", "low_obstacle", "thin_structure", "unknown")
+    score_candidate_actions = None  # type: ignore[assignment]
+    summarize_geometry_v0 = None  # type: ignore[assignment]
+
 
 MISSION_PHASES = (
     "IDLE",
@@ -69,7 +88,18 @@ FEATURE_NAMES: List[str] = [
     "pc_left_min_cm",
     "pc_right_min_cm",
     "pc_up_min_cm",
+    "pc_down_min_cm",
     "pc_nearest_cm",
+    "pc_obstacle_width_cm",
+    "pc_obstacle_height_cm",
+    "pc_obstacle_thickness_cm",
+    "pc_left_swept_clear",
+    "pc_right_swept_clear",
+    "pc_up_swept_clear",
+    "pc_down_swept_clear",
+    "pc_forward_swept_clear",
+    "pc_backoff_swept_clear",
+    "pc_local_map_age_ms",
     "relative_distance_cm",
     "relative_bearing_deg_body",
     "relative_dz_cm",
@@ -85,6 +115,8 @@ FEATURE_NAMES: List[str] = [
     "movement_enabled",
 ]
 FEATURE_NAMES.extend(f"phase_{phase.lower()}" for phase in MISSION_PHASES)
+FEATURE_NAMES.extend(f"geometry_{geometry}" for geometry in GEOMETRY_TYPES)
+FEATURE_NAMES.extend(f"candidate_score_{action}" for action in CANDIDATE_ACTIONS)
 
 
 def as_float(value: Any, default: float = 0.0) -> float:
@@ -115,7 +147,7 @@ def normalize_angle_deg(angle: float) -> float:
 def resolve_event_path(value: Any, *, base_dir: Optional[Path] = None) -> Path:
     text = str(value or "").strip()
     if not text:
-        return Path()
+        return Path("__missing_obstacle_avoidance_path__")
     path = Path(text).expanduser()
     if path.is_absolute():
         return path
@@ -153,7 +185,7 @@ def first_existing_path(event: Dict[str, Any], keys: Iterable[str], *, base_dir:
                 candidate = capture_dir / fallback_name
                 if candidate.exists():
                     return candidate
-    return Path()
+    return Path("__missing_obstacle_avoidance_path__")
 
 
 def summarize_rgb(event: Dict[str, Any], *, base_dir: Optional[Path] = None) -> Dict[str, float]:
@@ -274,36 +306,100 @@ def cloud_xyz_unreal_cm(path: Path, event: Dict[str, Any]) -> np.ndarray:
     cloud = np.load(path)
     if cloud.ndim != 2 or cloud.shape[1] < 3:
         return np.zeros((0, 3), dtype=np.float32)
+    if cloud.shape[0] > 200_000:
+        stride = max(1, int(math.ceil(cloud.shape[0] / 200_000)))
+        cloud = cloud[::stride]
     xyz = cloud[:, :3].astype(np.float32, copy=False)
-    if xyz.shape[0] > 200_000:
-        stride = max(1, int(math.ceil(xyz.shape[0] / 200_000)))
-        xyz = xyz[::stride]
     units = str(event.get("coordinate_units", "") or "").lower()
     is_standard_m = "standard_m" in path.name.lower() or units == "m"
     if is_standard_m:
         if flight is not None:
             try:
-                return flight.standard_world_m_to_unreal_world_cm(xyz).astype(np.float32, copy=False)
+                converted = flight.standard_world_m_to_unreal_world_cm(cloud[:, :6])
+                if converted.ndim == 2 and converted.shape[1] >= 3 and converted.shape[0] > 0:
+                    return converted[:, :3].astype(np.float32, copy=False)
             except Exception:
                 pass
-        return (xyz * 100.0).astype(np.float32, copy=False)
+        return np.column_stack((xyz[:, 0] * 100.0, -xyz[:, 1] * 100.0, xyz[:, 2] * 100.0)).astype(
+            np.float32,
+            copy=False,
+        )
     return xyz.astype(np.float32, copy=False)
 
 
-def summarize_pointcloud(event: Dict[str, Any], *, base_dir: Optional[Path] = None) -> Dict[str, float]:
-    raw = event.get("pointcloud_summary")
-    if isinstance(raw, dict) and raw:
-        return {
+def empty_pointcloud_feature_values(*, geometry: str = "unknown") -> Dict[str, float]:
+    values = {
+        "pc_available": 0.0,
+        "pc_point_count_log": 0.0,
+        "pc_front_min_cm": 0.0,
+        "pc_front_mean_cm": 0.0,
+        "pc_corridor_count_log": 0.0,
+        "pc_left_min_cm": 0.0,
+        "pc_right_min_cm": 0.0,
+        "pc_up_min_cm": 0.0,
+        "pc_down_min_cm": 0.0,
+        "pc_nearest_cm": 0.0,
+        "pc_obstacle_width_cm": 0.0,
+        "pc_obstacle_height_cm": 0.0,
+        "pc_obstacle_thickness_cm": 0.0,
+        "pc_left_swept_clear": 0.0,
+        "pc_right_swept_clear": 0.0,
+        "pc_up_swept_clear": 0.0,
+        "pc_down_swept_clear": 0.0,
+        "pc_forward_swept_clear": 0.0,
+        "pc_backoff_swept_clear": 0.0,
+        "pc_local_map_age_ms": 0.0,
+    }
+    geometry_key = str(geometry or "unknown").strip().lower()
+    if geometry_key not in GEOMETRY_TYPES:
+        geometry_key = "unknown"
+    for item in GEOMETRY_TYPES:
+        values[f"geometry_{item}"] = 1.0 if item == geometry_key else 0.0
+    return values
+
+
+def pointcloud_summary_to_feature_values(raw: Dict[str, Any]) -> Dict[str, float]:
+    geometry = str(raw.get("obstacle_geometry", "unknown") or "unknown").strip().lower()
+    values = empty_pointcloud_feature_values(geometry=geometry)
+    front_min = as_float(raw.get("front_min_depth_cm", raw.get("front_min_cm", 0.0)))
+    values.update(
+        {
             "pc_available": 1.0 if raw.get("available", True) else 0.0,
             "pc_point_count_log": float(math.log1p(max(0.0, as_float(raw.get("point_count", 0.0))))),
-            "pc_front_min_cm": as_float(raw.get("front_min_depth_cm", raw.get("front_min_cm", 0.0))),
+            "pc_front_min_cm": front_min,
             "pc_front_mean_cm": as_float(raw.get("front_mean_depth_cm", raw.get("front_mean_cm", 0.0))),
             "pc_corridor_count_log": float(math.log1p(max(0.0, as_float(raw.get("corridor_count", 0.0))))),
             "pc_left_min_cm": as_float(raw.get("left_min_depth_cm", raw.get("left_min_cm", 0.0))),
             "pc_right_min_cm": as_float(raw.get("right_min_depth_cm", raw.get("right_min_cm", 0.0))),
             "pc_up_min_cm": as_float(raw.get("up_min_depth_cm", raw.get("up_min_cm", 0.0))),
+            "pc_down_min_cm": as_float(raw.get("down_min_depth_cm", raw.get("down_min_cm", 0.0))),
             "pc_nearest_cm": as_float(raw.get("nearest_distance_cm", 0.0)),
+            "pc_obstacle_width_cm": as_float(raw.get("obstacle_width_cm", 0.0)),
+            "pc_obstacle_height_cm": as_float(raw.get("obstacle_height_cm", 0.0)),
+            "pc_obstacle_thickness_cm": as_float(raw.get("obstacle_thickness_cm", 0.0)),
+            "pc_left_swept_clear": 1.0 if as_bool(raw.get("left_swept_clear", False)) else 0.0,
+            "pc_right_swept_clear": 1.0 if as_bool(raw.get("right_swept_clear", False)) else 0.0,
+            "pc_up_swept_clear": 1.0 if as_bool(raw.get("up_swept_clear", False)) else 0.0,
+            "pc_down_swept_clear": 1.0 if as_bool(raw.get("down_swept_clear", False)) else 0.0,
+            "pc_forward_swept_clear": 1.0 if as_bool(raw.get("forward_swept_clear", front_min <= 0.0 or front_min >= 250.0)) else 0.0,
+            "pc_backoff_swept_clear": 1.0 if as_bool(raw.get("backoff_swept_clear", True)) else 0.0,
+            "pc_local_map_age_ms": as_float(raw.get("local_map_age_ms", 0.0)),
         }
+    )
+    return values
+
+
+def summarize_pointcloud(event: Dict[str, Any], *, base_dir: Optional[Path] = None) -> Dict[str, float]:
+    raw = event.get("pointcloud_summary")
+    if isinstance(raw, dict) and raw:
+        return pointcloud_summary_to_feature_values(raw)
+    if summarize_geometry_v0 is not None:
+        try:
+            geometry_summary = summarize_geometry_v0(event, base_dir=base_dir)
+            if bool(geometry_summary.get("available", False)):
+                return pointcloud_summary_to_feature_values(geometry_summary)
+        except Exception:
+            pass
     path = first_existing_path(
         event,
         (
@@ -314,23 +410,13 @@ def summarize_pointcloud(event: Dict[str, Any], *, base_dir: Optional[Path] = No
         base_dir=base_dir,
     )
     if not path.exists():
-        return {
-            "pc_available": 0.0,
-            "pc_point_count_log": 0.0,
-            "pc_front_min_cm": 0.0,
-            "pc_front_mean_cm": 0.0,
-            "pc_corridor_count_log": 0.0,
-            "pc_left_min_cm": 0.0,
-            "pc_right_min_cm": 0.0,
-            "pc_up_min_cm": 0.0,
-            "pc_nearest_cm": 0.0,
-        }
+        return empty_pointcloud_feature_values()
     try:
         xyz = cloud_xyz_unreal_cm(path, event)
     except Exception:
-        return summarize_pointcloud({}, base_dir=None)
+        return empty_pointcloud_feature_values()
     if xyz.size == 0:
-        return summarize_pointcloud({}, base_dir=None)
+        return empty_pointcloud_feature_values()
     pose = pose_from_event(event)
     yaw = math.radians(pose["yaw"])
     dx = xyz[:, 0] - pose["x"]
@@ -345,6 +431,7 @@ def summarize_pointcloud(event: Dict[str, Any], *, base_dir: Optional[Path] = No
     left = front & (right < -40.0) & (right >= -300.0) & vertical
     right_side = front & (right > 40.0) & (right <= 300.0) & vertical
     up_zone = front & (np.abs(right) <= 180.0) & (up > 40.0) & (up <= 300.0)
+    down_zone = front & (np.abs(right) <= 180.0) & (up < -40.0) & (up >= -300.0)
     nearest = np.sqrt(dx * dx + dy * dy + dz * dz)
 
     def min_forward(mask: np.ndarray) -> float:
@@ -352,17 +439,20 @@ def summarize_pointcloud(event: Dict[str, Any], *, base_dir: Optional[Path] = No
         return float(np.min(values)) if values.size else 0.0
 
     front_values = forward[corridor]
-    return {
-        "pc_available": 1.0,
-        "pc_point_count_log": float(math.log1p(xyz.shape[0])),
-        "pc_front_min_cm": float(np.min(front_values)) if front_values.size else 0.0,
-        "pc_front_mean_cm": float(np.mean(front_values)) if front_values.size else 0.0,
-        "pc_corridor_count_log": float(math.log1p(front_values.size)),
-        "pc_left_min_cm": min_forward(left),
-        "pc_right_min_cm": min_forward(right_side),
-        "pc_up_min_cm": min_forward(up_zone),
-        "pc_nearest_cm": float(np.min(nearest)) if nearest.size else 0.0,
+    summary = {
+        "available": True,
+        "point_count": float(xyz.shape[0]),
+        "front_min_depth_cm": float(np.min(front_values)) if front_values.size else 0.0,
+        "front_mean_depth_cm": float(np.mean(front_values)) if front_values.size else 0.0,
+        "corridor_count": float(front_values.size),
+        "left_min_depth_cm": min_forward(left),
+        "right_min_depth_cm": min_forward(right_side),
+        "up_min_depth_cm": min_forward(up_zone),
+        "down_min_depth_cm": min_forward(down_zone),
+        "nearest_distance_cm": float(np.min(nearest)) if nearest.size else 0.0,
+        "obstacle_geometry": "unknown",
     }
+    return pointcloud_summary_to_feature_values(summary)
 
 
 def relative_target_features(event: Dict[str, Any]) -> Dict[str, float]:
@@ -386,6 +476,41 @@ def relative_target_features(event: Dict[str, Any]) -> Dict[str, float]:
         "relative_bearing_deg_body": normalize_angle_deg(absolute_bearing - pose["yaw"]),
         "relative_dz_cm": dz,
     }
+
+
+def candidate_score_features(event: Dict[str, Any], pointcloud_values: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+    raw = event.get("candidate_action_scores")
+    if not isinstance(raw, dict) or not raw:
+        raw_summary = event.get("pointcloud_summary")
+        if isinstance(raw_summary, dict):
+            summary = raw_summary
+        else:
+            values = pointcloud_values or {}
+            summary = {
+                "front_min_depth_cm": values.get("pc_front_min_cm", 0.0),
+                "left_min_depth_cm": values.get("pc_left_min_cm", 0.0),
+                "right_min_depth_cm": values.get("pc_right_min_cm", 0.0),
+                "up_min_depth_cm": values.get("pc_up_min_cm", 0.0),
+                "down_min_depth_cm": values.get("pc_down_min_cm", 0.0),
+                "left_swept_clear": values.get("pc_left_swept_clear", 0.0) > 0.5,
+                "right_swept_clear": values.get("pc_right_swept_clear", 0.0) > 0.5,
+                "up_swept_clear": values.get("pc_up_swept_clear", 0.0) > 0.5,
+                "down_swept_clear": values.get("pc_down_swept_clear", 0.0) > 0.5,
+                "forward_swept_clear": values.get("pc_forward_swept_clear", 0.0) > 0.5,
+                "backoff_swept_clear": values.get("pc_backoff_swept_clear", 0.0) > 0.5,
+                "obstacle_geometry": next(
+                    (name for name in GEOMETRY_TYPES if values.get(f"geometry_{name}", 0.0) > 0.5),
+                    "unknown",
+                ),
+            }
+        if score_candidate_actions is not None:
+            try:
+                raw = score_candidate_actions(summary, event.get("relative_target", {}), event.get("last_action", {}))
+            except Exception:
+                raw = {}
+        else:
+            raw = {}
+    return {f"candidate_score_{action}": as_float(raw.get(action, 0.0)) for action in CANDIDATE_ACTIONS}
 
 
 def payload_from_label(label: Any) -> Dict[str, float]:
@@ -436,8 +561,10 @@ def extract_event_features(event: Dict[str, Any], *, base_dir: Optional[Path] = 
     values: Dict[str, float] = {}
     values.update(summarize_rgb(event, base_dir=base_dir))
     values.update(summarize_depth(event, base_dir=base_dir))
-    values.update(summarize_pointcloud(event, base_dir=base_dir))
+    pointcloud_values = summarize_pointcloud(event, base_dir=base_dir)
+    values.update(pointcloud_values)
     values.update(relative_target_features(event))
+    values.update(candidate_score_features(event, pointcloud_values))
     last_payload = event.get("last_action") if isinstance(event.get("last_action"), dict) else {}
     nominal_payload = event.get("nominal_action") if isinstance(event.get("nominal_action"), dict) else {}
     for name, value in zip(("last_forward_cm", "last_right_cm", "last_up_cm", "last_yaw_delta_deg"), payload_to_vector(last_payload)):

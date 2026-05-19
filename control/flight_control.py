@@ -23,6 +23,9 @@ class FlightControlMixin:
         obstacle_stop_event = getattr(self, "obstacle_avoidance_stop_event", None)
         if obstacle_stop_event is not None:
             obstacle_stop_event.set()
+        obstacle2_stop_event = getattr(self, "obstacle_avoidance_2_stop_event", None)
+        if obstacle2_stop_event is not None:
+            obstacle2_stop_event.set()
         self.route_stop_event.set()
         route3_stop_event = getattr(self, "llm_route3_stop_event", None)
         if route3_stop_event is not None:
@@ -52,6 +55,9 @@ class FlightControlMixin:
         session = self.session
         if session is None or not session.started:
             return
+        obstacle2_thread = getattr(self, "obstacle_avoidance_2_runner_thread", None)
+        if obstacle2_thread is not None and obstacle2_thread.is_alive():
+            return
         if self.state_refresh_inflight:
             return
 
@@ -69,7 +75,8 @@ class FlightControlMixin:
     def schedule_state_refresh(self) -> None:
         if not self.manual_request_inflight and not self.move_request_inflight:
             session = self.session
-            if session is not None and session.started:
+            obstacle2_thread = getattr(self, "obstacle_avoidance_2_runner_thread", None)
+            if session is not None and session.started and not (obstacle2_thread is not None and obstacle2_thread.is_alive()):
                 self.refresh_state_once()
         self.root.after(self.args.state_interval_ms, self.schedule_state_refresh)
 
@@ -1316,13 +1323,16 @@ class FlightControlMixin:
                         "open3d_world_standard_m": result.get("open3d_world_standard_m", {}),
                         "pose_json_path": result.get("pose_json_path", ""),
                         "action_json_path": result.get("action_json_path", ""),
+                        "depth_obstacle_summary": result.get("depth_obstacle_summary", {}),
+                        "minimal_capture": bool(result.get("minimal_capture", False)),
+                        "source_mode": result.get("source_mode", ""),
                         "point_count": int(result.get("point_count", 0) or 0),
                         "invalid_depth_count": int(result.get("invalid_depth_count", 0) or 0),
                         "depth_projection_selected": result.get("depth_projection_selected", result.get("depth_projection", "")),
                         "projection_corrected": bool(result.get("projection_corrected", True)),
                         "coordinate_frame": result.get("coordinate_frame", "standard_zup"),
                         "coordinate_units": result.get("coordinate_units", "m"),
-                        "raw_capture_only": bool(result.get("raw_capture_only", processing_mode == "smooth")),
+                        "raw_capture_only": bool(result.get("raw_capture_only", processing_mode in {"smooth", "minimal"})),
                         "postprocess_status": result.get("postprocess_status", "pending" if processing_mode == "smooth" else "done"),
                         "postprocess_started_at": result.get("postprocess_started_at", ""),
                         "postprocess_finished_at": result.get("postprocess_finished_at", ""),
@@ -1425,7 +1435,8 @@ class FlightControlMixin:
         self.latest_state["last_lidar_stream_capture"] = result
         self.stream_player_dir = stream_dir
         raw_only = bool(result.get("raw_capture_only", False))
-        self.stream_player_image_mode_var.set("rgb" if raw_only else "point_cloud_preview")
+        minimal_capture = bool(result.get("minimal_capture", False)) or str(result.get("source_mode", "")).lower() == "depth_sector_minimal"
+        self.stream_player_image_mode_var.set("depth_preview" if minimal_capture else ("rgb" if raw_only else "point_cloud_preview"))
         pose = result.get("pose") if isinstance(result.get("pose"), dict) else {}
         if pose:
             self.latest_state["pose"] = pose
