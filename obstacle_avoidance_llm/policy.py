@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, Tuple
 
 from obstacle_avoidance.collect_route_episodes import FORWARD_DANGER_CM, action_payload, as_float
@@ -43,6 +44,28 @@ STRATEGY_DECISION_SCHEMA: Dict[str, Any] = {
     "vertical_policy": "auto",
     "strategy_reason": "Short explanation.",
 }
+
+CANONICAL_OBSTACLE_HINTS = {
+    "unknown",
+    "tree_trunk_or_pole",
+    "tree_canopy_or_cluster",
+    "tree",
+    "pole",
+    "fence_or_rail",
+    "building",
+    "mixed",
+}
+
+POINTCLOUD_HEIGHT_STRATEGY_KEYS = (
+    "pointcloud_height_estimate",
+    "pointcloud_recommended_flyover_z_cm",
+    "pointcloud_recommended_vertical_offset_cm",
+    "pointcloud_obstacle_height_cm",
+    "pointcloud_obstacle_top_z_cm",
+    "pointcloud_height_source",
+    "pointcloud_flyover_recommended",
+    "pointcloud_clearance_z_cm",
+)
 
 
 def clamp(value: Any, low: float, high: float, default: float = 0.0) -> float:
@@ -140,19 +163,155 @@ def shield_direct_payload(
 def normalize_strategy_decision(raw: Dict[str, Any]) -> Dict[str, Any]:
     data = raw if isinstance(raw, dict) else {}
     environment_id = str(data.get("environment_id", "default_unreal_scene") or "default_unreal_scene").strip()
-    obstacle_hint = str(data.get("obstacle_hint", "unknown") or "unknown").strip()
+    raw_obstacle_hint = str(data.get("raw_obstacle_hint", data.get("obstacle_hint", "unknown")) or "unknown").strip()
+    obstacle_hint = canonical_obstacle_hint(raw_obstacle_hint, environment_id=environment_id)
     lateral = str(data.get("lateral_preference", "auto") or "auto").strip().lower()
     vertical = str(data.get("vertical_policy", "auto") or "auto").strip().lower()
-    return {
+    strategy_reason = str(data.get("strategy_reason", data.get("reason", "")) or "")
+    existing_note = str(data.get("llm_obstacle_note", "") or "").strip()
+    note_parts = [existing_note] if existing_note else []
+    if raw_obstacle_hint and raw_obstacle_hint.lower() not in {"unknown", obstacle_hint.lower()}:
+        note_parts.append(f"LLM hint: {raw_obstacle_hint}")
+    if strategy_reason:
+        note_parts.append(f"Reason: {strategy_reason}")
+    result = {
         "environment_id": environment_id or "default_unreal_scene",
         "obstacle_hint": obstacle_hint or "unknown",
         "recommended_method": "pointcloud_direction_rule",
         "flyover_z_cm": max(0.0, as_float(data.get("flyover_z_cm"))),
         "lateral_preference": lateral if lateral in {"auto", "left", "right", "none"} else "auto",
         "vertical_policy": vertical or "auto",
-        "strategy_reason": str(data.get("strategy_reason", data.get("reason", "")) or ""),
+        "strategy_reason": strategy_reason,
+        "raw_obstacle_hint": raw_obstacle_hint,
+        "llm_obstacle_note": "; ".join(note_parts),
         "raw_decision": data,
     }
+    for key in POINTCLOUD_HEIGHT_STRATEGY_KEYS:
+        if key in data:
+            result[key] = data[key]
+    return result
+
+
+def canonical_obstacle_hint(value: Any, *, environment_id: str = "") -> str:
+    raw = str(value or "").strip()
+    env = str(environment_id or "").strip().lower()
+    env_key = re.sub(r"[^a-z0-9]+", "_", env).strip("_")
+    text = re.sub(r"[^a-z0-9]+", "_", raw.lower()).strip("_")
+    if text in CANONICAL_OBSTACLE_HINTS:
+        return text
+    if text in {"fence", "rail", "railing", "fence_or_rails", "fence_rail"}:
+        return "fence_or_rail"
+    if text in {"tree_or_pole", "trunk", "tree_trunk", "vertical_pole"}:
+        return "tree_trunk_or_pole"
+    if text in {"canopy", "tree_canopy", "cluster", "tree_cluster"}:
+        return "tree_canopy_or_cluster"
+    phrase = f"{text} {env_key}"
+    if any(token in phrase for token in ("fence", "rail", "railing")):
+        return "fence_or_rail"
+    if any(token in phrase for token in ("building", "roof", "house", "wall")):
+        return "building"
+    if any(token in phrase for token in ("canopy", "cluster", "branch")):
+        return "tree_canopy_or_cluster"
+    if any(token in phrase for token in ("trunk", "pole")):
+        return "tree_trunk_or_pole"
+    if "mixed" in phrase:
+        return "mixed"
+    if "tree" in phrase:
+        return "tree"
+    if env_key in CANONICAL_OBSTACLE_HINTS:
+        return env_key
+    return "unknown"
+
+
+def apply_strategy_to_episode_metadata(episode: Dict[str, Any], strategy: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(episode) if isinstance(episode, dict) else {}
+    normalized = normalize_strategy_decision(strategy)
+    result["environment_id"] = normalized["environment_id"]
+    result["obstacle_hint"] = normalized["obstacle_hint"]
+    result["method"] = LLM_STRATEGY_METHOD_ID
+    note = str(result.get("operator_note", "") or "").strip()
+    llm_note = str(normalized.get("llm_obstacle_note", "") or "").strip()
+    if llm_note and llm_note not in note:
+        result["operator_note"] = f"{note} | {llm_note}" if note else llm_note
+    result["llm_strategy"] = {
+        key: value
+        for key, value in normalized.items()
+        if key not in {"raw_decision", "llm_raw"}
+    }
+    return result
+
+
+def refine_strategy_with_pointcloud_context(strategy: Dict[str, Any], event: Dict[str, Any]) -> Dict[str, Any]:
+    result = normalize_strategy_decision(strategy)
+    source_strategy = strategy if isinstance(strategy, dict) else {}
+    for key in POINTCLOUD_HEIGHT_STRATEGY_KEYS:
+        if key in source_strategy:
+            result[key] = source_strategy[key]
+
+    summary = event.get("pointcloud_summary") if isinstance(event, dict) and isinstance(event.get("pointcloud_summary"), dict) else {}
+    height_estimate = result.get("pointcloud_height_estimate") if isinstance(result.get("pointcloud_height_estimate"), dict) else {}
+    geometry = str(summary.get("obstacle_geometry", "") or "").lower()
+    width_cm = as_float(summary.get("obstacle_width_cm"))
+    summary_height_cm = as_float(summary.get("obstacle_height_cm"))
+    estimated_height_cm = as_float(height_estimate.get("obstacle_height_cm"))
+    top_z_cm = as_float(height_estimate.get("obstacle_top_z_cm"))
+    current_z_cm = as_float(height_estimate.get("current_z_cm"))
+    top_offset_cm = top_z_cm - current_z_cm if top_z_cm > 0.0 and current_z_cm > 0.0 else 0.0
+    raw_hint = str(result.get("raw_obstacle_hint", "") or "").lower()
+    reason = str(result.get("strategy_reason", "") or "").lower()
+    env = str(result.get("environment_id", "") or "").lower()
+    hint = str(result.get("obstacle_hint", "") or "").lower()
+
+    low_obstacle_hint = any(token in raw_hint for token in ("low_obstacle", "low barrier", "low_barrier", "fence", "rail"))
+    building_candidate = env in {"building_or_roof", "building"} or hint == "building"
+    low_wide_geometry = (
+        geometry == "low_obstacle"
+        and width_cm >= 220.0
+        and (
+            0.0 < estimated_height_cm <= 480.0
+            or 0.0 < summary_height_cm <= 520.0
+            or 0.0 < top_offset_cm <= 420.0
+        )
+        and bool(summary.get("up_swept_clear", True))
+    )
+    strong_building_phrase = any(token in f"{raw_hint} {reason}" for token in ("facade", "entrance", "door", "house wall", "tall building"))
+    if building_candidate and low_wide_geometry and (low_obstacle_hint or not strong_building_phrase):
+        previous_env = result.get("environment_id", "")
+        previous_hint = result.get("obstacle_hint", "")
+        result["environment_id"] = "fence_or_rail"
+        result["obstacle_hint"] = "fence_or_rail"
+        result["semantic_refinement_source"] = "pointcloud_low_wide_flyover"
+        result["semantic_refinement_reason"] = (
+            f"corrected {previous_env}/{previous_hint} to fence_or_rail because pointcloud shows "
+            f"low wide obstacle: geometry={geometry}, width={width_cm:.1f}cm, "
+            f"height={estimated_height_cm or summary_height_cm:.1f}cm, up_swept_clear={bool(summary.get('up_swept_clear', True))}"
+        )
+        note = str(result.get("llm_obstacle_note", "") or "").strip()
+        refinement_note = f"Semantic refinement: {result['semantic_refinement_reason']}"
+        result["llm_obstacle_note"] = f"{note}; {refinement_note}" if note else refinement_note
+    return result
+
+
+def strategy_from_episode_metadata(episode: Dict[str, Any]) -> Dict[str, Any]:
+    data = episode if isinstance(episode, dict) else {}
+    cached = data.get("llm_strategy")
+    if isinstance(cached, dict) and cached:
+        raw_strategy = dict(cached)
+    else:
+        raw_strategy = {
+            "environment_id": data.get("environment_id", "default_unreal_scene"),
+            "obstacle_hint": data.get("obstacle_hint", "unknown"),
+            "recommended_method": "pointcloud_direction_rule",
+            "flyover_z_cm": data.get("flyover_z_cm", 0.0),
+            "lateral_preference": data.get("lateral_preference", "auto"),
+            "vertical_policy": data.get("vertical_policy", "auto"),
+            "strategy_reason": "Using episode Environment/Hint without an execution-time LLM call.",
+        }
+    normalized = normalize_strategy_decision(raw_strategy)
+    normalized["strategy_source"] = "episode_metadata"
+    normalized["llm_call_required"] = False
+    normalized["llm_error"] = ""
+    return normalized
 
 
 def build_direct_prompts(event: Dict[str, Any], episode: Dict[str, Any], last_action: Dict[str, Any]) -> Tuple[str, str]:
@@ -194,6 +353,14 @@ def build_strategy_prompts(event: Dict[str, Any], episode: Dict[str, Any]) -> Tu
             "fence_or_rail",
             "building_or_roof",
             "mixed_obstacles",
+        ],
+        "available_obstacle_hints": sorted(CANONICAL_OBSTACLE_HINTS),
+        "classification_rules": [
+            "Use fence_or_rail for fences, rails, railings, low/wide horizontal barriers, and boundary walls that are best handled by a moderate flyover.",
+            "Use building_or_roof only for a real building, house facade, roof, entrance wall, or tall large structure that needs high vantage/overfly behavior.",
+            "Do not classify generic low_obstacle or low horizontal barrier as building_or_roof unless RGB clearly shows a building facade/roof/house.",
+            "For narrow trunks, poles, branches, or thin vertical objects, use tree_trunk_or_pole or tree_canopy_or_cluster and prefer lateral avoidance.",
+            "obstacle_hint must be one canonical value from available_obstacle_hints; put free-text visual details into strategy_reason.",
         ],
         "fixed_recommended_method": "pointcloud_direction_rule",
         "episode": episode,

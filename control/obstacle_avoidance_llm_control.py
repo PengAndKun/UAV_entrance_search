@@ -43,14 +43,18 @@ from obstacle_avoidance_llm.plans import (
     save_plans,
     validate_plan_episode,
 )
+from obstacle_avoidance_llm.height_estimator import estimate_pointcloud_flyover_height
 from obstacle_avoidance_llm.policy import (
     DIRECT_DECISION_SCHEMA,
     STRATEGY_DECISION_SCHEMA,
+    apply_strategy_to_episode_metadata,
     build_direct_prompts,
     build_strategy_prompts,
     normalize_direct_decision,
     normalize_strategy_decision,
+    refine_strategy_with_pointcloud_context,
     shield_direct_payload,
+    strategy_from_episode_metadata,
 )
 
 
@@ -78,6 +82,14 @@ class ObstacleAvoidanceLLMControlMixin:
             self.obstacle_avoidance_llm_goal_reached_var = tk.StringVar(value="Goal reached: --")
         if not hasattr(self, "obstacle_avoidance_llm_impact_var"):
             self.obstacle_avoidance_llm_impact_var = tk.StringVar(value="Impact: unknown")
+        if not hasattr(self, "obstacle_avoidance_llm_analysis_env_var"):
+            self.obstacle_avoidance_llm_analysis_env_var = tk.StringVar(value="LLM Environment: --")
+        if not hasattr(self, "obstacle_avoidance_llm_analysis_hint_var"):
+            self.obstacle_avoidance_llm_analysis_hint_var = tk.StringVar(value="LLM Hint: --")
+        if not hasattr(self, "obstacle_avoidance_llm_analysis_summary_var"):
+            self.obstacle_avoidance_llm_analysis_summary_var = tk.StringVar(value="LLM Analysis: not run")
+        if not hasattr(self, "obstacle_avoidance_llm_pointcloud_height_var"):
+            self.obstacle_avoidance_llm_pointcloud_height_var = tk.StringVar(value="PointCloud Height: --")
         if not hasattr(self, "obstacle_avoidance_llm_episode_id_var"):
             self.obstacle_avoidance_llm_episode_id_var = tk.StringVar(value="")
         if not hasattr(self, "obstacle_avoidance_llm_enabled_var"):
@@ -118,6 +130,8 @@ class ObstacleAvoidanceLLMControlMixin:
             self.obstacle_avoidance_llm_record_entries = []
         if not hasattr(self, "obstacle_avoidance_llm_runner_thread"):
             self.obstacle_avoidance_llm_runner_thread = None
+        if not hasattr(self, "obstacle_avoidance_llm_analysis_thread"):
+            self.obstacle_avoidance_llm_analysis_thread = None
         if not hasattr(self, "obstacle_avoidance_llm_stop_event"):
             self.obstacle_avoidance_llm_stop_event = threading.Event()
 
@@ -243,12 +257,17 @@ class ObstacleAvoidanceLLMControlMixin:
         for col in (4, 6, 8):
             experiment.grid_columnconfigure(col, weight=1)
         tk.Button(experiment, text="1. Locate Start", command=self.locate_obstacle_avoidance_llm_start).grid(row=0, column=0, padx=6, pady=6)
-        tk.Button(experiment, text="2. Apply Algorithm", command=self.apply_obstacle_avoidance_llm_algorithm).grid(row=0, column=1, padx=6, pady=6)
-        tk.Button(experiment, text="3. Execute To Goal", command=self.execute_obstacle_avoidance_llm_to_goal).grid(row=0, column=2, padx=6, pady=6)
-        tk.Button(experiment, text="Stop All", command=self.emergency_stop_obstacle_avoidance_llm_all).grid(row=0, column=3, padx=6, pady=6)
-        tk.Label(experiment, textvariable=self.obstacle_avoidance_llm_goal_distance_var, anchor="w").grid(row=0, column=4, sticky="ew", padx=12, pady=6)
+        tk.Button(experiment, text="2. LLM Analyze", command=self.analyze_obstacle_avoidance_llm_current_episode).grid(row=0, column=1, padx=6, pady=6)
+        tk.Button(experiment, text="3. Apply Algorithm", command=self.apply_obstacle_avoidance_llm_algorithm).grid(row=0, column=2, padx=6, pady=6)
+        tk.Button(experiment, text="4. Execute To Goal", command=self.execute_obstacle_avoidance_llm_to_goal).grid(row=0, column=3, padx=6, pady=6)
+        tk.Button(experiment, text="Stop All", command=self.emergency_stop_obstacle_avoidance_llm_all).grid(row=0, column=4, padx=6, pady=6)
+        tk.Label(experiment, textvariable=self.obstacle_avoidance_llm_goal_distance_var, anchor="w").grid(row=0, column=5, sticky="ew", padx=12, pady=6)
         tk.Label(experiment, textvariable=self.obstacle_avoidance_llm_goal_reached_var, anchor="w").grid(row=0, column=6, sticky="ew", padx=12, pady=6)
         tk.Label(experiment, textvariable=self.obstacle_avoidance_llm_impact_var, anchor="w").grid(row=0, column=8, sticky="ew", padx=12, pady=6)
+        tk.Label(experiment, textvariable=self.obstacle_avoidance_llm_analysis_env_var, anchor="w").grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 4))
+        tk.Label(experiment, textvariable=self.obstacle_avoidance_llm_analysis_hint_var, anchor="w").grid(row=1, column=2, columnspan=2, sticky="ew", padx=6, pady=(0, 4))
+        tk.Label(experiment, textvariable=self.obstacle_avoidance_llm_analysis_summary_var, anchor="w", wraplength=900, justify="left").grid(row=2, column=0, columnspan=9, sticky="ew", padx=6, pady=(0, 6))
+        tk.Label(experiment, textvariable=self.obstacle_avoidance_llm_pointcloud_height_var, anchor="w", wraplength=900, justify="left").grid(row=3, column=0, columnspan=9, sticky="ew", padx=6, pady=(0, 6))
 
         body = tk.Frame(window)
         body.grid(row=4, column=0, sticky="nsew", padx=8, pady=4)
@@ -951,7 +970,188 @@ class ObstacleAvoidanceLLMControlMixin:
         strategy = normalize_strategy_decision(call.get("parsed", {}))
         strategy["llm_error"] = call.get("error", "")
         strategy["llm_raw"] = call.get("raw", {})
+        height_estimate = estimate_pointcloud_flyover_height(event, strategy)
+        strategy["pointcloud_height_estimate"] = height_estimate
+        if height_estimate.get("available"):
+            strategy["pointcloud_recommended_flyover_z_cm"] = height_estimate.get("recommended_flyover_z_cm", 0.0)
+            strategy["pointcloud_recommended_vertical_offset_cm"] = height_estimate.get("recommended_vertical_offset_cm", 0.0)
+            strategy["pointcloud_obstacle_height_cm"] = height_estimate.get("obstacle_height_cm", 0.0)
+            strategy["pointcloud_obstacle_top_z_cm"] = height_estimate.get("obstacle_top_z_cm", 0.0)
+            strategy["pointcloud_height_source"] = height_estimate.get("height_source", "")
+            strategy["pointcloud_flyover_recommended"] = bool(height_estimate.get("flyover_recommended", False))
+            strategy["pointcloud_clearance_z_cm"] = height_estimate.get("clearance_z_cm", 0.0)
+            strategy["flyover_z_cm"] = height_estimate.get("recommended_vertical_offset_cm", 0.0)
+        strategy = refine_strategy_with_pointcloud_context(strategy, event)
         return strategy
+
+    def show_obstacle_avoidance_llm_analysis(self, episode: Dict[str, Any], strategy: Dict[str, Any], *, analysis_path: str = "") -> None:
+        environment_id = str(strategy.get("environment_id", LLM_DEFAULT_ENVIRONMENT_ID) or LLM_DEFAULT_ENVIRONMENT_ID)
+        obstacle_hint = str(strategy.get("obstacle_hint", "unknown") or "unknown")
+        flyover_z = strategy.get("flyover_z_cm", 0.0)
+        lateral = str(strategy.get("lateral_preference", "auto") or "auto")
+        vertical = str(strategy.get("vertical_policy", "auto") or "auto")
+        reason = str(strategy.get("strategy_reason", "") or "")
+        error_text = str(strategy.get("llm_error", "") or "")
+        height_estimate = strategy.get("pointcloud_height_estimate") if isinstance(strategy.get("pointcloud_height_estimate"), dict) else {}
+
+        self.obstacle_avoidance_llm_analysis_env_var.set(f"LLM Environment: {environment_id}")
+        self.obstacle_avoidance_llm_analysis_hint_var.set(f"LLM Hint: {obstacle_hint}")
+        summary = (
+            f"LLM Analysis: flyover_z={flyover_z}cm, lateral={lateral}, vertical={vertical}; "
+            f"reason={reason or 'n/a'}"
+        )
+        if error_text:
+            summary = f"{summary}; error={error_text}"
+        self.obstacle_avoidance_llm_analysis_summary_var.set(summary)
+        if height_estimate.get("available"):
+            self.obstacle_avoidance_llm_pointcloud_height_var.set(
+                "PointCloud Height: "
+                f"height={height_estimate.get('obstacle_height_cm', 0.0)}cm, "
+                f"top_z={height_estimate.get('obstacle_top_z_cm', 0.0)}cm, "
+                f"target_z={height_estimate.get('recommended_flyover_z_cm', 0.0)}cm, "
+                f"offset={height_estimate.get('recommended_vertical_offset_cm', 0.0)}cm, "
+                f"source={height_estimate.get('height_source', '')}, "
+                f"flyover={height_estimate.get('flyover_recommended', False)}"
+            )
+        else:
+            self.obstacle_avoidance_llm_pointcloud_height_var.set(
+                f"PointCloud Height: unavailable; {height_estimate.get('reason', 'no estimate')}"
+            )
+
+        original_method = str(episode.get("method", self.obstacle_avoidance_llm_method_var.get() or LLM_DEFAULT_METHOD_ID))
+        updated = apply_strategy_to_episode_metadata(episode, strategy)
+        updated["method"] = original_method
+        existing = self.find_obstacle_avoidance_llm_episode(str(updated.get("episode_id", "")))
+        if existing is not None:
+            existing.clear()
+            existing.update(updated)
+        self.obstacle_avoidance_llm_environment_var.set(environment_id)
+        self.obstacle_avoidance_llm_obstacle_hint_var.set(obstacle_hint)
+        self.obstacle_avoidance_llm_method_var.set(original_method)
+        self.obstacle_avoidance_llm_note_var.set(str(updated.get("operator_note", "")))
+        if isinstance(self.obstacle_avoidance_llm_plan_data, dict):
+            save_plans(self.obstacle_avoidance_llm_plan_path(), self.obstacle_avoidance_llm_plan_data)
+        self.refresh_obstacle_avoidance_llm_tree()
+        self.obstacle_avoidance_llm_status_var.set(
+            f"OA-LLM analysis applied: env={environment_id}, hint={obstacle_hint}"
+        )
+        self.obstacle_avoidance_llm_report(
+            {
+                "status": "llm_analysis_applied",
+                "episode_id": updated.get("episode_id", ""),
+                "environment_id": environment_id,
+                "obstacle_hint": obstacle_hint,
+                "strategy": strategy,
+                "analysis_path": analysis_path,
+            }
+        )
+
+    def analyze_obstacle_avoidance_llm_current_episode(self) -> None:
+        if self.obstacle_avoidance_llm_runner_thread is not None and self.obstacle_avoidance_llm_runner_thread.is_alive():
+            self.obstacle_avoidance_llm_status_var.set("OA-LLM runner is already active")
+            return
+        if self.obstacle_avoidance_llm_analysis_thread is not None and self.obstacle_avoidance_llm_analysis_thread.is_alive():
+            self.obstacle_avoidance_llm_status_var.set("OA-LLM analysis is already active")
+            return
+        session = self.active_session()
+        if session is None:
+            self.obstacle_avoidance_llm_status_var.set("OA-LLM: start Unreal from the main window first")
+            return
+        episode = self.upsert_obstacle_avoidance_llm_editor_episode()
+        if episode is None:
+            return
+
+        episode = deepcopy(episode)
+        self.obstacle_avoidance_llm_status_var.set(f"OA-LLM analyzing current view: {episode.get('episode_id', '')}")
+        self.obstacle_avoidance_llm_analysis_summary_var.set("LLM Analysis: running...")
+        self.obstacle_avoidance_llm_pointcloud_height_var.set("PointCloud Height: calculating after LLM type...")
+
+        def worker() -> None:
+            episode_id = str(episode.get("episode_id", "E00"))
+            start = pose_dict(episode["start_pose"])
+            goal = pose_dict(episode["goal_pose"])
+            run_id = sanitize_id(f"analysis_{episode_id}_{datetime.now().strftime('%H%M%S')}", "analysis")
+            args = self.obstacle_avoidance_llm_args(method=LLM_STRATEGY_METHOD_ID, run_id=run_id, note="llm one-frame analysis")
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            session_dir = self.obstacle_avoidance_llm_data_root() / "analysis" / f"{timestamp}_llm_analysis_{episode_id}_{run_id}"
+            events_path = session_dir / "analysis_events.jsonl"
+            try:
+                session_dir.mkdir(parents=True, exist_ok=False)
+                try:
+                    session.args.lidar_capture_processing = "minimal"
+                except Exception:
+                    pass
+                pre_state = session.get_state()
+                pre_pose = pose_from_state(pre_state if isinstance(pre_state, dict) else {})
+                action_detail = {
+                    "source": "obstacle_avoidance_llm_analysis",
+                    "episode_id": episode_id,
+                    "episode_index": 1,
+                    "collection_stage": "route_episode_llm_analysis",
+                    "scenario_id": episode.get("scenario_id") or f"oa_llm_route_{episode_id}",
+                    "environment_id": episode.get("environment_id", ""),
+                    "method": LLM_STRATEGY_METHOD_ID,
+                    "plan_method": episode.get("method", ""),
+                    "obstacle_hint": episode.get("obstacle_hint", ""),
+                    "run_id": run_id,
+                    "mission_phase": "LLM_ANALYSIS",
+                    "risk_state": "SAFE",
+                    "expert_action": "hold",
+                    "expert_action_payload": action_payload("hold"),
+                    "start_pose": start,
+                    "goal_pose": goal,
+                    "target_waypoint": goal,
+                    "operator_note": episode.get("operator_note", ""),
+                }
+                result = session.capture_lidar_stream_frame(session_dir, 1, action_detail=action_detail)
+                if not isinstance(result, dict):
+                    raise RuntimeError("capture_lidar_stream_frame returned non-dict")
+                event = build_route_event(
+                    result,
+                    session_dir=session_dir,
+                    frame_id=1,
+                    args=args,
+                    episode=episode,
+                    episode_index=1,
+                    start=start,
+                    goal=goal,
+                    last_action=action_payload("hold"),
+                )
+                event["source"] = "obstacle_avoidance_llm_analysis"
+                event["current_pose_before_analysis"] = pre_pose
+                strategy = self.obstacle_avoidance_llm_strategy_decision(event, episode)
+                event["llm_strategy"] = deepcopy(strategy)
+                event["llm_analysis_result"] = deepcopy(strategy)
+                append_jsonl(events_path, event)
+                summary = {
+                    "status": "ok",
+                    "episode_id": episode_id,
+                    "session_dir": str(session_dir),
+                    "analysis_event_path": str(events_path),
+                    "strategy": strategy,
+                    "finished_at": datetime.now().isoformat(timespec="milliseconds"),
+                }
+                write_json(session_dir / "analysis_summary.json", summary)
+                self.root.after(
+                    0,
+                    lambda e=deepcopy(episode), s=deepcopy(strategy), p=str(session_dir): self.show_obstacle_avoidance_llm_analysis(
+                        e,
+                        s,
+                        analysis_path=p,
+                    ),
+                )
+            except Exception as exc:
+                self.root.after(
+                    0,
+                    lambda err=str(exc): (
+                        self.obstacle_avoidance_llm_status_var.set(f"OA-LLM analysis failed: {err}"),
+                        self.obstacle_avoidance_llm_analysis_summary_var.set(f"LLM Analysis: failed; error={err}"),
+                        self.obstacle_avoidance_llm_report({"status": "error", "task": "llm_analysis", "error": err}),
+                    ),
+                )
+
+        self.obstacle_avoidance_llm_analysis_thread = threading.Thread(target=worker, daemon=True)
+        self.obstacle_avoidance_llm_analysis_thread.start()
 
     def prepare_obstacle_avoidance_llm_run(self) -> Optional[Tuple[Dict[str, Any], List[str], Path, str, str, str]]:
         if self.obstacle_avoidance_llm_plan_data is None:
@@ -1267,8 +1467,8 @@ class ObstacleAvoidanceLLMControlMixin:
                     event["llm_decision"] = llm_decision
                 else:
                     if llm_strategy is None:
-                        llm_strategy = self.obstacle_avoidance_llm_strategy_decision(event, episode)
-                        self.root.after(0, lambda eid=episode_id, s=deepcopy(llm_strategy): self.obstacle_avoidance_llm_report({"status": "llm_strategy_selected", "episode_id": eid, "strategy": s}))
+                        llm_strategy = strategy_from_episode_metadata(episode)
+                        self.root.after(0, lambda eid=episode_id, s=deepcopy(llm_strategy): self.obstacle_avoidance_llm_report({"status": "llm_strategy_loaded_from_episode", "episode_id": eid, "strategy": s}))
                     runtime_env = str(llm_strategy.get("environment_id", episode.get("environment_id", "")) if isinstance(llm_strategy, dict) else episode.get("environment_id", ""))
                     runtime_hint = str(llm_strategy.get("obstacle_hint", episode.get("obstacle_hint", "")) if isinstance(llm_strategy, dict) else episode.get("obstacle_hint", ""))
                     selected_action, payload, rule_reason, phase = select_route_action(
@@ -1292,6 +1492,7 @@ class ObstacleAvoidanceLLMControlMixin:
                     reason = (
                         "llm_strategy_pointcloud_rule_v1: "
                         f"env={runtime_env} hint={runtime_hint} "
+                        f"source={llm_strategy.get('strategy_source', '') if isinstance(llm_strategy, dict) else ''} "
                         f"policy={llm_strategy.get('vertical_policy', '') if isinstance(llm_strategy, dict) else ''}; "
                         f"{rule_reason}"
                     )
