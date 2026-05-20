@@ -1,0 +1,115 @@
+{
+  "dataset_path": "obstacle_representation_2_data\\datasets\\a_plus_2_dataset_latest.npz",
+  "model_path": "obstacle_representation_2_data\\models\\a_plus_2_model.pt",
+  "model_version": "a_plus_2_v1",
+  "test_count": 495,
+  "accuracy": 0.9515151515151515,
+  "macro_f1": 0.8337932597288246,
+  "mask_iou": 0.8075402616250394,
+  "raw_forward_danger_violation_count": 9,
+  "raw_forward_danger_violation_rate": 0.08035714285714286,
+  "forward_danger_violation_count": 0,
+  "forward_danger_violation_rate": 0.0,
+  "red_front_blocked_count": 112,
+  "up_recall_when_front_blocked": 0.9803921568627451,
+  "up_needed_count": 102,
+  "per_class": {
+    "forward": {
+      "precision": 0.9854368932038835,
+      "recall": 0.918552036199095,
+      "f1": 0.9508196721311474,
+      "support": 221
+    },
+    "left": {
+      "precision": 0.9411764705882353,
+      "recall": 0.9876543209876543,
+      "f1": 0.963855421686747,
+      "support": 162
+    },
+    "right": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "support": 2
+    },
+    "up": {
+      "precision": 0.9803921568627451,
+      "recall": 0.9803921568627451,
+      "f1": 0.9803921568627451,
+      "support": 102
+    },
+    "backoff": {
+      "precision": 0.8,
+      "recall": 0.8,
+      "f1": 0.8000000000000002,
+      "support": 5
+    },
+    "hold": {
+      "precision": 0.2,
+      "recall": 0.6666666666666666,
+      "f1": 0.30769230769230765,
+      "support": 3
+    }
+  },
+  "confusion_matrix": [
+    [
+      203,
+      10,
+      0,
+      1,
+      0,
+      7
+    ],
+    [
+      2,
+      160,
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      2,
+      0,
+      0,
+      0
+    ],
+    [
+      0,
+      0,
+      0,
+      100,
+      1,
+      1
+    ],
+    [
+      0,
+      0,
+      0,
+      1,
+      4,
+      0
+    ],
+    [
+      1,
+      0,
+      0,
+      0,
+      0,
+      2
+    ]
+  ],
+  "direction_labels": [
+    "forward",
+    "left",
+    "right",
+    "up",
+    "backoff",
+    "hold"
+  ],
+  "latency_ms_mean": 0.6101137370510836,
+  "latency_ms_p95": 6.825199998274911,
+  "device": "cuda"
+}

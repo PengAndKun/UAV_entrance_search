@@ -1792,6 +1792,9 @@ class RunDroneFlightPanel(
             except Exception:
                 pass
             self.llm_route4_window = None
+            self.llm_route4_window_canvas = None
+            self.llm_route4_window_content = None
+            self.llm_route4_window_content_window = None
             self.llm_route4_map_widget = None
             self.llm_route4_preview_text = None
             self.llm_route4_analysis_text = None

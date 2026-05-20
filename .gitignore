@@ -64,3 +64,4 @@ stream_capture_lidar
 route_capture_lidar
 yolo26n.pt
 runs
+llm_route4_fusion_runs

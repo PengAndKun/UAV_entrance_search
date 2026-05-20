@@ -1,0 +1,75 @@
+{
+  "dataset_path": "obstacle_representation_2_data\\datasets\\a_plus_2_dataset_latest.npz",
+  "dataset_jsonl_path": "obstacle_representation_2_data\\datasets\\a_plus_2_dataset_latest.jsonl",
+  "total_samples": 2579,
+  "data_roots": [
+    "obstacle_avoidance_llm_data",
+    "obstacle_avoidance_2_data"
+  ],
+  "source_counts": {
+    "obstacle_avoidance_llm_data": 611,
+    "obstacle_avoidance_2_data": 1968
+  },
+  "direction_label_counts": {
+    "forward": 1459,
+    "left": 464,
+    "right": 38,
+    "up": 470,
+    "backoff": 115,
+    "hold": 33
+  },
+  "split_counts": {
+    "test": 495,
+    "train": 1829,
+    "val": 255
+  },
+  "group_split_counts": {
+    "test": 13,
+    "train": 62,
+    "val": 14
+  },
+  "red_front_blocked_count": 686,
+  "teacher_source_counts": {
+    "depth_pointcloud_vlm_cached_affordance": 2579
+  },
+  "missing_counts": {},
+  "direction_map": {
+    "forward": 0,
+    "left": 1,
+    "right": 2,
+    "up": 3,
+    "backoff": 4,
+    "hold": 5
+  },
+  "geometry_feature_names": [
+    "front_min_depth_cm",
+    "front_mean_depth_cm",
+    "left_min_depth_cm",
+    "right_min_depth_cm",
+    "up_min_depth_cm",
+    "down_min_depth_cm",
+    "nearest_distance_cm",
+    "obstacle_width_cm",
+    "obstacle_height_cm",
+    "obstacle_thickness_cm",
+    "corridor_count",
+    "valid_depth_count",
+    "invalid_depth_count",
+    "down_p05_depth_cm",
+    "down_close_fraction",
+    "distance_to_goal_cm",
+    "bearing_deg_body",
+    "dz_cm",
+    "forward_swept_clear",
+    "left_swept_clear",
+    "right_swept_clear",
+    "up_swept_clear",
+    "down_swept_clear",
+    "backoff_swept_clear"
+  ],
+  "image_size": 96,
+  "danger_depth_cm": 250.0,
+  "clearance_depth_cm": 450.0,
+  "built_at": "2026-05-21T00:47:03",
+  "seed": 42
+}
