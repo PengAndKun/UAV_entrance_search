@@ -1,0 +1,248 @@
+from __future__ import annotations
+
+from .common import *
+
+
+class ObstacleRepresentationControlMixin:
+    def ensure_obstacle_representation_state(self) -> None:
+        if not hasattr(self, "obstacle_representation_model_var"):
+            self.obstacle_representation_model_var = tk.StringVar(
+                value=str(PROJECT_ROOT / "obstacle_representation_data" / "models" / "scheme_a_model.pt")
+            )
+        if not hasattr(self, "obstacle_representation_status_var"):
+            self.obstacle_representation_status_var = tk.StringVar(value="Obstacle Representation: idle")
+        if not hasattr(self, "obstacle_representation_result_var"):
+            self.obstacle_representation_result_var = tk.StringVar(value="Result: --")
+        if not hasattr(self, "obstacle_representation_capture_dir_var"):
+            self.obstacle_representation_capture_dir_var = tk.StringVar(value="Capture: --")
+        if not hasattr(self, "obstacle_representation_window"):
+            self.obstacle_representation_window = None
+        if not hasattr(self, "obstacle_representation_rgb_label"):
+            self.obstacle_representation_rgb_label = None
+        if not hasattr(self, "obstacle_representation_mask_label"):
+            self.obstacle_representation_mask_label = None
+        if not hasattr(self, "obstacle_representation_rgb_photo"):
+            self.obstacle_representation_rgb_photo = None
+        if not hasattr(self, "obstacle_representation_mask_photo"):
+            self.obstacle_representation_mask_photo = None
+        if not hasattr(self, "obstacle_representation_report_text"):
+            self.obstacle_representation_report_text = None
+        if not hasattr(self, "obstacle_representation_thread"):
+            self.obstacle_representation_thread = None
+        if not hasattr(self, "obstacle_representation_frame_index"):
+            self.obstacle_representation_frame_index = 0
+
+    def open_obstacle_representation_window(self) -> None:
+        self.ensure_obstacle_representation_state()
+        if self.obstacle_representation_window is not None and self.obstacle_representation_window.winfo_exists():
+            self.obstacle_representation_window.lift()
+            return
+        window = tk.Toplevel(self.root)
+        self.obstacle_representation_window = window
+        window.title("Obstacle Representation Demo")
+        window.geometry("1120x760")
+        window.protocol("WM_DELETE_WINDOW", self.close_obstacle_representation_window)
+
+        storage = tk.LabelFrame(window, text="Scheme A Model")
+        storage.pack(fill="x", padx=8, pady=6)
+        storage.grid_columnconfigure(1, weight=1)
+        tk.Label(storage, text="Model").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        tk.Entry(storage, textvariable=self.obstacle_representation_model_var).grid(
+            row=0, column=1, sticky="ew", padx=6, pady=6
+        )
+        tk.Button(storage, text="Browse", command=self.select_obstacle_representation_model).grid(
+            row=0, column=2, padx=6, pady=6
+        )
+        tk.Button(storage, text="Default", command=self.use_default_obstacle_representation_model).grid(
+            row=0, column=3, padx=6, pady=6
+        )
+
+        actions = tk.LabelFrame(window, text="Demo Inference")
+        actions.pack(fill="x", padx=8, pady=4)
+        tk.Button(actions, text="Analyze Current Frame", command=self.run_obstacle_representation_demo).pack(
+            side="left", padx=6, pady=6
+        )
+        tk.Label(actions, textvariable=self.obstacle_representation_status_var, anchor="w").pack(
+            side="left", fill="x", expand=True, padx=12, pady=6
+        )
+
+        result = tk.LabelFrame(window, text="Prediction")
+        result.pack(fill="x", padx=8, pady=4)
+        tk.Label(result, textvariable=self.obstacle_representation_result_var, anchor="w").pack(
+            fill="x", padx=6, pady=(6, 2)
+        )
+        tk.Label(result, textvariable=self.obstacle_representation_capture_dir_var, anchor="w").pack(
+            fill="x", padx=6, pady=(2, 6)
+        )
+
+        previews = tk.Frame(window)
+        previews.pack(fill="both", expand=True, padx=8, pady=4)
+        previews.grid_columnconfigure(0, weight=1)
+        previews.grid_columnconfigure(1, weight=1)
+        previews.grid_rowconfigure(0, weight=1)
+
+        rgb_frame = tk.LabelFrame(previews, text="RGB")
+        rgb_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=4)
+        mask_frame = tk.LabelFrame(previews, text="Model Segmentation Demo")
+        mask_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=4)
+        self.obstacle_representation_rgb_label = tk.Label(rgb_frame, text="No image")
+        self.obstacle_representation_rgb_label.pack(fill="both", expand=True, padx=6, pady=6)
+        self.obstacle_representation_mask_label = tk.Label(mask_frame, text="No mask")
+        self.obstacle_representation_mask_label.pack(fill="both", expand=True, padx=6, pady=6)
+
+        report = tk.LabelFrame(window, text="Report")
+        report.pack(fill="both", padx=8, pady=(4, 8))
+        self.obstacle_representation_report_text = tk.Text(report, height=7, wrap="word")
+        self.obstacle_representation_report_text.pack(fill="both", expand=True, padx=6, pady=6)
+
+    def close_obstacle_representation_window(self) -> None:
+        if self.obstacle_representation_window is not None and self.obstacle_representation_window.winfo_exists():
+            self.obstacle_representation_window.destroy()
+        self.obstacle_representation_window = None
+        self.obstacle_representation_rgb_label = None
+        self.obstacle_representation_mask_label = None
+        self.obstacle_representation_rgb_photo = None
+        self.obstacle_representation_mask_photo = None
+        self.obstacle_representation_report_text = None
+
+    def select_obstacle_representation_model(self) -> None:
+        self.ensure_obstacle_representation_state()
+        path = filedialog.askopenfilename(
+            title="Select Scheme A model",
+            filetypes=[("PyTorch model", "*.pt"), ("All files", "*.*")],
+            initialdir=str(PROJECT_ROOT / "obstacle_representation_data" / "models"),
+        )
+        if path:
+            self.obstacle_representation_model_var.set(path)
+
+    def use_default_obstacle_representation_model(self) -> None:
+        self.ensure_obstacle_representation_state()
+        self.obstacle_representation_model_var.set(
+            str(PROJECT_ROOT / "obstacle_representation_data" / "models" / "scheme_a_model.pt")
+        )
+
+    def run_obstacle_representation_demo(self) -> None:
+        self.ensure_obstacle_representation_state()
+        session = self.active_session()
+        if session is None:
+            return
+        thread = getattr(self, "obstacle_representation_thread", None)
+        if thread is not None and thread.is_alive():
+            self.obstacle_representation_status_var.set("Obstacle Representation: analysis already running")
+            return
+        model_path = Path(self.obstacle_representation_model_var.get().strip()).expanduser()
+        if not model_path.is_file():
+            self.obstacle_representation_status_var.set(f"Obstacle Representation: model not found: {model_path}")
+            return
+
+        def worker() -> None:
+            self.root.after(
+                0,
+                lambda: self.obstacle_representation_status_var.set(
+                    "Obstacle Representation: capturing current frame..."
+                ),
+            )
+            try:
+                result = self._capture_and_predict_obstacle_representation(session, model_path)
+                self.root.after(0, lambda r=result: self.apply_obstacle_representation_result(r))
+            except Exception as exc:
+                self.root.after(
+                    0,
+                    lambda e=exc: self.obstacle_representation_status_var.set(
+                        f"Obstacle Representation failed: {e}"
+                    ),
+                )
+
+        self.obstacle_representation_thread = threading.Thread(target=worker, daemon=True)
+        self.obstacle_representation_thread.start()
+
+    def _capture_and_predict_obstacle_representation(
+        self,
+        session: flight.DroneFlightSession,
+        model_path: Path,
+    ) -> Dict[str, Any]:
+        self.sync_capture_options_to_session(session)
+        demo_root = PROJECT_ROOT / "obstacle_representation_data" / "demo_captures"
+        run_dir = demo_root / datetime.now().strftime("%Y%m%d-%H%M%S_obstacle_representation")
+        old_mode = str(getattr(session.args, "lidar_capture_processing", flight.DEFAULT_LIDAR_CAPTURE_PROCESSING))
+        try:
+            session.args.lidar_capture_processing = "minimal"
+            frame_index = int(getattr(self, "obstacle_representation_frame_index", 0))
+            self.obstacle_representation_frame_index = frame_index + 1
+            capture = session.capture_lidar_stream_frame(
+                str(run_dir),
+                frame_index,
+                {
+                    "source": "obstacle_representation_demo",
+                    "action_name": "analyze_current_frame",
+                },
+            )
+        finally:
+            session.args.lidar_capture_processing = old_mode
+        summary = capture.get("pointcloud_summary")
+        if not isinstance(summary, dict):
+            summary = capture.get("depth_obstacle_summary") if isinstance(capture.get("depth_obstacle_summary"), dict) else {}
+        event = {
+            "rgb_path": capture.get("rgb_path", ""),
+            "depth_npy_path": capture.get("depth_npy_path", ""),
+            "capture_dir": capture.get("capture_dir", ""),
+            "pose": capture.get("pose", {}),
+            "pointcloud_summary": summary,
+            "depth_obstacle_summary": capture.get("depth_obstacle_summary", {}),
+            "relative_target": {},
+        }
+        from obstacle_representation.demo import predict_obstacle_representation, render_prediction_mask
+
+        prediction = predict_obstacle_representation(model_path, event["rgb_path"], event)
+        rgb_image = np.asarray(Image.open(event["rgb_path"]).convert("RGB"), dtype=np.uint8)
+        depth_path = Path(str(event.get("depth_npy_path", "") or ""))
+        depth_image = np.load(depth_path) if depth_path.is_file() else None
+        mask_image = render_prediction_mask(rgb_image, depth_image, prediction)
+        return {
+            "capture": capture,
+            "event": event,
+            "prediction": prediction,
+            "rgb_image": rgb_image,
+            "mask_image": mask_image,
+        }
+
+    def obstacle_representation_array_to_photo(
+        self,
+        image: np.ndarray,
+        *,
+        max_width: int = 520,
+        max_height: int = 360,
+    ) -> ImageTk.PhotoImage:
+        pil = Image.fromarray(np.asarray(image, dtype=np.uint8))
+        scale = min(max_width / max(1, pil.width), max_height / max(1, pil.height), 1.0)
+        if scale < 1.0:
+            pil = pil.resize((max(1, int(pil.width * scale)), max(1, int(pil.height * scale))), Image.Resampling.LANCZOS)
+        return ImageTk.PhotoImage(pil)
+
+    def apply_obstacle_representation_result(self, result: Dict[str, Any]) -> None:
+        prediction = result.get("prediction") if isinstance(result.get("prediction"), dict) else {}
+        event = result.get("event") if isinstance(result.get("event"), dict) else {}
+        summary = event.get("pointcloud_summary") if isinstance(event.get("pointcloud_summary"), dict) else {}
+        label = str(prediction.get("predicted_label", "unknown"))
+        confidence = float(prediction.get("confidence", 0.0) or 0.0)
+        flyover_probability = float(prediction.get("flyover_probability", 0.0) or 0.0)
+        self.obstacle_representation_status_var.set("Obstacle Representation: done")
+        self.obstacle_representation_result_var.set(
+            f"Result: label={label}, confidence={confidence:.3f}, "
+            f"flyover={flyover_probability:.3f}, front={float(summary.get('front_min_depth_cm', 0.0) or 0.0):.1f} cm"
+        )
+        self.obstacle_representation_capture_dir_var.set(f"Capture: {event.get('capture_dir', '--')}")
+        if self.obstacle_representation_rgb_label is not None and isinstance(result.get("rgb_image"), np.ndarray):
+            self.obstacle_representation_rgb_photo = self.obstacle_representation_array_to_photo(result["rgb_image"])
+            self.obstacle_representation_rgb_label.configure(image=self.obstacle_representation_rgb_photo, text="")
+        if self.obstacle_representation_mask_label is not None and isinstance(result.get("mask_image"), np.ndarray):
+            self.obstacle_representation_mask_photo = self.obstacle_representation_array_to_photo(result["mask_image"])
+            self.obstacle_representation_mask_label.configure(image=self.obstacle_representation_mask_photo, text="")
+        if self.obstacle_representation_report_text is not None:
+            payload = {
+                "prediction": prediction,
+                "pointcloud_summary": summary,
+                "capture_dir": event.get("capture_dir", ""),
+            }
+            self.obstacle_representation_report_text.delete("1.0", "end")
+            self.obstacle_representation_report_text.insert("end", json.dumps(payload, indent=2, ensure_ascii=False))

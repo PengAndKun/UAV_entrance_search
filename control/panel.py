@@ -8,6 +8,7 @@ from .map_control import MapControlMixin
 from .obstacle_avoidance_2_control import ObstacleAvoidance2ControlMixin
 from .obstacle_avoidance_llm_control import ObstacleAvoidanceLLMControlMixin
 from .obstacle_avoidance_control import ObstacleAvoidanceControlMixin
+from .obstacle_representation_control import ObstacleRepresentationControlMixin
 from .route_control import RouteControlMixin
 
 
@@ -20,6 +21,7 @@ class RunDroneFlightPanel(
     ObstacleAvoidanceControlMixin,
     ObstacleAvoidance2ControlMixin,
     ObstacleAvoidanceLLMControlMixin,
+    ObstacleRepresentationControlMixin,
 ):
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -219,6 +221,12 @@ class RunDroneFlightPanel(
         self.obstacle_avoidance_2_scenario_var = tk.StringVar(value="")
         self.obstacle_avoidance_2_obstacle_hint_var = tk.StringVar(value="unknown")
         self.obstacle_avoidance_2_note_var = tk.StringVar(value="")
+        self.obstacle_representation_model_var = tk.StringVar(
+            value=str(PROJECT_ROOT / "obstacle_representation_data" / "models" / "scheme_a_model.pt")
+        )
+        self.obstacle_representation_status_var = tk.StringVar(value="Obstacle Representation: idle")
+        self.obstacle_representation_result_var = tk.StringVar(value="Result: --")
+        self.obstacle_representation_capture_dir_var = tk.StringVar(value="Capture: --")
         self.stream_analysis_status_var = tk.StringVar(value="Analysis: idle")
         self.stream_analysis_stream_dir_var = tk.StringVar(value="")
         self.stream_analysis_weights_var = tk.StringVar(value="")
@@ -309,6 +317,14 @@ class RunDroneFlightPanel(
         self.obstacle_avoidance_stop_event = threading.Event()
         self.obstacle_avoidance_session_dir: Optional[Path] = None
         self.obstacle_avoidance_frame_index = 0
+        self.obstacle_representation_window: Optional[tk.Toplevel] = None
+        self.obstacle_representation_rgb_label: Optional[tk.Label] = None
+        self.obstacle_representation_mask_label: Optional[tk.Label] = None
+        self.obstacle_representation_rgb_photo: Optional[ImageTk.PhotoImage] = None
+        self.obstacle_representation_mask_photo: Optional[ImageTk.PhotoImage] = None
+        self.obstacle_representation_report_text: Optional[tk.Text] = None
+        self.obstacle_representation_thread: Optional[threading.Thread] = None
+        self.obstacle_representation_frame_index = 0
         self.map_window: Optional[tk.Toplevel] = None
         self.map_widget: Optional[OverheadMapWidget] = None
         self.map_refresh_inflight = False
@@ -753,6 +769,9 @@ class RunDroneFlightPanel(
             state="readonly",
             width=8,
         ).grid(row=2, column=6, sticky="w", padx=(0, 8), pady=(0, 6))
+        tk.Button(stream, text="Obstacle Representation", command=self.open_obstacle_representation_window).grid(
+            row=2, column=7, sticky="w", padx=6, pady=(0, 6)
+        )
         tk.Label(stream, textvariable=self.stream_status_var, anchor="w").grid(row=3, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
         tk.Label(stream, textvariable=self.lidar_stream_status_var, anchor="w").grid(row=4, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
         tk.Label(stream, textvariable=self.lidar_stream_analysis_status_var, anchor="w").grid(row=5, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
