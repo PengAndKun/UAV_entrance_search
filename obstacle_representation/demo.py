@@ -11,8 +11,9 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import torch
 from PIL import Image
 
-from .model import SchemeAObstacleNet
+from .model import SchemeAObstacleNet, SchemeAPlusObstacleNet
 from .schema import GEOMETRY_FEATURE_NAMES, OBSTACLE_LABELS, geometry_vector
+from .train import load_depth_array
 
 
 LABEL_COLORS: Dict[str, Tuple[int, int, int]] = {
@@ -26,7 +27,7 @@ LABEL_COLORS: Dict[str, Tuple[int, int, int]] = {
 }
 
 
-def _load_checkpoint(model_path: Path, device: torch.device) -> Tuple[SchemeAObstacleNet, Dict[str, Any]]:
+def _load_checkpoint(model_path: Path, device: torch.device) -> Tuple[torch.nn.Module, Dict[str, Any]]:
     try:
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     except TypeError:
@@ -34,7 +35,10 @@ def _load_checkpoint(model_path: Path, device: torch.device) -> Tuple[SchemeAObs
     config = checkpoint.get("config", {})
     labels = list(config.get("labels", OBSTACLE_LABELS))
     geometry_dim = int(config.get("geometry_dim", len(GEOMETRY_FEATURE_NAMES)))
-    model = SchemeAObstacleNet(num_labels=len(labels), geometry_dim=geometry_dim).to(device)
+    if bool(config.get("use_depth", False)):
+        model = SchemeAPlusObstacleNet(num_labels=len(labels), geometry_dim=geometry_dim).to(device)
+    else:
+        model = SchemeAObstacleNet(num_labels=len(labels), geometry_dim=geometry_dim).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model, checkpoint
@@ -46,6 +50,12 @@ def _rgb_tensor_from_path(image_path: Path, image_size: int, device: torch.devic
         arr = np.asarray(rgb, dtype=np.float32) / 255.0
     arr = np.transpose(arr, (2, 0, 1))
     return torch.from_numpy(arr).unsqueeze(0).to(device)
+
+
+def _depth_tensor_from_event(event: Dict[str, Any], image_size: int, device: torch.device) -> torch.Tensor:
+    depth_path = str(event.get("depth_npy_path") or event.get("depth_path") or "")
+    depth = load_depth_array(depth_path, image_size)
+    return torch.from_numpy(depth.copy()).unsqueeze(0).to(device)
 
 
 def predict_obstacle_representation(
@@ -67,6 +77,8 @@ def predict_obstacle_representation(
     config = checkpoint.get("config", {})
     labels: List[str] = list(config.get("labels", OBSTACLE_LABELS))
     image_size = int(config.get("image_size", 96))
+    model_version = str(config.get("model_version", "scheme_a_v1"))
+    use_depth = bool(config.get("use_depth", False))
 
     geometry = geometry_vector(event)
     mean = np.asarray(checkpoint.get("geometry_mean", np.zeros_like(geometry)), dtype=np.float32)
@@ -76,22 +88,27 @@ def predict_obstacle_representation(
         raise ValueError(f"checkpoint geometry shape mismatch: model={mean.shape[0]} event={geometry.shape[0]}")
     geometry_tensor = torch.from_numpy(((geometry - mean) / std).astype(np.float32)).unsqueeze(0).to(device)
     rgb_tensor = _rgb_tensor_from_path(rgb_path, image_size, device)
+    depth_tensor = _depth_tensor_from_event(event, image_size, device) if use_depth else None
 
     with torch.no_grad():
-        output = model(rgb_tensor, geometry_tensor)
+        output = model(rgb_tensor, geometry_tensor, depth_tensor) if use_depth else model(rgb_tensor, geometry_tensor)
         probabilities_tensor = torch.softmax(output["label_logits"], dim=1)[0].detach().cpu()
         flyover_probability = float(torch.sigmoid(output["flyover_logits"])[0].detach().cpu().item())
     probabilities = {label: float(probabilities_tensor[idx].item()) for idx, label in enumerate(labels)}
     best_index = int(torch.argmax(probabilities_tensor).item())
     top3 = sorted(probabilities.items(), key=lambda item: item[1], reverse=True)[:3]
     predicted_label = labels[best_index] if 0 <= best_index < len(labels) else "unknown"
+    building_vs_fence_margin = float(probabilities.get("building", 0.0) - probabilities.get("fence_or_rail", 0.0))
     return {
         "model_path": str(model_path),
+        "model_version": model_version,
+        "use_depth": bool(use_depth),
         "rgb_path": str(rgb_path),
         "predicted_label": predicted_label,
         "confidence": float(probabilities.get(predicted_label, 0.0)),
         "probabilities": probabilities,
         "top3": [{"label": label, "probability": probability} for label, probability in top3],
+        "building_vs_fence_margin": building_vs_fence_margin,
         "flyover_probability": flyover_probability,
         "flyover_recommended": bool(flyover_probability >= 0.5),
         "device": str(device),

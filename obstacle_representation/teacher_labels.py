@@ -77,6 +77,22 @@ def flyover_recommended_for_label(label: str, event: Dict[str, Any]) -> bool:
 
 
 def teacher_label_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    manual_label = event.get("manual_label") or event.get("manual_obstacle_label")
+    if manual_label:
+        label = canonical_obstacle_label(manual_label, event)
+        return {
+            "label": label,
+            "label_index": OBSTACLE_LABELS.index(label),
+            "raw_label": str(manual_label or ""),
+            "teacher_source": "manual_hard_label",
+            "flyover_recommended": bool(
+                event.get("flyover_recommended")
+                if "flyover_recommended" in event
+                else flyover_recommended_for_label(label, event)
+            ),
+            "sample_weight": float(as_float(event.get("sample_weight"), 3.0) or 3.0),
+            "is_manual_hard_case": True,
+        }
     strategy = _strategy(event)
     raw_label = (
         strategy.get("obstacle_hint")
@@ -90,10 +106,17 @@ def teacher_label_from_event(event: Dict[str, Any]) -> Dict[str, Any]:
     if label == "unknown":
         label = geometry_label_from_event(event)
         source = "pointcloud_geometry" if label != "unknown" else source
+    default_weight = {
+        "llm_strategy": 1.5,
+        "event_metadata": 0.8,
+        "pointcloud_geometry": 0.7,
+    }.get(source, 1.0)
     return {
         "label": label,
         "label_index": OBSTACLE_LABELS.index(label),
         "raw_label": str(raw_label or ""),
         "teacher_source": source,
         "flyover_recommended": bool(flyover_recommended_for_label(label, event)),
+        "sample_weight": float(default_weight),
+        "is_manual_hard_case": False,
     }

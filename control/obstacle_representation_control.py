@@ -4,11 +4,14 @@ from .common import *
 
 
 class ObstacleRepresentationControlMixin:
+    def default_obstacle_representation_model_path(self) -> Path:
+        plus = PROJECT_ROOT / "obstacle_representation_data" / "models" / "scheme_a_plus_model.pt"
+        legacy = PROJECT_ROOT / "obstacle_representation_data" / "models" / "scheme_a_model.pt"
+        return plus if plus.is_file() else legacy
+
     def ensure_obstacle_representation_state(self) -> None:
         if not hasattr(self, "obstacle_representation_model_var"):
-            self.obstacle_representation_model_var = tk.StringVar(
-                value=str(PROJECT_ROOT / "obstacle_representation_data" / "models" / "scheme_a_model.pt")
-            )
+            self.obstacle_representation_model_var = tk.StringVar(value=str(self.default_obstacle_representation_model_path()))
         if not hasattr(self, "obstacle_representation_status_var"):
             self.obstacle_representation_status_var = tk.StringVar(value="Obstacle Representation: idle")
         if not hasattr(self, "obstacle_representation_result_var"):
@@ -89,6 +92,11 @@ class ObstacleRepresentationControlMixin:
         self.obstacle_representation_rgb_label.pack(fill="both", expand=True, padx=6, pady=6)
         self.obstacle_representation_mask_label = tk.Label(mask_frame, text="No mask")
         self.obstacle_representation_mask_label.pack(fill="both", expand=True, padx=6, pady=6)
+        tk.Label(
+            mask_frame,
+            text="Depth obstacle mask + predicted class color; this is not pixel-level segmentation.",
+            anchor="w",
+        ).pack(fill="x", padx=6, pady=(0, 6))
 
         report = tk.LabelFrame(window, text="Report")
         report.pack(fill="both", padx=8, pady=(4, 8))
@@ -117,9 +125,7 @@ class ObstacleRepresentationControlMixin:
 
     def use_default_obstacle_representation_model(self) -> None:
         self.ensure_obstacle_representation_state()
-        self.obstacle_representation_model_var.set(
-            str(PROJECT_ROOT / "obstacle_representation_data" / "models" / "scheme_a_model.pt")
-        )
+        self.obstacle_representation_model_var.set(str(self.default_obstacle_representation_model_path()))
 
     def run_obstacle_representation_demo(self) -> None:
         self.ensure_obstacle_representation_state()
@@ -194,6 +200,7 @@ class ObstacleRepresentationControlMixin:
         from obstacle_representation.demo import predict_obstacle_representation, render_prediction_mask
 
         prediction = predict_obstacle_representation(model_path, event["rgb_path"], event)
+        event["is_manual_hard_case"] = self.obstacle_representation_is_manual_hard_case(event)
         rgb_image = np.asarray(Image.open(event["rgb_path"]).convert("RGB"), dtype=np.uint8)
         depth_path = Path(str(event.get("depth_npy_path", "") or ""))
         depth_image = np.load(depth_path) if depth_path.is_file() else None
@@ -229,7 +236,8 @@ class ObstacleRepresentationControlMixin:
         self.obstacle_representation_status_var.set("Obstacle Representation: done")
         self.obstacle_representation_result_var.set(
             f"Result: label={label}, confidence={confidence:.3f}, "
-            f"flyover={flyover_probability:.3f}, front={float(summary.get('front_min_depth_cm', 0.0) or 0.0):.1f} cm"
+            f"flyover={flyover_probability:.3f}, front={float(summary.get('front_min_depth_cm', 0.0) or 0.0):.1f} cm, "
+            f"model={prediction.get('model_version', 'unknown')}"
         )
         self.obstacle_representation_capture_dir_var.set(f"Capture: {event.get('capture_dir', '--')}")
         if self.obstacle_representation_rgb_label is not None and isinstance(result.get("rgb_image"), np.ndarray):
@@ -242,7 +250,31 @@ class ObstacleRepresentationControlMixin:
             payload = {
                 "prediction": prediction,
                 "pointcloud_summary": summary,
+                "is_manual_hard_case": bool(event.get("is_manual_hard_case", False)),
                 "capture_dir": event.get("capture_dir", ""),
             }
             self.obstacle_representation_report_text.delete("1.0", "end")
             self.obstacle_representation_report_text.insert("end", json.dumps(payload, indent=2, ensure_ascii=False))
+
+    def obstacle_representation_is_manual_hard_case(self, event: Dict[str, Any]) -> bool:
+        manual_path = PROJECT_ROOT / "obstacle_representation_data" / "manual_labels" / "hard_cases.jsonl"
+        if not manual_path.is_file():
+            return False
+        rgb_path = str(event.get("rgb_path", "") or "")
+        capture_dir = str(event.get("capture_dir", "") or "")
+        try:
+            for line in manual_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    continue
+                row_rgb = str(row.get("rgb_path", "") or "")
+                row_capture = str(row.get("capture_json_path", "") or "")
+                if row_rgb and (row_rgb in rgb_path or Path(row_rgb).name == Path(rgb_path).name and Path(row_rgb).parent.name == Path(rgb_path).parent.name):
+                    return True
+                if row_capture and capture_dir and Path(row_capture).parent.name == Path(capture_dir).name:
+                    return True
+        except Exception:
+            return False
+        return False

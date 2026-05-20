@@ -221,8 +221,10 @@ class RunDroneFlightPanel(
         self.obstacle_avoidance_2_scenario_var = tk.StringVar(value="")
         self.obstacle_avoidance_2_obstacle_hint_var = tk.StringVar(value="unknown")
         self.obstacle_avoidance_2_note_var = tk.StringVar(value="")
+        obstacle_representation_plus_model = PROJECT_ROOT / "obstacle_representation_data" / "models" / "scheme_a_plus_model.pt"
+        obstacle_representation_legacy_model = PROJECT_ROOT / "obstacle_representation_data" / "models" / "scheme_a_model.pt"
         self.obstacle_representation_model_var = tk.StringVar(
-            value=str(PROJECT_ROOT / "obstacle_representation_data" / "models" / "scheme_a_model.pt")
+            value=str(obstacle_representation_plus_model if obstacle_representation_plus_model.is_file() else obstacle_representation_legacy_model)
         )
         self.obstacle_representation_status_var = tk.StringVar(value="Obstacle Representation: idle")
         self.obstacle_representation_result_var = tk.StringVar(value="Result: --")

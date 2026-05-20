@@ -11,9 +11,10 @@ import numpy as np
 import torch
 from PIL import Image
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-from .model import SchemeAObstacleNet
+from .model import SchemeAObstacleNet, SchemeAPlusObstacleNet
 from .schema import GEOMETRY_FEATURE_NAMES, LABEL_TO_INDEX, OBSTACLE_LABELS
 
 
@@ -31,15 +32,25 @@ class SchemeADataset(Dataset):
         flyover: np.ndarray,
         indices: np.ndarray,
         *,
+        depth_paths: np.ndarray | None = None,
+        sample_weights: np.ndarray | None = None,
+        use_depth: bool = False,
         image_size: int,
         geometry_mean: np.ndarray,
         geometry_std: np.ndarray,
     ) -> None:
         self.image_paths = image_paths.astype(str)
+        self.depth_paths = depth_paths.astype(str) if depth_paths is not None else np.asarray([""] * len(image_paths), dtype=str)
         self.geometry = geometry.astype(np.float32, copy=False)
         self.labels = labels.astype(np.int64, copy=False)
         self.flyover = flyover.astype(np.float32, copy=False)
+        self.sample_weights = (
+            sample_weights.astype(np.float32, copy=False)
+            if sample_weights is not None
+            else np.ones_like(self.flyover, dtype=np.float32)
+        )
         self.indices = indices.astype(np.int64, copy=False)
+        self.use_depth = bool(use_depth)
         self.image_size = int(image_size)
         self.geometry_mean = geometry_mean.astype(np.float32, copy=False)
         self.geometry_std = geometry_std.astype(np.float32, copy=False)
@@ -54,22 +65,50 @@ class SchemeADataset(Dataset):
             rgb_arr = np.asarray(rgb, dtype=np.float32) / 255.0
         rgb_arr = np.transpose(rgb_arr, (2, 0, 1))
         geom = (self.geometry[idx] - self.geometry_mean) / self.geometry_std
-        return {
+        item = {
             "rgb": torch.from_numpy(rgb_arr),
             "geometry": torch.from_numpy(geom.astype(np.float32, copy=False)),
             "label": torch.tensor(int(self.labels[idx]), dtype=torch.long),
             "flyover": torch.tensor(float(self.flyover[idx]), dtype=torch.float32),
+            "sample_weight": torch.tensor(float(self.sample_weights[idx]), dtype=torch.float32),
         }
+        if self.use_depth:
+            item["depth"] = torch.from_numpy(load_depth_array(self.depth_paths[idx], self.image_size).copy())
+        return item
+
+
+def load_depth_array(depth_path: str, image_size: int) -> np.ndarray:
+    try:
+        depth = np.load(str(depth_path)).astype(np.float32)
+    except Exception:
+        depth = np.zeros((int(image_size), int(image_size)), dtype=np.float32)
+    if depth.ndim == 3:
+        depth = depth[..., 0]
+    depth = np.squeeze(depth)
+    if depth.ndim != 2:
+        depth = np.zeros((int(image_size), int(image_size)), dtype=np.float32)
+    valid = np.isfinite(depth) & (depth > 0.0) & (depth < 65000.0)
+    cleaned = np.zeros(depth.shape, dtype=np.float32)
+    cleaned[valid] = np.clip(depth[valid], 0.0, 1200.0) / 1200.0
+    pil = Image.fromarray(cleaned.astype(np.float32), mode="F")
+    resized = pil.resize((int(image_size), int(image_size)), Image.BILINEAR)
+    return np.asarray(resized, dtype=np.float32)[None, :, :]
 
 
 def load_dataset_arrays(dataset_path: Path) -> Dict[str, np.ndarray]:
     data = np.load(dataset_path, allow_pickle=True)
+    n = int(data["image_paths"].shape[0])
     return {
         "image_paths": data["image_paths"],
+        "depth_paths": data["depth_paths"] if "depth_paths" in data else np.asarray([""] * n, dtype=object),
         "geometry": data["geometry"].astype(np.float32),
         "label_indices": data["label_indices"].astype(np.int64),
         "flyover": data["flyover"].astype(np.float32),
+        "sample_weights": data["sample_weights"].astype(np.float32) if "sample_weights" in data else np.ones(n, dtype=np.float32),
         "splits": data["splits"].astype(str),
+        "teacher_sources": data["teacher_sources"].astype(str) if "teacher_sources" in data else np.asarray(["unknown"] * n, dtype=str),
+        "group_ids": data["group_ids"].astype(str) if "group_ids" in data else np.asarray([""] * n, dtype=str),
+        "is_manual_hard_case": data["is_manual_hard_case"].astype(bool) if "is_manual_hard_case" in data else np.zeros(n, dtype=bool),
     }
 
 
@@ -80,13 +119,13 @@ def accuracy_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> float:
 
 
 def run_epoch(
-    model: SchemeAObstacleNet,
+    model: nn.Module,
     loader: DataLoader,
     *,
     optimizer: torch.optim.Optimizer | None,
-    label_loss_fn: nn.Module,
-    flyover_loss_fn: nn.Module,
+    class_weights: torch.Tensor,
     device: torch.device,
+    use_depth: bool,
 ) -> Dict[str, float]:
     training = optimizer is not None
     model.train(training)
@@ -99,13 +138,17 @@ def run_epoch(
         geometry = batch["geometry"].to(device)
         labels = batch["label"].to(device)
         flyover = batch["flyover"].to(device)
+        weights = batch["sample_weight"].to(device)
+        depth = batch.get("depth")
+        depth_tensor = depth.to(device) if use_depth and depth is not None else None
         if training:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(training):
-            out = model(rgb, geometry)
-            label_loss = label_loss_fn(out["label_logits"], labels)
-            flyover_loss = flyover_loss_fn(out["flyover_logits"], flyover)
-            loss = label_loss + 0.3 * flyover_loss
+            out = model(rgb, geometry, depth_tensor) if use_depth else model(rgb, geometry)
+            label_loss = F.cross_entropy(out["label_logits"], labels, weight=class_weights, reduction="none")
+            flyover_loss = F.binary_cross_entropy_with_logits(out["flyover_logits"], flyover, reduction="none")
+            loss_each = label_loss + 0.3 * flyover_loss
+            loss = torch.sum(loss_each * weights) / torch.clamp(torch.sum(weights), min=1.0)
             if training:
                 loss.backward()
                 optimizer.step()
@@ -133,6 +176,7 @@ def train_model(
     image_size: int = 96,
     learning_rate: float = 1e-3,
     seed: int = 42,
+    model_version: str = "scheme_a",
 ) -> Dict[str, Any]:
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -140,8 +184,10 @@ def train_model(
     output_root = output_root or dataset_path.parents[1]
     model_dir = output_root / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
-    model_path = model_dir / "scheme_a_model.pt"
-    metrics_path = model_dir / "training_metrics.json"
+    use_depth = str(model_version).strip().lower() in {"scheme_a_plus", "scheme_a_plus_v1", "a_plus"}
+    normalized_model_version = "scheme_a_plus_v1" if use_depth else "scheme_a_v1"
+    model_path = model_dir / ("scheme_a_plus_model.pt" if use_depth else "scheme_a_model.pt")
+    metrics_path = model_dir / ("training_metrics_scheme_a_plus.json" if use_depth else "training_metrics.json")
     label_map_path = model_dir / "label_map.json"
 
     arrays = load_dataset_arrays(dataset_path)
@@ -163,6 +209,9 @@ def train_model(
         arrays["label_indices"],
         arrays["flyover"],
         train_indices,
+        depth_paths=arrays["depth_paths"],
+        sample_weights=arrays["sample_weights"],
+        use_depth=use_depth,
         image_size=image_size,
         geometry_mean=geometry_mean,
         geometry_std=geometry_std,
@@ -173,21 +222,34 @@ def train_model(
         arrays["label_indices"],
         arrays["flyover"],
         val_indices,
+        depth_paths=arrays["depth_paths"],
+        sample_weights=arrays["sample_weights"],
+        use_depth=use_depth,
         image_size=image_size,
         geometry_mean=geometry_mean,
         geometry_std=geometry_std,
     )
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    sampler_weights = arrays["sample_weights"][train_indices].astype(np.float32, copy=True)
+    building_fence = np.isin(arrays["label_indices"][train_indices], [LABEL_TO_INDEX["building"], LABEL_TO_INDEX["fence_or_rail"]])
+    sampler_weights[building_fence] *= 1.5
+    sampler = WeightedRandomSampler(
+        weights=torch.as_tensor(np.maximum(sampler_weights, 1e-3), dtype=torch.double),
+        num_samples=int(train_indices.size),
+        replacement=True,
+    )
+    train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SchemeAObstacleNet(num_labels=len(OBSTACLE_LABELS), geometry_dim=len(GEOMETRY_FEATURE_NAMES)).to(device)
+    if use_depth:
+        model: nn.Module = SchemeAPlusObstacleNet(num_labels=len(OBSTACLE_LABELS), geometry_dim=len(GEOMETRY_FEATURE_NAMES)).to(device)
+    else:
+        model = SchemeAObstacleNet(num_labels=len(OBSTACLE_LABELS), geometry_dim=len(GEOMETRY_FEATURE_NAMES)).to(device)
     class_counts = np.bincount(arrays["label_indices"][train_indices], minlength=len(OBSTACLE_LABELS)).astype(np.float32)
     class_weights = np.where(class_counts > 0, 1.0 / np.sqrt(np.maximum(class_counts, 1.0)), 0.0)
     if float(class_weights.sum()) > 0.0:
         class_weights = class_weights / class_weights[class_weights > 0].mean()
-    label_loss_fn = nn.CrossEntropyLoss(weight=torch.tensor(class_weights, dtype=torch.float32, device=device))
-    flyover_loss_fn = nn.BCEWithLogitsLoss()
+    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     history = []
@@ -199,17 +261,17 @@ def train_model(
             model,
             train_loader,
             optimizer=optimizer,
-            label_loss_fn=label_loss_fn,
-            flyover_loss_fn=flyover_loss_fn,
             device=device,
+            class_weights=class_weights_tensor,
+            use_depth=use_depth,
         )
         val_metrics = run_epoch(
             model,
             val_loader,
             optimizer=None,
-            label_loss_fn=label_loss_fn,
-            flyover_loss_fn=flyover_loss_fn,
             device=device,
+            class_weights=class_weights_tensor,
+            use_depth=use_depth,
         )
         history.append({"epoch": epoch, "train": train_metrics, "val": val_metrics})
         if val_metrics["loss"] < best_val_loss:
@@ -226,6 +288,8 @@ def train_model(
     checkpoint = {
         "model_state": model.state_dict(),
         "config": {
+            "model_version": normalized_model_version,
+            "use_depth": bool(use_depth),
             "num_labels": len(OBSTACLE_LABELS),
             "geometry_dim": len(GEOMETRY_FEATURE_NAMES),
             "image_size": int(image_size),
@@ -243,6 +307,8 @@ def train_model(
         "model_path": str(model_path),
         "metrics_path": str(metrics_path),
         "dataset_path": str(dataset_path),
+        "model_version": normalized_model_version,
+        "use_depth": bool(use_depth),
         "epochs": int(epochs),
         "batch_size": int(batch_size),
         "image_size": int(image_size),
@@ -271,6 +337,7 @@ def main() -> None:
     parser.add_argument("--image-size", type=int, default=96)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--model-version", choices=["scheme_a", "scheme_a_plus"], default="scheme_a")
     args = parser.parse_args()
     summary = train_model(
         Path(args.dataset),
@@ -280,6 +347,7 @@ def main() -> None:
         image_size=args.image_size,
         learning_rate=args.learning_rate,
         seed=args.seed,
+        model_version=args.model_version,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
 

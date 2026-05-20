@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .model import SchemeAObstacleNet
+from .model import SchemeAObstacleNet, SchemeAPlusObstacleNet
 from .schema import GEOMETRY_FEATURE_NAMES, OBSTACLE_LABELS
 from .train import SchemeADataset, load_dataset_arrays, write_json
 
@@ -65,6 +65,8 @@ def validate_model(
     config = checkpoint["config"]
     labels = list(config.get("labels", OBSTACLE_LABELS))
     image_size = int(config.get("image_size", 96))
+    use_depth = bool(config.get("use_depth", False))
+    model_version = str(config.get("model_version", "scheme_a_v1"))
     geometry_mean = np.asarray(checkpoint["geometry_mean"], dtype=np.float32)
     geometry_std = np.asarray(checkpoint["geometry_std"], dtype=np.float32)
     arrays = load_dataset_arrays(dataset_path)
@@ -81,13 +83,19 @@ def validate_model(
         arrays["label_indices"],
         arrays["flyover"],
         indices,
+        depth_paths=arrays["depth_paths"],
+        sample_weights=arrays["sample_weights"],
+        use_depth=use_depth,
         image_size=image_size,
         geometry_mean=geometry_mean,
         geometry_std=geometry_std,
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SchemeAObstacleNet(num_labels=len(labels), geometry_dim=len(GEOMETRY_FEATURE_NAMES)).to(device)
+    if use_depth:
+        model = SchemeAPlusObstacleNet(num_labels=len(labels), geometry_dim=len(GEOMETRY_FEATURE_NAMES)).to(device)
+    else:
+        model = SchemeAObstacleNet(num_labels=len(labels), geometry_dim=len(GEOMETRY_FEATURE_NAMES)).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
@@ -97,7 +105,10 @@ def validate_model(
     fly_pred: List[float] = []
     with torch.no_grad():
         for batch in loader:
-            out = model(batch["rgb"].to(device), batch["geometry"].to(device))
+            if use_depth:
+                out = model(batch["rgb"].to(device), batch["geometry"].to(device), batch["depth"].to(device))
+            else:
+                out = model(batch["rgb"].to(device), batch["geometry"].to(device))
             y_true.extend(batch["label"].numpy().astype(int).tolist())
             y_pred.extend(torch.argmax(out["label_logits"], dim=1).cpu().numpy().astype(int).tolist())
             fly_true.extend(batch["flyover"].numpy().astype(float).tolist())
@@ -113,15 +124,16 @@ def validate_model(
         latency_batch = next(iter(latency_loader))
         rgb = latency_batch["rgb"].to(device)
         geometry = latency_batch["geometry"].to(device)
+        depth = latency_batch["depth"].to(device) if use_depth else None
         with torch.no_grad():
             for _ in range(3):
-                _ = model(rgb, geometry)
+                _ = model(rgb, geometry, depth) if use_depth else model(rgb, geometry)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             start = time.perf_counter()
             runs = 20
             for _ in range(runs):
-                _ = model(rgb, geometry)
+                _ = model(rgb, geometry, depth) if use_depth else model(rgb, geometry)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - start
@@ -130,6 +142,8 @@ def validate_model(
     report = {
         "dataset_path": str(dataset_path),
         "model_path": str(model_path),
+        "model_version": model_version,
+        "use_depth": bool(use_depth),
         "split": split,
         "sample_count": int(len(dataset)),
         "accuracy": metrics["accuracy"],
@@ -138,6 +152,14 @@ def validate_model(
         "per_class_recall": {label: item["recall"] for label, item in metrics["per_class"].items()},
         "per_class": metrics["per_class"],
         "confusion_matrix": matrix.tolist(),
+        "building_fence_confusion": {
+            "building_as_fence_or_rail": int(matrix[labels.index("building"), labels.index("fence_or_rail")])
+            if "building" in labels and "fence_or_rail" in labels
+            else 0,
+            "fence_or_rail_as_building": int(matrix[labels.index("fence_or_rail"), labels.index("building")])
+            if "building" in labels and "fence_or_rail" in labels
+            else 0,
+        },
         "labels": labels,
         "latency_ms_mean": round(float(latency_ms_mean), 6),
         "device": str(device),
