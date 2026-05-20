@@ -10,12 +10,14 @@ from .obstacle_avoidance_llm_control import ObstacleAvoidanceLLMControlMixin
 from .obstacle_avoidance_control import ObstacleAvoidanceControlMixin
 from .obstacle_representation_control import ObstacleRepresentationControlMixin
 from .route_control import RouteControlMixin
+from .route4_fusion_control import Route4FusionControlMixin
 
 
 class RunDroneFlightPanel(
     FlightControlMixin,
     MapControlMixin,
     RouteControlMixin,
+    Route4FusionControlMixin,
     AnalysisControlMixin,
     LidarAnalysisControlMixin,
     ObstacleAvoidanceControlMixin,
@@ -905,6 +907,7 @@ class RunDroneFlightPanel(
             tk.Button(scan, text="Open LLM Route Window", command=self.open_llm_route_window).pack(side="left", padx=(18, 6), pady=4)
             tk.Button(scan, text="Open LLM Route Window 2", command=self.open_llm_route_window2).pack(side="left", padx=6, pady=4)
             tk.Button(scan, text="Open LLM Route Window 3", command=self.open_llm_route_window3).pack(side="left", padx=6, pady=4)
+            tk.Button(scan, text="Open LLM Route Window 4", command=self.open_llm_route_window4).pack(side="left", padx=6, pady=4)
 
         actions = tk.Frame(route)
         actions.grid(row=4, column=0, columnspan=6, sticky="ew", padx=0, pady=(0, 4))
@@ -1738,6 +1741,12 @@ class RunDroneFlightPanel(
         self.stop_keyboard_control(send_hold=False)
         self.llm_route3_stop_event.set()
         self.llm_route3_pause_event.clear()
+        route4_stop_event = getattr(self, "llm_route4_stop_event", None)
+        if route4_stop_event is not None:
+            route4_stop_event.set()
+        route4_pause_event = getattr(self, "llm_route4_pause_event", None)
+        if route4_pause_event is not None:
+            route4_pause_event.clear()
         if self.llm_route_window is not None:
             try:
                 self.llm_route_window.destroy()
@@ -1777,6 +1786,17 @@ class RunDroneFlightPanel(
             self.llm_route3_analysis_text = None
             self.llm_route3_rgb_label = None
             self.llm_route3_rgb_photo = None
+        if getattr(self, "llm_route4_window", None) is not None:
+            try:
+                self.llm_route4_window.destroy()
+            except Exception:
+                pass
+            self.llm_route4_window = None
+            self.llm_route4_map_widget = None
+            self.llm_route4_preview_text = None
+            self.llm_route4_analysis_text = None
+            self.llm_route4_rgb_label = None
+            self.llm_route4_rgb_photo = None
         self.stop_stream_player()
         self.stop_stream_analysis()
         self.close_lidar_analysis_window()
