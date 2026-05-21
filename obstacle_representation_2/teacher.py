@@ -12,6 +12,10 @@ from .schema import (
     DIRECTION_LABELS,
     DIRECTION_TO_INDEX,
     MASK_CHANNELS,
+    RISK_STATES,
+    RISK_TO_INDEX,
+    STOP_DEPTH_CM,
+    WARNING_DEPTH_CM,
     as_bool,
     as_float,
 )
@@ -29,9 +33,17 @@ def depth_masks(depth_cm: np.ndarray, image_size: int) -> np.ndarray:
         depth = np.zeros((int(image_size), int(image_size)), dtype=np.float32)
     depth = resize_float_image(depth, image_size, nearest=False)
     valid = np.isfinite(depth) & (depth > 0.0)
-    danger = valid & (depth <= DANGER_DEPTH_CM)
-    insufficient = valid & (depth > DANGER_DEPTH_CM) & (depth <= CLEARANCE_DEPTH_CM)
-    return np.stack([danger.astype(np.float32), insufficient.astype(np.float32)], axis=0)
+    must_stop = valid & (depth <= STOP_DEPTH_CM)
+    obstacle_warning = valid & (depth > STOP_DEPTH_CM) & (depth <= WARNING_DEPTH_CM)
+    clearance_warning = valid & (depth > WARNING_DEPTH_CM) & (depth <= CLEARANCE_DEPTH_CM)
+    return np.stack(
+        [
+            clearance_warning.astype(np.float32),
+            obstacle_warning.astype(np.float32),
+            must_stop.astype(np.float32),
+        ],
+        axis=0,
+    )
 
 
 def _sector(mask: np.ndarray, x0: float, x1: float, y0: float, y1: float) -> np.ndarray:
@@ -81,8 +93,8 @@ def _depth_score(value_cm: float, swept_clear: bool, danger_fraction: float, yel
 
 def compute_direction_scores(event: Dict[str, Any], masks: np.ndarray) -> Dict[str, float]:
     summary = event.get("pointcloud_summary") if isinstance(event.get("pointcloud_summary"), dict) else {}
-    danger = masks[0] > 0.5
-    yellow = masks[1] > 0.5
+    danger = masks[2] > 0.5
+    yellow = masks[0] > 0.5
 
     front_red = _fraction(danger, 0.34, 0.66, 0.26, 0.82)
     left_red = _fraction(danger, 0.05, 0.38, 0.30, 0.86)
@@ -146,14 +158,40 @@ def compute_direction_scores(event: Dict[str, Any], masks: np.ndarray) -> Dict[s
 def is_front_blocked(event: Dict[str, Any], masks: np.ndarray) -> bool:
     summary = event.get("pointcloud_summary") if isinstance(event.get("pointcloud_summary"), dict) else {}
     front_min = as_float(summary.get("front_min_depth_cm"))
-    red_fraction = _fraction(masks[0] > 0.5, 0.34, 0.66, 0.26, 0.82)
-    yellow_fraction = _fraction(masks[1] > 0.5, 0.34, 0.66, 0.26, 0.82)
+    red_fraction = _fraction(masks[2] > 0.5, 0.34, 0.66, 0.26, 0.82)
+    yellow_fraction = _fraction((masks[0] > 0.5) | (masks[1] > 0.5), 0.34, 0.66, 0.26, 0.82)
     return bool(
         red_fraction >= 0.025
         or yellow_fraction >= 0.22
         or (front_min > 0.0 and front_min < DANGER_DEPTH_CM)
         or not as_bool(summary.get("forward_swept_clear", True), True)
     )
+
+
+def front_risk_from_masks(event: Dict[str, Any], masks: np.ndarray) -> Dict[str, Any]:
+    summary = event.get("pointcloud_summary") if isinstance(event.get("pointcloud_summary"), dict) else {}
+    front_min = as_float(summary.get("front_min_depth_cm"))
+    clearance_fraction = _fraction(masks[0] > 0.5, 0.34, 0.66, 0.26, 0.82)
+    warning_fraction = _fraction(masks[1] > 0.5, 0.34, 0.66, 0.26, 0.82)
+    stop_fraction = _fraction(masks[2] > 0.5, 0.34, 0.66, 0.26, 0.82)
+    state = "clear"
+    if stop_fraction >= 0.01 or (front_min > 0.0 and front_min <= STOP_DEPTH_CM):
+        state = "must_stop"
+    elif warning_fraction >= 0.025 or (front_min > STOP_DEPTH_CM and front_min <= WARNING_DEPTH_CM):
+        state = "obstacle_warning"
+    elif clearance_fraction >= 0.10 or (front_min > WARNING_DEPTH_CM and front_min <= CLEARANCE_DEPTH_CM):
+        state = "clearance_warning"
+    must_stop = state == "must_stop"
+    can_forward = state in {"clear", "clearance_warning", "obstacle_warning"}
+    return {
+        "front_risk_state": state,
+        "front_risk_index": int(RISK_TO_INDEX[state]),
+        "can_forward": bool(can_forward),
+        "must_stop": bool(must_stop),
+        "front_clearance_fraction": float(clearance_fraction),
+        "front_warning_fraction": float(warning_fraction),
+        "front_stop_fraction": float(stop_fraction),
+    }
 
 
 def select_direction(scores: Dict[str, float], event: Dict[str, Any], masks: np.ndarray) -> str:
@@ -185,17 +223,23 @@ def compute_affordance_teacher(event: Dict[str, Any], depth_cm: np.ndarray, imag
     scores = compute_direction_scores(event, masks)
     direction = select_direction(scores, event, masks)
     front_blocked = is_front_blocked(event, masks)
-    red_fraction = _fraction(masks[0] > 0.5, 0.34, 0.66, 0.26, 0.82)
-    yellow_fraction = _fraction(masks[1] > 0.5, 0.34, 0.66, 0.26, 0.82)
+    risk = front_risk_from_masks(event, masks)
     return {
         "masks": masks.astype(np.float32, copy=False),
+        "front_risk_state": risk["front_risk_state"],
+        "front_risk_index": risk["front_risk_index"],
+        "can_forward": risk["can_forward"],
+        "must_stop": risk["must_stop"],
+        "front_clearance_fraction": risk["front_clearance_fraction"],
+        "front_warning_fraction": risk["front_warning_fraction"],
+        "front_stop_fraction": risk["front_stop_fraction"],
         "direction_label": direction,
         "direction_index": int(DIRECTION_TO_INDEX[direction]),
         "direction_scores": {label: float(scores[label]) for label in DIRECTION_LABELS},
         "direction_scores_vector": np.asarray([scores[label] for label in DIRECTION_LABELS], dtype=np.float32),
         "flyover_delta_cm": float(flyover_delta_cm_for_direction(direction, event)),
         "red_front_blocked": bool(front_blocked),
-        "front_red_fraction": float(red_fraction),
-        "front_insufficient_fraction": float(yellow_fraction),
-        "teacher_source": "depth_pointcloud_vlm_cached_affordance",
+        "front_red_fraction": float(risk["front_warning_fraction"] + risk["front_stop_fraction"]),
+        "front_insufficient_fraction": float(risk["front_clearance_fraction"]),
+        "teacher_source": "depth_pointcloud_risk_layer_teacher",
     }

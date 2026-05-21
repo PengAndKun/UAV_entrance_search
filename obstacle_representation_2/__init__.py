@@ -13,6 +13,10 @@ from .schema import (
     DIRECTION_TO_INDEX,
     GEOMETRY_FEATURE_NAMES,
     MASK_CHANNELS,
+    RISK_STATES,
+    RISK_TO_INDEX,
+    STOP_DEPTH_CM,
+    WARNING_DEPTH_CM,
 )
 from .teacher import compute_affordance_teacher
 
@@ -23,5 +27,9 @@ __all__ = [
     "DIRECTION_TO_INDEX",
     "GEOMETRY_FEATURE_NAMES",
     "MASK_CHANNELS",
+    "RISK_STATES",
+    "RISK_TO_INDEX",
+    "STOP_DEPTH_CM",
+    "WARNING_DEPTH_CM",
     "compute_affordance_teacher",
 ]

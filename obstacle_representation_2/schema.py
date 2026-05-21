@@ -8,11 +8,16 @@ import numpy as np
 from obstacle_representation.schema import GEOMETRY_FEATURE_NAMES, geometry_vector
 
 
-DANGER_DEPTH_CM = 250.0
+STOP_DEPTH_CM = 100.0
+WARNING_DEPTH_CM = 250.0
 CLEARANCE_DEPTH_CM = 450.0
+DANGER_DEPTH_CM = WARNING_DEPTH_CM
 MAX_DEPTH_CM = 1200.0
 
-MASK_CHANNELS = ("danger", "insufficient_clearance")
+MASK_CHANNELS = ("clearance_warning", "obstacle_warning", "must_stop")
+RISK_STATES = ("clear", "clearance_warning", "obstacle_warning", "must_stop")
+RISK_TO_INDEX = {label: idx for idx, label in enumerate(RISK_STATES)}
+INDEX_TO_RISK = {idx: label for label, idx in RISK_TO_INDEX.items()}
 DIRECTION_LABELS = ("forward", "left", "right", "up", "backoff", "hold")
 DIRECTION_TO_INDEX = {label: idx for idx, label in enumerate(DIRECTION_LABELS)}
 INDEX_TO_DIRECTION = {idx: label for label, idx in DIRECTION_TO_INDEX.items()}

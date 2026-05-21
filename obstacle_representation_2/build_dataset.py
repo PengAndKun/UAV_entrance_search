@@ -11,7 +11,7 @@ import numpy as np
 
 from obstacle_representation.build_dataset import iter_events, resolve_path, sample_group_id, split_indices_by_group_label, write_json
 
-from .schema import DIRECTION_LABELS, DIRECTION_TO_INDEX, GEOMETRY_FEATURE_NAMES, event_geometry_vector
+from .schema import GEOMETRY_FEATURE_NAMES, RISK_STATES, RISK_TO_INDEX, event_geometry_vector
 from .teacher import compute_affordance_teacher
 
 
@@ -97,6 +97,13 @@ def build_dataset(
             "red_front_blocked": bool(teacher["red_front_blocked"]),
             "front_red_fraction": float(teacher["front_red_fraction"]),
             "front_insufficient_fraction": float(teacher["front_insufficient_fraction"]),
+            "front_risk_state": teacher["front_risk_state"],
+            "front_risk_index": int(teacher["front_risk_index"]),
+            "can_forward": bool(teacher["can_forward"]),
+            "must_stop": bool(teacher["must_stop"]),
+            "front_clearance_fraction": float(teacher["front_clearance_fraction"]),
+            "front_warning_fraction": float(teacher["front_warning_fraction"]),
+            "front_stop_fraction": float(teacher["front_stop_fraction"]),
             "teacher_source": str(teacher["teacher_source"]),
             "geometry_features": event_geometry_vector(event).astype(float).tolist(),
             "pointcloud_summary": event.get("pointcloud_summary", {}),
@@ -107,7 +114,7 @@ def build_dataset(
     if not samples:
         raise ValueError(f"no OR2 samples built from data_roots={data_roots}")
 
-    labels = [sample["direction_label"] for sample in samples]
+    labels = [sample["front_risk_state"] for sample in samples]
     groups = [sample["group_id"] for sample in samples]
     splits = split_indices_by_group_label(labels, groups, seed=seed)
     masks = []
@@ -132,11 +139,14 @@ def build_dataset(
     mask_targets = np.asarray(masks, dtype=np.float32)
     direction_indices = np.asarray([sample["direction_index"] for sample in samples], dtype=np.int64)
     direction_scores = np.asarray(
-        [[sample["direction_scores"][label] for label in DIRECTION_LABELS] for sample in samples],
+        [[sample["direction_scores"].get(label, 0.0) for label in ("forward", "left", "right", "up", "backoff", "hold")] for sample in samples],
         dtype=np.float32,
     )
     flyover_delta_cm = np.asarray([sample["flyover_delta_cm"] for sample in samples], dtype=np.float32)
     red_front_blocked = np.asarray([sample["red_front_blocked"] for sample in samples], dtype=bool)
+    risk_indices = np.asarray([sample["front_risk_index"] for sample in samples], dtype=np.int64)
+    can_forward = np.asarray([sample["can_forward"] for sample in samples], dtype=bool)
+    must_stop = np.asarray([sample["must_stop"] for sample in samples], dtype=bool)
     split_array = np.asarray(splits, dtype=object)
     group_ids = np.asarray(groups, dtype=object)
     np.savez_compressed(
@@ -149,9 +159,13 @@ def build_dataset(
         direction_scores=direction_scores,
         flyover_delta_cm=flyover_delta_cm,
         red_front_blocked=red_front_blocked,
+        risk_indices=risk_indices,
+        can_forward=can_forward,
+        must_stop=must_stop,
         splits=split_array,
         group_ids=group_ids,
-        direction_labels=np.asarray(DIRECTION_LABELS, dtype=object),
+        direction_labels=np.asarray(("forward", "left", "right", "up", "backoff", "hold"), dtype=object),
+        risk_states=np.asarray(RISK_STATES, dtype=object),
         geometry_feature_names=np.asarray(GEOMETRY_FEATURE_NAMES, dtype=object),
         image_size=np.asarray([int(image_size)], dtype=np.int64),
     )
@@ -170,16 +184,19 @@ def build_dataset(
         "total_samples": len(samples),
         "data_roots": [str(root) for root in data_roots],
         "source_counts": source_counts,
-        "direction_label_counts": {label: int(counts(labels).get(label, 0)) for label in DIRECTION_LABELS},
+        "risk_state_counts": {label: int(counts(labels).get(label, 0)) for label in RISK_STATES},
+        "legacy_direction_label_counts": counts(sample["direction_label"] for sample in samples),
         "split_counts": counts(splits),
         "group_split_counts": counts(group_splits.values()),
-        "red_front_blocked_count": int(np.count_nonzero(red_front_blocked)),
+        "can_forward_count": int(np.count_nonzero(can_forward)),
+        "must_stop_count": int(np.count_nonzero(must_stop)),
         "teacher_source_counts": counts(sample["teacher_source"] for sample in samples),
         "missing_counts": dict(sorted(missing_counts.items())),
-        "direction_map": DIRECTION_TO_INDEX,
+        "risk_map": RISK_TO_INDEX,
         "geometry_feature_names": GEOMETRY_FEATURE_NAMES,
         "image_size": int(image_size),
-        "danger_depth_cm": 250.0,
+        "stop_depth_cm": 100.0,
+        "warning_depth_cm": 250.0,
         "clearance_depth_cm": 450.0,
         "built_at": datetime.now().isoformat(timespec="seconds"),
         "seed": seed,

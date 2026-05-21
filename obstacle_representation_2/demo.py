@@ -11,17 +11,15 @@ import torch
 from PIL import Image
 
 from .model import APlus2AffordanceNet
-from .schema import DIRECTION_LABELS, GEOMETRY_FEATURE_NAMES, event_geometry_vector
+from .schema import GEOMETRY_FEATURE_NAMES, RISK_STATES, event_geometry_vector
 from .train import load_depth, load_rgb
 
 
-DIRECTION_COLORS: Dict[str, Tuple[int, int, int]] = {
-    "forward": (60, 190, 90),
-    "left": (60, 130, 230),
-    "right": (80, 210, 230),
-    "up": (245, 190, 45),
-    "backoff": (230, 80, 70),
-    "hold": (145, 145, 155),
+RISK_COLORS: Dict[str, Tuple[int, int, int]] = {
+    "clear": (60, 190, 90),
+    "clearance_warning": (245, 200, 45),
+    "obstacle_warning": (245, 130, 95),
+    "must_stop": (190, 20, 35),
 }
 
 
@@ -33,11 +31,17 @@ def _load_checkpoint(model_path: Path, device: torch.device) -> tuple[APlus2Affo
     config = checkpoint.get("config", {})
     model = APlus2AffordanceNet(
         geometry_dim=int(config.get("geometry_dim", len(GEOMETRY_FEATURE_NAMES))),
-        num_directions=len(config.get("direction_labels", DIRECTION_LABELS)),
+        num_risk_states=len(config.get("risk_states", RISK_STATES)),
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model, checkpoint
+
+
+def _front_fraction(mask: np.ndarray) -> float:
+    h, w = mask.shape[:2]
+    region = mask[int(h * 0.26) : int(h * 0.82), int(w * 0.34) : int(w * 0.66)]
+    return float(np.mean(region >= 0.5)) if region.size else 0.0
 
 
 def predict_obstacle_representation_2(
@@ -57,7 +61,7 @@ def predict_obstacle_representation_2(
     model, checkpoint = _load_checkpoint(model_path, device)
     config = checkpoint.get("config", {})
     image_size = int(config.get("image_size", 96))
-    labels = list(config.get("direction_labels", DIRECTION_LABELS))
+    labels = list(config.get("risk_states", RISK_STATES))
 
     geometry = event_geometry_vector(event)
     mean = np.asarray(checkpoint.get("geometry_mean", np.zeros_like(geometry)), dtype=np.float32)
@@ -70,43 +74,50 @@ def predict_obstacle_representation_2(
     with torch.no_grad():
         output = model(rgb, depth, geometry_tensor)
         mask_prob = torch.sigmoid(output["mask_logits"])[0].detach().cpu().numpy()
-        direction_prob = torch.softmax(output["direction_logits"], dim=1)[0].detach().cpu().numpy()
-        score_prob = torch.sigmoid(output["score_logits"])[0].detach().cpu().numpy()
-        flyover_delta_cm = float(max(0.0, output["flyover_delta"][0].detach().cpu().item() * 400.0))
-    selected_idx = int(np.argmax(direction_prob))
-    selected_direction = labels[selected_idx] if 0 <= selected_idx < len(labels) else "hold"
-    danger = mask_prob[0] if mask_prob.ndim == 3 else np.zeros((image_size, image_size), dtype=np.float32)
-    insufficient = mask_prob[1] if mask_prob.ndim == 3 and mask_prob.shape[0] > 1 else np.zeros_like(danger)
-    h, w = danger.shape
-    front = danger[int(h * 0.26) : int(h * 0.82), int(w * 0.34) : int(w * 0.66)]
-    front_insuff = insufficient[int(h * 0.26) : int(h * 0.82), int(w * 0.34) : int(w * 0.66)]
-    front_red_fraction = float(np.mean(front >= 0.5)) if front.size else 0.0
-    front_insufficient_fraction = float(np.mean(front_insuff >= 0.5)) if front_insuff.size else 0.0
+        risk_prob = torch.softmax(output["risk_logits"], dim=1)[0].detach().cpu().numpy()
+        can_forward_probability = float(torch.sigmoid(output["can_forward_logits"])[0].detach().cpu().item())
+        must_stop_probability = float(torch.sigmoid(output["must_stop_logits"])[0].detach().cpu().item())
+    selected_idx = int(np.argmax(risk_prob))
+    front_risk_state = labels[selected_idx] if 0 <= selected_idx < len(labels) else "clear"
+    clearance = mask_prob[0] if mask_prob.ndim == 3 else np.zeros((image_size, image_size), dtype=np.float32)
+    warning = mask_prob[1] if mask_prob.ndim == 3 and mask_prob.shape[0] > 1 else np.zeros_like(clearance)
+    stop = mask_prob[2] if mask_prob.ndim == 3 and mask_prob.shape[0] > 2 else np.zeros_like(clearance)
+    front_clearance_fraction = _front_fraction(clearance)
+    front_warning_fraction = _front_fraction(warning)
+    front_stop_fraction = _front_fraction(stop)
     summary = event.get("pointcloud_summary") if isinstance(event.get("pointcloud_summary"), dict) else {}
     front_min = float(summary.get("front_min_depth_cm", 0.0) or 0.0)
-    red_front_blocked = bool(front_red_fraction >= 0.025 or front_insufficient_fraction >= 0.22 or (front_min > 0.0 and front_min < 250.0))
-    direction_scores = {label: float(score_prob[idx]) for idx, label in enumerate(labels)}
-    if red_front_blocked:
-        direction_scores["forward"] = 0.0
-        if selected_direction == "forward":
-            selected_direction = max((label for label in labels if label != "forward"), key=lambda item: direction_scores.get(item, 0.0))
+
+    # Safety override: the raw model can only become more conservative.
+    if front_stop_fraction >= 0.01 or (front_min > 0.0 and front_min <= 100.0) or must_stop_probability >= 0.5:
+        front_risk_state = "must_stop"
+    elif front_warning_fraction >= 0.025 and labels.index(front_risk_state) < labels.index("obstacle_warning"):
+        front_risk_state = "obstacle_warning"
+    elif front_clearance_fraction >= 0.10 and labels.index(front_risk_state) < labels.index("clearance_warning"):
+        front_risk_state = "clearance_warning"
+    must_stop = front_risk_state == "must_stop"
+    can_forward = bool((not must_stop) and can_forward_probability >= 0.35)
     reason = (
-        f"selected={selected_direction}; front_red={front_red_fraction:.3f}; "
-        f"front_insufficient={front_insufficient_fraction:.3f}; front_min={front_min:.1f}cm"
+        f"risk={front_risk_state}; can_forward={can_forward}; must_stop={must_stop}; "
+        f"front_clearance={front_clearance_fraction:.3f}; front_warning={front_warning_fraction:.3f}; "
+        f"front_stop={front_stop_fraction:.3f}; front_min={front_min:.1f}cm"
     )
     return {
         "model_path": str(model_path),
         "model_version": str(config.get("model_version", "a_plus_2_v1")),
         "rgb_path": str(rgb_path),
-        "danger_mask": danger.astype(np.float32),
-        "insufficient_clearance_mask": insufficient.astype(np.float32),
-        "direction_probabilities": {label: float(direction_prob[idx]) for idx, label in enumerate(labels)},
-        "direction_scores": direction_scores,
-        "selected_direction": selected_direction,
-        "red_front_blocked": bool(red_front_blocked),
-        "front_red_fraction": front_red_fraction,
-        "front_insufficient_fraction": front_insufficient_fraction,
-        "flyover_delta_cm": flyover_delta_cm,
+        "clearance_warning_mask": clearance.astype(np.float32),
+        "obstacle_warning_mask": warning.astype(np.float32),
+        "must_stop_mask": stop.astype(np.float32),
+        "risk_probabilities": {label: float(risk_prob[idx]) for idx, label in enumerate(labels)},
+        "front_risk_state": front_risk_state,
+        "can_forward": bool(can_forward),
+        "must_stop": bool(must_stop),
+        "can_forward_probability": can_forward_probability,
+        "must_stop_probability": must_stop_probability,
+        "front_clearance_fraction": front_clearance_fraction,
+        "front_warning_fraction": front_warning_fraction,
+        "front_stop_fraction": front_stop_fraction,
         "reason": reason,
         "device": str(device),
         "image_size": int(image_size),
@@ -119,21 +130,30 @@ def render_affordance_overlay(rgb_image: Any, prediction: Dict[str, Any], *, alp
         raise ValueError("rgb_image must be HxWx3")
     rgb = rgb[..., :3].astype(np.uint8, copy=False)
     h, w = rgb.shape[:2]
-    danger = np.asarray(prediction.get("danger_mask", np.zeros((h, w))), dtype=np.float32)
-    insufficient = np.asarray(prediction.get("insufficient_clearance_mask", np.zeros_like(danger)), dtype=np.float32)
-    if danger.shape != (h, w):
-        danger = np.asarray(Image.fromarray(danger.astype(np.float32), mode="F").resize((w, h), Image.BILINEAR), dtype=np.float32)
-    if insufficient.shape != (h, w):
-        insufficient = np.asarray(Image.fromarray(insufficient.astype(np.float32), mode="F").resize((w, h), Image.BILINEAR), dtype=np.float32)
+    clearance = np.asarray(prediction.get("clearance_warning_mask", np.zeros((h, w))), dtype=np.float32)
+    warning = np.asarray(prediction.get("obstacle_warning_mask", np.zeros_like(clearance)), dtype=np.float32)
+    stop = np.asarray(prediction.get("must_stop_mask", np.zeros_like(clearance)), dtype=np.float32)
+    for name, mask in (("clearance", clearance), ("warning", warning), ("stop", stop)):
+        if mask.shape != (h, w):
+            resized = np.asarray(Image.fromarray(mask.astype(np.float32), mode="F").resize((w, h), Image.BILINEAR), dtype=np.float32)
+            if name == "clearance":
+                clearance = resized
+            elif name == "warning":
+                warning = resized
+            else:
+                stop = resized
     canvas = (rgb.astype(np.float32) * 0.35).astype(np.float32)
-    yellow = np.asarray((245, 190, 45), dtype=np.float32)
-    red = np.asarray((230, 50, 50), dtype=np.float32)
-    yellow_mask = insufficient >= 0.5
-    red_mask = danger >= 0.5
-    canvas[yellow_mask] = canvas[yellow_mask] * (1.0 - alpha) + yellow * alpha
-    canvas[red_mask] = canvas[red_mask] * (1.0 - alpha) + red * alpha
-    direction = str(prediction.get("selected_direction", "hold"))
-    color = np.asarray(DIRECTION_COLORS.get(direction, DIRECTION_COLORS["hold"]), dtype=np.float32)
+    yellow = np.asarray(RISK_COLORS["clearance_warning"], dtype=np.float32)
+    light_red = np.asarray(RISK_COLORS["obstacle_warning"], dtype=np.float32)
+    dark_red = np.asarray(RISK_COLORS["must_stop"], dtype=np.float32)
+    clearance_mask = clearance >= 0.5
+    warning_mask = warning >= 0.5
+    stop_mask = stop >= 0.5
+    canvas[clearance_mask] = canvas[clearance_mask] * (1.0 - alpha) + yellow * alpha
+    canvas[warning_mask] = canvas[warning_mask] * (1.0 - alpha) + light_red * alpha
+    canvas[stop_mask] = canvas[stop_mask] * (1.0 - alpha) + dark_red * alpha
+    state = str(prediction.get("front_risk_state", "clear"))
+    color = np.asarray(RISK_COLORS.get(state, RISK_COLORS["clear"]), dtype=np.float32)
     band_h = max(10, h // 18)
     canvas[:band_h, :] = color
     return np.clip(canvas, 0, 255).astype(np.uint8)

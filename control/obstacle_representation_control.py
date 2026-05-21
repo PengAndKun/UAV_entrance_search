@@ -65,7 +65,7 @@ class ObstacleRepresentationControlMixin:
             row=0, column=3, padx=6, pady=6
         )
 
-        storage2 = tk.LabelFrame(window, text="Scheme A+2 Direction Model")
+        storage2 = tk.LabelFrame(window, text="Scheme A+2 Risk Model")
         storage2.pack(fill="x", padx=8, pady=4)
         storage2.grid_columnconfigure(1, weight=1)
         tk.Label(storage2, text="Model").grid(row=0, column=0, sticky="w", padx=6, pady=6)
@@ -84,7 +84,7 @@ class ObstacleRepresentationControlMixin:
         tk.Button(actions, text="Analyze Current Frame", command=self.run_obstacle_representation_demo).pack(
             side="left", padx=6, pady=6
         )
-        tk.Button(actions, text="Analyze A+2 Direction", command=self.run_obstacle_representation_2_demo).pack(
+        tk.Button(actions, text="Analyze A+2 Risk", command=self.run_obstacle_representation_2_demo).pack(
             side="left", padx=6, pady=6
         )
         tk.Label(actions, textvariable=self.obstacle_representation_status_var, anchor="w").pack(
@@ -108,7 +108,7 @@ class ObstacleRepresentationControlMixin:
 
         rgb_frame = tk.LabelFrame(previews, text="RGB")
         rgb_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=4)
-        mask_frame = tk.LabelFrame(previews, text="Mask / Direction Demo")
+        mask_frame = tk.LabelFrame(previews, text="Mask / Risk Demo")
         mask_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=4)
         self.obstacle_representation_rgb_label = tk.Label(rgb_frame, text="No image")
         self.obstacle_representation_rgb_label.pack(fill="both", expand=True, padx=6, pady=6)
@@ -116,7 +116,7 @@ class ObstacleRepresentationControlMixin:
         self.obstacle_representation_mask_label.pack(fill="both", expand=True, padx=6, pady=6)
         tk.Label(
             mask_frame,
-            text="A+: depth obstacle mask + class color. A+2: red=danger, yellow=insufficient clearance, top band=selected direction.",
+            text="A+: depth obstacle mask + class color. A+2: yellow=250-450cm, light red=100-250cm, dark red<=100cm, top band=risk.",
             anchor="w",
         ).pack(fill="x", padx=6, pady=(0, 6))
 
@@ -152,7 +152,7 @@ class ObstacleRepresentationControlMixin:
     def select_obstacle_representation_2_model(self) -> None:
         self.ensure_obstacle_representation_state()
         path = filedialog.askopenfilename(
-            title="Select Scheme A+2 direction model",
+            title="Select Scheme A+2 risk model",
             filetypes=[("PyTorch model", "*.pt"), ("All files", "*.*")],
             initialdir=str(PROJECT_ROOT / "obstacle_representation_2_data" / "models"),
         )
@@ -379,14 +379,15 @@ class ObstacleRepresentationControlMixin:
         prediction = result.get("prediction") if isinstance(result.get("prediction"), dict) else {}
         event = result.get("event") if isinstance(result.get("event"), dict) else {}
         summary = event.get("pointcloud_summary") if isinstance(event.get("pointcloud_summary"), dict) else {}
-        direction = str(prediction.get("selected_direction", "hold"))
-        front_red = float(prediction.get("front_red_fraction", 0.0) or 0.0)
-        front_insufficient = float(prediction.get("front_insufficient_fraction", 0.0) or 0.0)
+        risk = str(prediction.get("front_risk_state", "clear"))
+        clearance = float(prediction.get("front_clearance_fraction", 0.0) or 0.0)
+        warning = float(prediction.get("front_warning_fraction", 0.0) or 0.0)
+        stop = float(prediction.get("front_stop_fraction", 0.0) or 0.0)
         self.obstacle_representation_status_var.set("Obstacle Representation 2: done")
         self.obstacle_representation_result_var.set(
-            f"Result: direction={direction}, red_front_blocked={bool(prediction.get('red_front_blocked', False))}, "
-            f"front_red={front_red:.3f}, front_insufficient={front_insufficient:.3f}, "
-            f"flyover_delta={float(prediction.get('flyover_delta_cm', 0.0) or 0.0):.1f} cm, "
+            f"Result: risk={risk}, can_forward={bool(prediction.get('can_forward', False))}, "
+            f"must_stop={bool(prediction.get('must_stop', False))}, "
+            f"front_yellow={clearance:.3f}, front_light_red={warning:.3f}, front_dark_red={stop:.3f}, "
             f"model={prediction.get('model_version', 'unknown')}"
         )
         self.obstacle_representation_capture_dir_var.set(f"Capture: {event.get('capture_dir', '--')}")
@@ -401,7 +402,7 @@ class ObstacleRepresentationControlMixin:
                 "prediction": {
                     key: value
                     for key, value in prediction.items()
-                    if key not in {"danger_mask", "insufficient_clearance_mask"}
+                    if key not in {"clearance_warning_mask", "obstacle_warning_mask", "must_stop_mask"}
                 },
                 "pointcloud_summary": summary,
                 "capture_dir": event.get("capture_dir", ""),

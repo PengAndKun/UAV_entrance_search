@@ -18,7 +18,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from .model import APlus2AffordanceNet
-from .schema import DIRECTION_LABELS, GEOMETRY_FEATURE_NAMES, MAX_DEPTH_CM, normalize_depth_cm
+from .schema import GEOMETRY_FEATURE_NAMES, MAX_DEPTH_CM, RISK_STATES, normalize_depth_cm
 
 
 def write_json(path: Path, data: Dict[str, Any]) -> None:
@@ -33,10 +33,9 @@ def load_dataset_arrays(dataset_path: Path) -> Dict[str, np.ndarray]:
         "depth_paths": data["depth_paths"],
         "geometry": data["geometry"].astype(np.float32),
         "mask_targets": data["mask_targets"].astype(np.float32),
-        "direction_indices": data["direction_indices"].astype(np.int64),
-        "direction_scores": data["direction_scores"].astype(np.float32),
-        "flyover_delta_cm": data["flyover_delta_cm"].astype(np.float32),
-        "red_front_blocked": data["red_front_blocked"].astype(bool),
+        "risk_indices": data["risk_indices"].astype(np.int64),
+        "can_forward": data["can_forward"].astype(bool),
+        "must_stop": data["must_stop"].astype(bool),
         "splits": data["splits"].astype(str),
         "group_ids": data["group_ids"].astype(str),
     }
@@ -84,15 +83,14 @@ class APlus2Dataset(Dataset):
     def __getitem__(self, item: int) -> Dict[str, torch.Tensor]:
         idx = int(self.indices[item])
         geometry = (self.arrays["geometry"][idx] - self.geometry_mean) / self.geometry_std
-        flyover_norm = float(self.arrays["flyover_delta_cm"][idx]) / 400.0
         return {
             "rgb": torch.from_numpy(load_rgb(str(self.arrays["image_paths"][idx]), self.image_size).copy()),
             "depth": torch.from_numpy(load_depth(str(self.arrays["depth_paths"][idx]), self.image_size).copy()),
             "geometry": torch.from_numpy(geometry.astype(np.float32, copy=False)),
             "mask": torch.from_numpy(self.arrays["mask_targets"][idx].astype(np.float32, copy=False)),
-            "direction": torch.tensor(int(self.arrays["direction_indices"][idx]), dtype=torch.long),
-            "scores": torch.from_numpy(self.arrays["direction_scores"][idx].astype(np.float32, copy=False)),
-            "flyover": torch.tensor(flyover_norm, dtype=torch.float32),
+            "risk": torch.tensor(int(self.arrays["risk_indices"][idx]), dtype=torch.long),
+            "can_forward": torch.tensor(1.0 if bool(self.arrays["can_forward"][idx]) else 0.0, dtype=torch.float32),
+            "must_stop": torch.tensor(1.0 if bool(self.arrays["must_stop"][idx]) else 0.0, dtype=torch.float32),
         }
 
 
@@ -116,16 +114,17 @@ def run_epoch(
     model.train(training)
     total_loss = 0.0
     total_mask_iou = 0.0
-    total_dir_acc = 0.0
+    total_risk_acc = 0.0
+    total_stop_acc = 0.0
     total_count = 0
     for batch in loader:
         rgb = batch["rgb"].to(device)
         depth = batch["depth"].to(device)
         geometry = batch["geometry"].to(device)
         mask = batch["mask"].to(device)
-        direction = batch["direction"].to(device)
-        scores = batch["scores"].to(device)
-        flyover = batch["flyover"].to(device)
+        risk = batch["risk"].to(device)
+        can_forward = batch["can_forward"].to(device)
+        must_stop = batch["must_stop"].to(device)
         if training:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(training):
@@ -133,10 +132,10 @@ def run_epoch(
             bce = F.binary_cross_entropy_with_logits(output["mask_logits"], mask)
             dice = dice_loss_from_logits(output["mask_logits"], mask)
             loss_mask = bce + dice
-            loss_dir = F.cross_entropy(output["direction_logits"], direction)
-            loss_score = F.mse_loss(torch.sigmoid(output["score_logits"]), scores)
-            loss_flyover = F.smooth_l1_loss(torch.clamp(output["flyover_delta"], min=0.0), flyover)
-            loss = loss_mask + loss_dir + 0.2 * loss_score + 0.1 * loss_flyover
+            loss_risk = F.cross_entropy(output["risk_logits"], risk)
+            loss_can_forward = F.binary_cross_entropy_with_logits(output["can_forward_logits"], can_forward)
+            loss_must_stop = F.binary_cross_entropy_with_logits(output["must_stop_logits"], must_stop)
+            loss = loss_mask + loss_risk + 0.2 * loss_can_forward + 0.3 * loss_must_stop
             if training:
                 loss.backward()
                 optimizer.step()
@@ -145,17 +144,20 @@ def run_epoch(
         intersection = torch.logical_and(pred_mask, target_mask).sum(dim=(1, 2, 3)).float()
         union = torch.logical_or(pred_mask, target_mask).sum(dim=(1, 2, 3)).float()
         mask_iou = torch.where(union > 0, intersection / torch.clamp(union, min=1.0), torch.ones_like(union))
-        pred_dir = torch.argmax(output["direction_logits"].detach(), dim=1)
-        batch_size = int(direction.numel())
+        pred_risk = torch.argmax(output["risk_logits"].detach(), dim=1)
+        pred_stop = (torch.sigmoid(output["must_stop_logits"].detach()) >= 0.5).float()
+        batch_size = int(risk.numel())
         total_count += batch_size
         total_loss += float(loss.item()) * batch_size
         total_mask_iou += float(mask_iou.mean().item()) * batch_size
-        total_dir_acc += float((pred_dir == direction).float().mean().item()) * batch_size
+        total_risk_acc += float((pred_risk == risk).float().mean().item()) * batch_size
+        total_stop_acc += float((pred_stop == must_stop).float().mean().item()) * batch_size
     denom = max(1, total_count)
     return {
         "loss": total_loss / denom,
         "mask_iou": total_mask_iou / denom,
-        "direction_accuracy": total_dir_acc / denom,
+        "risk_accuracy": total_risk_acc / denom,
+        "must_stop_accuracy": total_stop_acc / denom,
         "count": total_count,
     }
 
@@ -192,8 +194,8 @@ def train_model(
 
     train_ds = APlus2Dataset(arrays, train_indices, image_size=image_size, geometry_mean=geometry_mean, geometry_std=geometry_std)
     val_ds = APlus2Dataset(arrays, val_indices, image_size=image_size, geometry_mean=geometry_mean, geometry_std=geometry_std)
-    direction_counts = np.bincount(arrays["direction_indices"][train_indices], minlength=len(DIRECTION_LABELS)).astype(np.float32)
-    sampler_weights = np.asarray([1.0 / max(1.0, direction_counts[idx]) for idx in arrays["direction_indices"][train_indices]], dtype=np.float32)
+    risk_counts = np.bincount(arrays["risk_indices"][train_indices], minlength=len(RISK_STATES)).astype(np.float32)
+    sampler_weights = np.asarray([1.0 / max(1.0, risk_counts[idx]) for idx in arrays["risk_indices"][train_indices]], dtype=np.float32)
     sampler = WeightedRandomSampler(
         weights=torch.as_tensor(sampler_weights, dtype=torch.double),
         num_samples=int(train_indices.size),
@@ -203,7 +205,7 @@ def train_model(
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = APlus2AffordanceNet(geometry_dim=len(GEOMETRY_FEATURE_NAMES), num_directions=len(DIRECTION_LABELS)).to(device)
+    model = APlus2AffordanceNet(geometry_dim=len(GEOMETRY_FEATURE_NAMES), num_risk_states=len(RISK_STATES)).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     history = []
     best_val_loss = float("inf")
@@ -218,7 +220,7 @@ def train_model(
             best_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
         print(
             f"epoch={epoch:03d} train_loss={train_metrics['loss']:.4f} "
-            f"val_loss={val_metrics['loss']:.4f} val_dir_acc={val_metrics['direction_accuracy']:.4f} "
+            f"val_loss={val_metrics['loss']:.4f} val_risk_acc={val_metrics['risk_accuracy']:.4f} "
             f"val_mask_iou={val_metrics['mask_iou']:.4f}",
             flush=True,
         )
@@ -232,9 +234,10 @@ def train_model(
             "image_size": int(image_size),
             "geometry_dim": len(GEOMETRY_FEATURE_NAMES),
             "geometry_feature_names": GEOMETRY_FEATURE_NAMES,
-            "direction_labels": list(DIRECTION_LABELS),
-            "mask_channels": ["danger", "insufficient_clearance"],
-            "danger_depth_cm": 250.0,
+            "risk_states": list(RISK_STATES),
+            "mask_channels": ["clearance_warning", "obstacle_warning", "must_stop"],
+            "stop_depth_cm": 100.0,
+            "warning_depth_cm": 250.0,
             "clearance_depth_cm": 450.0,
         },
         "geometry_mean": geometry_mean,
@@ -258,7 +261,7 @@ def train_model(
         "val_count": int(val_indices.size),
         "duration_s": round(float(duration_s), 3),
         "best_val_loss": round(float(best_val_loss), 6),
-        "direction_labels": list(DIRECTION_LABELS),
+        "risk_states": list(RISK_STATES),
         "final_train": history[-1]["train"] if history else {},
         "final_val": history[-1]["val"] if history else {},
         "history": history,

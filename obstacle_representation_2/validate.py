@@ -14,7 +14,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .model import APlus2AffordanceNet
-from .schema import DIRECTION_LABELS
+from .schema import RISK_STATES
 from .train import APlus2Dataset, load_dataset_arrays, write_json
 
 
@@ -25,7 +25,7 @@ def _safe_div(num: float, den: float) -> float:
 def _macro_f1(confusion: np.ndarray) -> tuple[float, Dict[str, Dict[str, float]]]:
     per_class: Dict[str, Dict[str, float]] = {}
     values: List[float] = []
-    for idx, label in enumerate(DIRECTION_LABELS):
+    for idx, label in enumerate(RISK_STATES):
         tp = float(confusion[idx, idx])
         fp = float(confusion[:, idx].sum() - tp)
         fn = float(confusion[idx, :].sum() - tp)
@@ -68,58 +68,52 @@ def validate_model(
     ds = APlus2Dataset(arrays, test_indices, image_size=image_size, geometry_mean=geometry_mean, geometry_std=geometry_std)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = APlus2AffordanceNet(geometry_dim=int(config.get("geometry_dim", geometry_mean.shape[0])), num_directions=len(DIRECTION_LABELS)).to(device)
+    model = APlus2AffordanceNet(
+        geometry_dim=int(config.get("geometry_dim", geometry_mean.shape[0])),
+        num_risk_states=len(RISK_STATES),
+    ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
-    confusion = np.zeros((len(DIRECTION_LABELS), len(DIRECTION_LABELS)), dtype=np.int64)
+    confusion = np.zeros((len(RISK_STATES), len(RISK_STATES)), dtype=np.int64)
     mask_iou_sum = 0.0
     count = 0
-    forward_danger_violations = 0
-    raw_forward_danger_violations = 0
-    red_blocked_count = 0
-    up_needed_count = 0
-    up_correct_count = 0
+    raw_must_stop_miss_count = 0
+    shielded_must_stop_miss_count = 0
+    must_stop_count = 0
+    can_forward_errors = 0
     latency_samples: List[float] = []
     with torch.no_grad():
-        offset = 0
         for batch in loader:
             rgb = batch["rgb"].to(device)
             depth = batch["depth"].to(device)
             geometry = batch["geometry"].to(device)
             target_mask = batch["mask"].to(device) >= 0.5
-            target_direction = batch["direction"].cpu().numpy()
+            target_risk = batch["risk"].cpu().numpy()
+            target_must_stop = batch["must_stop"].cpu().numpy().astype(bool)
+            target_can_forward = batch["can_forward"].cpu().numpy().astype(bool)
             start = time.perf_counter()
             output = model(rgb, depth, geometry)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             latency_samples.extend([elapsed_ms / max(1, rgb.shape[0])] * int(rgb.shape[0]))
-            raw_pred_direction = torch.argmax(output["direction_logits"], dim=1).detach().cpu().numpy()
-            score_prob = torch.sigmoid(output["score_logits"]).detach().cpu().numpy()
-            pred_direction = raw_pred_direction.copy()
+            raw_pred_risk = torch.argmax(output["risk_logits"], dim=1).detach().cpu().numpy()
+            pred_must_stop = (torch.sigmoid(output["must_stop_logits"]).detach().cpu().numpy() >= 0.5)
+            pred_can_forward = (torch.sigmoid(output["can_forward_logits"]).detach().cpu().numpy() >= 0.5)
             pred_mask = (torch.sigmoid(output["mask_logits"]) >= 0.5).detach()
             intersection = torch.logical_and(pred_mask, target_mask).sum(dim=(1, 2, 3)).float()
             union = torch.logical_or(pred_mask, target_mask).sum(dim=(1, 2, 3)).float()
             iou = torch.where(union > 0, intersection / torch.clamp(union, min=1.0), torch.ones_like(union))
             mask_iou_sum += float(iou.sum().item())
-            batch_indices = test_indices[offset : offset + int(rgb.shape[0])]
-            offset += int(rgb.shape[0])
-            red_blocked = arrays["red_front_blocked"][batch_indices]
-            red_blocked_count += int(np.count_nonzero(red_blocked))
-            forward_idx = DIRECTION_LABELS.index("forward")
-            up_idx = DIRECTION_LABELS.index("up")
-            raw_forward_danger_violations += int(np.count_nonzero(red_blocked & (raw_pred_direction == forward_idx)))
-            for row_idx, blocked in enumerate(red_blocked):
-                if bool(blocked) and int(pred_direction[row_idx]) == forward_idx:
-                    fallback_scores = score_prob[row_idx].copy()
-                    fallback_scores[forward_idx] = -1.0
-                    pred_direction[row_idx] = int(np.argmax(fallback_scores))
-            forward_danger_violations += int(np.count_nonzero(red_blocked & (pred_direction == forward_idx)))
-            up_teacher = target_direction == up_idx
-            up_needed_count += int(np.count_nonzero(up_teacher))
-            up_correct_count += int(np.count_nonzero(up_teacher & (pred_direction == up_idx)))
-            for true_idx, pred_idx in zip(target_direction, pred_direction):
+
+            stop_idx = RISK_STATES.index("must_stop")
+            raw_must_stop_miss_count += int(np.count_nonzero(target_must_stop & (raw_pred_risk != stop_idx) & ~pred_must_stop))
+            pred_risk = np.where(pred_must_stop, stop_idx, raw_pred_risk)
+            shielded_must_stop_miss_count += int(np.count_nonzero(target_must_stop & (pred_risk != stop_idx)))
+            must_stop_count += int(np.count_nonzero(target_must_stop))
+            can_forward_errors += int(np.count_nonzero(pred_can_forward != target_can_forward))
+            for true_idx, pred_idx in zip(target_risk, pred_risk):
                 confusion[int(true_idx), int(pred_idx)] += 1
             count += int(rgb.shape[0])
 
@@ -130,19 +124,19 @@ def validate_model(
         "model_path": str(model_path),
         "model_version": str(config.get("model_version", "a_plus_2_v1")),
         "test_count": int(count),
-        "accuracy": accuracy,
+        "risk_accuracy": accuracy,
         "macro_f1": macro_f1,
         "mask_iou": float(mask_iou_sum / max(1, count)),
-        "raw_forward_danger_violation_count": int(raw_forward_danger_violations),
-        "raw_forward_danger_violation_rate": float(raw_forward_danger_violations / max(1, red_blocked_count)),
-        "forward_danger_violation_count": int(forward_danger_violations),
-        "forward_danger_violation_rate": float(forward_danger_violations / max(1, red_blocked_count)),
-        "red_front_blocked_count": int(red_blocked_count),
-        "up_recall_when_front_blocked": float(up_correct_count / max(1, up_needed_count)),
-        "up_needed_count": int(up_needed_count),
+        "raw_must_stop_miss_count": int(raw_must_stop_miss_count),
+        "raw_must_stop_miss_rate": float(raw_must_stop_miss_count / max(1, must_stop_count)),
+        "shielded_must_stop_miss_count": int(shielded_must_stop_miss_count),
+        "shielded_must_stop_miss_rate": float(shielded_must_stop_miss_count / max(1, must_stop_count)),
+        "must_stop_count": int(must_stop_count),
+        "can_forward_error_count": int(can_forward_errors),
+        "can_forward_error_rate": float(can_forward_errors / max(1, count)),
         "per_class": per_class,
         "confusion_matrix": confusion.astype(int).tolist(),
-        "direction_labels": list(DIRECTION_LABELS),
+        "risk_states": list(RISK_STATES),
         "latency_ms_mean": float(np.mean(latency_samples)) if latency_samples else 0.0,
         "latency_ms_p95": float(np.percentile(latency_samples, 95)) if latency_samples else 0.0,
         "device": str(device),
@@ -152,7 +146,7 @@ def validate_model(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Validate Obstacle Representation 2 A+2 model.")
+    parser = argparse.ArgumentParser(description="Validate Obstacle Representation 2 A+2 risk model.")
     parser.add_argument("--dataset", default="obstacle_representation_2_data/datasets/a_plus_2_dataset_latest.npz")
     parser.add_argument("--model", default="obstacle_representation_2_data/models/a_plus_2_model.pt")
     parser.add_argument("--report", default=None)

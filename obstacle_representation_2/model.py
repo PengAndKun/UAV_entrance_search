@@ -27,9 +27,9 @@ class ConvBlock(nn.Module):
 
 
 class APlus2AffordanceNet(nn.Module):
-    """Small RGB-D U-Net style model with direction and flyover heads."""
+    """Small RGB-D U-Net style model with risk-state heads."""
 
-    def __init__(self, *, geometry_dim: int, num_directions: int = 6, mask_channels: int = 2) -> None:
+    def __init__(self, *, geometry_dim: int, num_risk_states: int = 4, mask_channels: int = 3) -> None:
         super().__init__()
         self.enc1 = ConvBlock(4, 24)
         self.enc2 = ConvBlock(24, 48)
@@ -47,16 +47,16 @@ class APlus2AffordanceNet(nn.Module):
             nn.Linear(64, 32),
             nn.ReLU(inplace=True),
         )
-        self.direction_head = nn.Sequential(
+        self.risk_head = nn.Sequential(
             nn.Linear(96 + 32, 96),
             nn.ReLU(inplace=True),
             nn.Dropout(p=0.15),
             nn.Linear(96, 64),
             nn.ReLU(inplace=True),
         )
-        self.direction_logits = nn.Linear(64, num_directions)
-        self.score_logits = nn.Linear(64, num_directions)
-        self.flyover_head = nn.Linear(64, 1)
+        self.risk_logits = nn.Linear(64, num_risk_states)
+        self.can_forward_head = nn.Linear(64, 1)
+        self.must_stop_head = nn.Linear(64, 1)
 
     def forward(self, rgb: torch.Tensor, depth: torch.Tensor, geometry: torch.Tensor) -> Dict[str, torch.Tensor]:
         x = torch.cat([rgb, depth], dim=1)
@@ -73,10 +73,10 @@ class APlus2AffordanceNet(nn.Module):
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
         pooled = F.adaptive_avg_pool2d(e3, (1, 1)).flatten(1)
         geom = self.geometry_encoder(geometry)
-        fused = self.direction_head(torch.cat([pooled, geom], dim=1))
+        fused = self.risk_head(torch.cat([pooled, geom], dim=1))
         return {
             "mask_logits": self.mask_head(d1),
-            "direction_logits": self.direction_logits(fused),
-            "score_logits": self.score_logits(fused),
-            "flyover_delta": self.flyover_head(fused).squeeze(1),
+            "risk_logits": self.risk_logits(fused),
+            "can_forward_logits": self.can_forward_head(fused).squeeze(1),
+            "must_stop_logits": self.must_stop_head(fused).squeeze(1),
         }
