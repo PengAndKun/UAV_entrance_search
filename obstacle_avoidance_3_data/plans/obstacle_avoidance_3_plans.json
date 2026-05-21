@@ -1,0 +1,262 @@
+{
+  "version": 1,
+  "updated_at": "2026-05-21T14:11:55.850",
+  "active_project_id": "route_obstacle_or2_collection_v1",
+  "environments": [
+    {
+      "environment_id": "default_unreal_scene",
+      "name": "Default Unreal scene"
+    },
+    {
+      "environment_id": "tree_trunk_or_pole",
+      "name": "Tree trunk / pole"
+    },
+    {
+      "environment_id": "fence_or_rail",
+      "name": "Fence / rail"
+    },
+    {
+      "environment_id": "building_or_roof",
+      "name": "Building / roof"
+    },
+    {
+      "environment_id": "mixed_obstacles",
+      "name": "Mixed obstacles"
+    }
+  ],
+  "methods": [
+    {
+      "method_id": "obstacle_representation_direction_rule_v1",
+      "name": "OR2 risk-region direction rule v1",
+      "runnable": true,
+      "description": "Uses OR2 RGB-D risk masks. Deep red blocks only that corridor; choose clear left/right/up before backoff."
+    }
+  ],
+  "projects": [
+    {
+      "project_id": "route_obstacle_or2_collection_v1",
+      "name": "OA3 default OR2 risk-region collection",
+      "environment_id": "default_unreal_scene",
+      "default_method": "obstacle_representation_direction_rule_v1",
+      "episodes": [
+        {
+          "episode_id": "E01",
+          "enabled": true,
+          "start_pose": [
+            325.5,
+            526.0,
+            211.2,
+            0.2
+          ],
+          "goal_pose": [
+            734.3,
+            552.0,
+            211.2,
+            0.2
+          ],
+          "scenario_id": "oa3_route_E01",
+          "environment_id": "default_unreal_scene",
+          "method": "obstacle_representation_direction_rule_v1",
+          "obstacle_hint": "unknown",
+          "operator_note": ""
+        },
+        {
+          "episode_id": "E02",
+          "enabled": true,
+          "start_pose": [
+            1298.8,
+            513.8,
+            258.2,
+            0.3
+          ],
+          "goal_pose": [
+            2048.9,
+            443.8,
+            259.7,
+            0.3
+          ],
+          "scenario_id": "oa3_route_E02",
+          "environment_id": "default_unreal_scene",
+          "method": "obstacle_representation_direction_rule_v1",
+          "obstacle_hint": "unknown",
+          "operator_note": ""
+        },
+        {
+          "episode_id": "E03",
+          "enabled": true,
+          "start_pose": [
+            2475.1,
+            1129.3,
+            175.3,
+            74.2
+          ],
+          "goal_pose": [
+            2883.4,
+            1852.3,
+            162.0,
+            65.4
+          ],
+          "scenario_id": "oa3_route_E03",
+          "environment_id": "default_unreal_scene",
+          "method": "obstacle_representation_direction_rule_v1",
+          "obstacle_hint": "unknown",
+          "operator_note": ""
+        },
+        {
+          "episode_id": "E04",
+          "enabled": true,
+          "start_pose": [
+            3546.2,
+            2361.3,
+            162.0,
+            -55.8
+          ],
+          "goal_pose": [
+            4425.2,
+            1100.3,
+            200.0,
+            -55.6
+          ],
+          "scenario_id": "oa3_route_E04",
+          "environment_id": "default_unreal_scene",
+          "method": "obstacle_representation_direction_rule_v1",
+          "obstacle_hint": "unknown",
+          "operator_note": ""
+        },
+        {
+          "episode_id": "E05",
+          "enabled": true,
+          "start_pose": [
+            4870.3,
+            -655.2,
+            257.9,
+            -105.3
+          ],
+          "goal_pose": [
+            3820.9,
+            -2436.0,
+            267.9,
+            123.3
+          ],
+          "scenario_id": "oa3_route_E05",
+          "environment_id": "default_unreal_scene",
+          "method": "obstacle_representation_direction_rule_v1",
+          "obstacle_hint": "unknown",
+          "operator_note": ""
+        },
+        {
+          "episode_id": "E06",
+          "enabled": true,
+          "start_pose": [
+            1875.2,
+            -1390.4,
+            223.5,
+            -89.8
+          ],
+          "goal_pose": [
+            1877.1,
+            1911.1,
+            223.5,
+            -89.8
+          ],
+          "scenario_id": "oa3_route_E06",
+          "environment_id": "default_unreal_scene",
+          "method": "obstacle_representation_direction_rule_v1",
+          "obstacle_hint": "unknown",
+          "operator_note": ""
+        },
+        {
+          "episode_id": "E07",
+          "enabled": true,
+          "start_pose": [
+            1916.6,
+            -2605.6,
+            223.5,
+            178.0
+          ],
+          "goal_pose": [
+            1429.5,
+            -2646.4,
+            223.5,
+            178.0
+          ],
+          "scenario_id": "oa3_route_E07",
+          "environment_id": "default_unreal_scene",
+          "method": "obstacle_representation_direction_rule_v1",
+          "obstacle_hint": "unknown",
+          "operator_note": ""
+        },
+        {
+          "episode_id": "E08",
+          "enabled": true,
+          "start_pose": [
+            -549.9,
+            -2703.1,
+            262.5,
+            93.0
+          ],
+          "goal_pose": [
+            -589.8,
+            -1948.0,
+            262.4,
+            93.0
+          ],
+          "scenario_id": "oa3_route_E08",
+          "environment_id": "default_unreal_scene",
+          "method": "obstacle_representation_direction_rule_v1",
+          "obstacle_hint": "unknown",
+          "operator_note": ""
+        },
+        {
+          "episode_id": "E09",
+          "enabled": true,
+          "start_pose": [
+            -497.1,
+            1640.1,
+            195.2,
+            85.6
+          ],
+          "goal_pose": [
+            -462.9,
+            2084.6,
+            201.2,
+            85.6
+          ],
+          "scenario_id": "oa3_route_E09",
+          "environment_id": "default_unreal_scene",
+          "method": "obstacle_representation_direction_rule_v1",
+          "obstacle_hint": "unknown",
+          "operator_note": ""
+        },
+        {
+          "episode_id": "E10",
+          "enabled": true,
+          "start_pose": [
+            1960.5,
+            1975.9,
+            153.1,
+            -87.4
+          ],
+          "goal_pose": [
+            1983.1,
+            1474.2,
+            153.1,
+            -87.4
+          ],
+          "scenario_id": "oa3_route_E10",
+          "environment_id": "default_unreal_scene",
+          "method": "obstacle_representation_direction_rule_v1",
+          "obstacle_hint": "unknown",
+          "operator_note": ""
+        }
+      ],
+      "experiment_defaults": {
+        "stage": "route_episode_3",
+        "method": "obstacle_representation_direction_rule_v1",
+        "reach_tol_cm": 180.0,
+        "interval_s": 0.5,
+        "max_ticks_per_episode": 220
+      }
+    }
+  ]
+}

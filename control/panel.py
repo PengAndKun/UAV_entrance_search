@@ -6,6 +6,7 @@ from .flight_control import FlightControlMixin
 from .lidar_analysis_control import LidarAnalysisControlMixin
 from .map_control import MapControlMixin
 from .obstacle_avoidance_2_control import ObstacleAvoidance2ControlMixin
+from .obstacle_avoidance_3_control import ObstacleAvoidance3ControlMixin
 from .obstacle_avoidance_llm_control import ObstacleAvoidanceLLMControlMixin
 from .obstacle_avoidance_control import ObstacleAvoidanceControlMixin
 from .obstacle_representation_control import ObstacleRepresentationControlMixin
@@ -22,6 +23,7 @@ class RunDroneFlightPanel(
     LidarAnalysisControlMixin,
     ObstacleAvoidanceControlMixin,
     ObstacleAvoidance2ControlMixin,
+    ObstacleAvoidance3ControlMixin,
     ObstacleAvoidanceLLMControlMixin,
     ObstacleRepresentationControlMixin,
 ):
@@ -760,6 +762,7 @@ class RunDroneFlightPanel(
         tk.Button(stream, text="Obstacle Avoidance", command=self.open_obstacle_avoidance_window).grid(row=1, column=5, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Obstacle Avoidance 2", command=self.open_obstacle_avoidance_2_window).grid(row=1, column=6, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Obstacle Avoidance LLM", command=self.open_obstacle_avoidance_llm_window).grid(row=1, column=7, sticky="w", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Obstacle Avoidance 3", command=self.open_obstacle_avoidance_3_window).grid(row=1, column=8, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Start Lidar Capture", command=self.on_start_lidar_stream_capture).grid(row=2, column=0, padx=6, pady=(0, 6))
         tk.Button(stream, text="Stop Lidar Capture", command=self.on_stop_lidar_stream_capture).grid(row=2, column=1, sticky="w", padx=6, pady=(0, 6))
         tk.Button(stream, text="Analyze Lidar", command=self.open_lidar_analysis_window).grid(row=2, column=2, sticky="w", padx=6, pady=(0, 6))
@@ -779,10 +782,10 @@ class RunDroneFlightPanel(
         tk.Button(stream, text="Obstacle Representation 2", command=self.open_obstacle_representation_2_monitor_window).grid(
             row=3, column=7, sticky="w", padx=6, pady=(0, 6)
         )
-        tk.Label(stream, textvariable=self.stream_status_var, anchor="w").grid(row=4, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
-        tk.Label(stream, textvariable=self.lidar_stream_status_var, anchor="w").grid(row=5, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
-        tk.Label(stream, textvariable=self.lidar_stream_analysis_status_var, anchor="w").grid(row=6, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
-        tk.Label(stream, textvariable=self.stream_player_status_var, anchor="w").grid(row=7, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 6))
+        tk.Label(stream, textvariable=self.stream_status_var, anchor="w").grid(row=4, column=0, columnspan=9, sticky="ew", padx=6, pady=(0, 3))
+        tk.Label(stream, textvariable=self.lidar_stream_status_var, anchor="w").grid(row=5, column=0, columnspan=9, sticky="ew", padx=6, pady=(0, 3))
+        tk.Label(stream, textvariable=self.lidar_stream_analysis_status_var, anchor="w").grid(row=6, column=0, columnspan=9, sticky="ew", padx=6, pady=(0, 3))
+        tk.Label(stream, textvariable=self.stream_player_status_var, anchor="w").grid(row=7, column=0, columnspan=9, sticky="ew", padx=6, pady=(0, 6))
 
         map_frame = tk.LabelFrame(outer, text="Map")
         map_frame.grid(row=7, column=0, sticky="ew", padx=8, pady=4)
@@ -1809,6 +1812,9 @@ class RunDroneFlightPanel(
         self.stream_capture_stop_event.set()
         self.lidar_stream_capture_stop_event.set()
         self.obstacle_avoidance_stop_event.set()
+        oa3_stop_event = getattr(self, "obstacle_avoidance_3_stop_event", None)
+        if oa3_stop_event is not None:
+            oa3_stop_event.set()
         or2_monitor_stop_event = getattr(self, "or2_monitor_stop_event", None)
         if or2_monitor_stop_event is not None:
             or2_monitor_stop_event.set()
@@ -1819,6 +1825,14 @@ class RunDroneFlightPanel(
                 pass
             self.obstacle_avoidance_window = None
             self.obstacle_avoidance_report_text = None
+        oa3_window = getattr(self, "obstacle_avoidance_3_window", None)
+        if oa3_window is not None:
+            try:
+                oa3_window.destroy()
+            except Exception:
+                pass
+            self.obstacle_avoidance_3_window = None
+            self.obstacle_avoidance_3_report_text = None
         self.sequence_stop_event.set()
         self.route_stop_event.set()
         session = self.session

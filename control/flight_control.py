@@ -26,6 +26,9 @@ class FlightControlMixin:
         obstacle2_stop_event = getattr(self, "obstacle_avoidance_2_stop_event", None)
         if obstacle2_stop_event is not None:
             obstacle2_stop_event.set()
+        obstacle3_stop_event = getattr(self, "obstacle_avoidance_3_stop_event", None)
+        if obstacle3_stop_event is not None:
+            obstacle3_stop_event.set()
         or2_monitor_stop_event = getattr(self, "or2_monitor_stop_event", None)
         if or2_monitor_stop_event is not None:
             or2_monitor_stop_event.set()
@@ -65,7 +68,10 @@ class FlightControlMixin:
         if session is None or not session.started:
             return
         obstacle2_thread = getattr(self, "obstacle_avoidance_2_runner_thread", None)
+        obstacle3_thread = getattr(self, "obstacle_avoidance_3_runner_thread", None)
         if obstacle2_thread is not None and obstacle2_thread.is_alive():
+            return
+        if obstacle3_thread is not None and obstacle3_thread.is_alive():
             return
         if self.state_refresh_inflight:
             return
@@ -85,7 +91,10 @@ class FlightControlMixin:
         if not self.manual_request_inflight and not self.move_request_inflight:
             session = self.session
             obstacle2_thread = getattr(self, "obstacle_avoidance_2_runner_thread", None)
-            if session is not None and session.started and not (obstacle2_thread is not None and obstacle2_thread.is_alive()):
+            obstacle3_thread = getattr(self, "obstacle_avoidance_3_runner_thread", None)
+            oa2_active = obstacle2_thread is not None and obstacle2_thread.is_alive()
+            oa3_active = obstacle3_thread is not None and obstacle3_thread.is_alive()
+            if session is not None and session.started and not (oa2_active or oa3_active):
                 self.refresh_state_once()
         self.root.after(self.args.state_interval_ms, self.schedule_state_refresh)
 
