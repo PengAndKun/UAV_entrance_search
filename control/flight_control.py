@@ -26,6 +26,9 @@ class FlightControlMixin:
         obstacle2_stop_event = getattr(self, "obstacle_avoidance_2_stop_event", None)
         if obstacle2_stop_event is not None:
             obstacle2_stop_event.set()
+        or2_monitor_stop_event = getattr(self, "or2_monitor_stop_event", None)
+        if or2_monitor_stop_event is not None:
+            or2_monitor_stop_event.set()
         self.route_stop_event.set()
         route3_stop_event = getattr(self, "llm_route3_stop_event", None)
         if route3_stop_event is not None:

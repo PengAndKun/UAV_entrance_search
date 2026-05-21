@@ -776,10 +776,13 @@ class RunDroneFlightPanel(
         tk.Button(stream, text="Obstacle Representation", command=self.open_obstacle_representation_window).grid(
             row=2, column=7, sticky="w", padx=6, pady=(0, 6)
         )
-        tk.Label(stream, textvariable=self.stream_status_var, anchor="w").grid(row=3, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
-        tk.Label(stream, textvariable=self.lidar_stream_status_var, anchor="w").grid(row=4, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
-        tk.Label(stream, textvariable=self.lidar_stream_analysis_status_var, anchor="w").grid(row=5, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
-        tk.Label(stream, textvariable=self.stream_player_status_var, anchor="w").grid(row=6, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 6))
+        tk.Button(stream, text="Obstacle Representation 2", command=self.open_obstacle_representation_2_monitor_window).grid(
+            row=3, column=7, sticky="w", padx=6, pady=(0, 6)
+        )
+        tk.Label(stream, textvariable=self.stream_status_var, anchor="w").grid(row=4, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
+        tk.Label(stream, textvariable=self.lidar_stream_status_var, anchor="w").grid(row=5, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
+        tk.Label(stream, textvariable=self.lidar_stream_analysis_status_var, anchor="w").grid(row=6, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 3))
+        tk.Label(stream, textvariable=self.stream_player_status_var, anchor="w").grid(row=7, column=0, columnspan=8, sticky="ew", padx=6, pady=(0, 6))
 
         map_frame = tk.LabelFrame(outer, text="Map")
         map_frame.grid(row=7, column=0, sticky="ew", padx=8, pady=4)
@@ -1806,6 +1809,9 @@ class RunDroneFlightPanel(
         self.stream_capture_stop_event.set()
         self.lidar_stream_capture_stop_event.set()
         self.obstacle_avoidance_stop_event.set()
+        or2_monitor_stop_event = getattr(self, "or2_monitor_stop_event", None)
+        if or2_monitor_stop_event is not None:
+            or2_monitor_stop_event.set()
         if self.obstacle_avoidance_window is not None:
             try:
                 self.obstacle_avoidance_window.destroy()
