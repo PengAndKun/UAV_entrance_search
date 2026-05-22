@@ -29,6 +29,9 @@ class FlightControlMixin:
         obstacle3_stop_event = getattr(self, "obstacle_avoidance_3_stop_event", None)
         if obstacle3_stop_event is not None:
             obstacle3_stop_event.set()
+        obstacle3_or2_stop_event = getattr(self, "obstacle_avoidance_3_or2_monitor_stop_event", None)
+        if obstacle3_or2_stop_event is not None:
+            obstacle3_or2_stop_event.set()
         or2_monitor_stop_event = getattr(self, "or2_monitor_stop_event", None)
         if or2_monitor_stop_event is not None:
             or2_monitor_stop_event.set()
@@ -45,6 +48,15 @@ class FlightControlMixin:
         route4_pause_event = getattr(self, "llm_route4_pause_event", None)
         if route4_pause_event is not None:
             route4_pause_event.clear()
+        route5_stop_event = getattr(self, "llm_route5_stop_event", None)
+        if route5_stop_event is not None:
+            route5_stop_event.set()
+        route5_pause_event = getattr(self, "llm_route5_pause_event", None)
+        if route5_pause_event is not None:
+            route5_pause_event.clear()
+        route5_or2_stop_event = getattr(self, "route5_or2_monitor_stop_event", None)
+        if route5_or2_stop_event is not None:
+            route5_or2_stop_event.set()
         session = self.session
         if session is None:
             try:
@@ -69,9 +81,12 @@ class FlightControlMixin:
             return
         obstacle2_thread = getattr(self, "obstacle_avoidance_2_runner_thread", None)
         obstacle3_thread = getattr(self, "obstacle_avoidance_3_runner_thread", None)
+        obstacle3_or2_thread = getattr(self, "obstacle_avoidance_3_or2_monitor_thread", None)
         if obstacle2_thread is not None and obstacle2_thread.is_alive():
             return
         if obstacle3_thread is not None and obstacle3_thread.is_alive():
+            return
+        if obstacle3_or2_thread is not None and obstacle3_or2_thread.is_alive():
             return
         if self.state_refresh_inflight:
             return
@@ -92,9 +107,11 @@ class FlightControlMixin:
             session = self.session
             obstacle2_thread = getattr(self, "obstacle_avoidance_2_runner_thread", None)
             obstacle3_thread = getattr(self, "obstacle_avoidance_3_runner_thread", None)
+            obstacle3_or2_thread = getattr(self, "obstacle_avoidance_3_or2_monitor_thread", None)
             oa2_active = obstacle2_thread is not None and obstacle2_thread.is_alive()
             oa3_active = obstacle3_thread is not None and obstacle3_thread.is_alive()
-            if session is not None and session.started and not (oa2_active or oa3_active):
+            oa3_or2_active = obstacle3_or2_thread is not None and obstacle3_or2_thread.is_alive()
+            if session is not None and session.started and not (oa2_active or oa3_active or oa3_or2_active):
                 self.refresh_state_once()
         self.root.after(self.args.state_interval_ms, self.schedule_state_refresh)
 
@@ -642,6 +659,10 @@ class FlightControlMixin:
             self.keyboard_pressed_symbols.clear()
             self.update_keyboard_status("locked by LLM Route V4")
             return
+        if getattr(self, "llm_route5_control_locked", False):
+            self.keyboard_pressed_symbols.clear()
+            self.update_keyboard_status("locked by LLM Route V5")
+            return
         if not self.keyboard_enabled_var.get():
             self.stop_keyboard_control(send_hold=True)
             return
@@ -734,6 +755,9 @@ class FlightControlMixin:
             return
         if getattr(self, "llm_route4_control_locked", False):
             self.status_var.set(f"Move {symbol} ignored while LLM Route V4 controls movement.")
+            return
+        if getattr(self, "llm_route5_control_locked", False):
+            self.status_var.set(f"Move {symbol} ignored while LLM Route V5 controls movement.")
             return
         if self.move_request_inflight or self.keyboard_request_inflight:
             self.status_var.set(f"Move {symbol} ignored while another move is in flight.")

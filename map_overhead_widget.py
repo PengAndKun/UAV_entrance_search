@@ -207,6 +207,14 @@ class OverheadMapWidget:
         self.canvas.delete("dynamic")
         self._house_canvas_circles.clear()
 
+    def resize_canvas(self, canvas_w: int, canvas_h: int) -> None:
+        """Resize the drawing area and redraw map layers."""
+        self._canvas_w = max(1, int(canvas_w))
+        self._canvas_h = max(1, int(canvas_h))
+        if self._canvas_alive():
+            self.canvas.configure(width=self._canvas_w, height=self._canvas_h)
+        self._redraw()
+
     def set_background_image(self, image_bgr: Optional[np.ndarray]) -> None:
         """
         Set an optional background image for the overhead map.
@@ -287,6 +295,8 @@ class OverheadMapWidget:
                         "height_band": str(point.get("height_band", "") or ""),
                         "floor_index": point.get("floor_index"),
                         "safe_interval_index": point.get("safe_interval_index"),
+                        "color": str(point.get("color", "") or ""),
+                        "outline_color": str(point.get("outline_color", "") or ""),
                     }
                 )
         self._route_plan = points
@@ -737,6 +747,10 @@ class OverheadMapWidget:
                 color = band_palette[(max(1, floor_index) - 1) % len(band_palette)] if floor_index else "#ffd166"
             else:
                 color = ROUTE_PLAN_COLOR
+            custom_color = str(point.get("color", "") or "")
+            if custom_color:
+                color = custom_color
+            outline_color = str(point.get("outline_color", "") or "#1a1a1a")
             radius = 6 if status == "active" else (4 if is_scan_point else 5)
             draw_cx = cx
             draw_cy = cy
@@ -749,7 +763,7 @@ class OverheadMapWidget:
                 draw_cx + radius,
                 draw_cy + radius,
                 fill=color,
-                outline="#1a1a1a",
+                outline=outline_color,
                 width=1,
                 tags="dynamic",
             )

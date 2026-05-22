@@ -12,6 +12,7 @@ from .obstacle_avoidance_control import ObstacleAvoidanceControlMixin
 from .obstacle_representation_control import ObstacleRepresentationControlMixin
 from .route_control import RouteControlMixin
 from .route4_fusion_control import Route4FusionControlMixin
+from .route5_fusion_control import Route5FusionControlMixin
 
 
 class RunDroneFlightPanel(
@@ -19,6 +20,7 @@ class RunDroneFlightPanel(
     MapControlMixin,
     RouteControlMixin,
     Route4FusionControlMixin,
+    Route5FusionControlMixin,
     AnalysisControlMixin,
     LidarAnalysisControlMixin,
     ObstacleAvoidanceControlMixin,
@@ -914,6 +916,7 @@ class RunDroneFlightPanel(
             tk.Button(scan, text="Open LLM Route Window 2", command=self.open_llm_route_window2).pack(side="left", padx=6, pady=4)
             tk.Button(scan, text="Open LLM Route Window 3", command=self.open_llm_route_window3).pack(side="left", padx=6, pady=4)
             tk.Button(scan, text="Open LLM Route Window 4", command=self.open_llm_route_window4).pack(side="left", padx=6, pady=4)
+            tk.Button(scan, text="Open LLM Route Window 5", command=self.open_llm_route_window5).pack(side="left", padx=6, pady=4)
 
         actions = tk.Frame(route)
         actions.grid(row=4, column=0, columnspan=6, sticky="ew", padx=0, pady=(0, 4))
@@ -1753,6 +1756,15 @@ class RunDroneFlightPanel(
         route4_pause_event = getattr(self, "llm_route4_pause_event", None)
         if route4_pause_event is not None:
             route4_pause_event.clear()
+        route5_stop_event = getattr(self, "llm_route5_stop_event", None)
+        if route5_stop_event is not None:
+            route5_stop_event.set()
+        route5_pause_event = getattr(self, "llm_route5_pause_event", None)
+        if route5_pause_event is not None:
+            route5_pause_event.clear()
+        route5_or2_stop_event = getattr(self, "route5_or2_monitor_stop_event", None)
+        if route5_or2_stop_event is not None:
+            route5_or2_stop_event.set()
         if self.llm_route_window is not None:
             try:
                 self.llm_route_window.destroy()
@@ -1806,6 +1818,26 @@ class RunDroneFlightPanel(
             self.llm_route4_analysis_text = None
             self.llm_route4_rgb_label = None
             self.llm_route4_rgb_photo = None
+        if getattr(self, "llm_route5_window", None) is not None:
+            try:
+                self.llm_route5_window.destroy()
+            except Exception:
+                pass
+            self.llm_route5_window = None
+            self.llm_route5_window_canvas = None
+            self.llm_route5_window_content = None
+            self.llm_route5_window_content_window = None
+            self.llm_route5_map_widget = None
+            self.llm_route5_preview_text = None
+            self.llm_route5_analysis_text = None
+            self.llm_route5_rgb_label = None
+            self.llm_route5_rgb_photo = None
+            self.route5_or2_state_label = None
+            self.route5_or2_rgb_label = None
+            self.route5_or2_mask_label = None
+            self.route5_or2_rgb_photo = None
+            self.route5_or2_mask_photo = None
+            self.route5_or2_report_text = None
         self.stop_stream_player()
         self.stop_stream_analysis()
         self.close_lidar_analysis_window()
@@ -1815,6 +1847,9 @@ class RunDroneFlightPanel(
         oa3_stop_event = getattr(self, "obstacle_avoidance_3_stop_event", None)
         if oa3_stop_event is not None:
             oa3_stop_event.set()
+        oa3_or2_stop_event = getattr(self, "obstacle_avoidance_3_or2_monitor_stop_event", None)
+        if oa3_or2_stop_event is not None:
+            oa3_or2_stop_event.set()
         or2_monitor_stop_event = getattr(self, "or2_monitor_stop_event", None)
         if or2_monitor_stop_event is not None:
             or2_monitor_stop_event.set()

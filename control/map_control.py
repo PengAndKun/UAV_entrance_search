@@ -939,6 +939,8 @@ class MapControlMixin:
             self.refresh_llm_route3_map()
             if hasattr(self, "refresh_llm_route4_map"):
                 self.refresh_llm_route4_map()
+            if hasattr(self, "refresh_llm_route5_map"):
+                self.refresh_llm_route5_map()
         except Exception as exc:
             LOGGER.warning("Save setting map config failed: %s", exc)
             self.map_setting_status_var.set(f"Setting Map: save failed: {exc}")
