@@ -476,6 +476,7 @@ def run_lidar_yolo_analysis(
     max_points_per_detection: int = DEFAULT_LIDAR_YOLO_MAX_POINTS_PER_DETECTION,
     stop_event: Optional[threading.Event] = None,
     progress_callback: Optional[ProgressCallback] = None,
+    selected_frames_override: Optional[List[LidarYoloFrame]] = None,
 ) -> Dict[str, Any]:
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     os.environ.setdefault("YOLO_CONFIG_DIR", str(PROJECT_ROOT / ".ultralytics"))
@@ -488,7 +489,15 @@ def run_lidar_yolo_analysis(
     selected_weights = Path(weights_path).expanduser().resolve()
     if not selected_weights.exists():
         raise RuntimeError(f"YOLO weights not found: {selected_weights}")
-    selected_frames = scan_lidar_yolo_frames(stream_path, stride=stride, max_frames=max_frames)
+    if selected_frames_override is None:
+        selected_frames = scan_lidar_yolo_frames(stream_path, stride=stride, max_frames=max_frames)
+    else:
+        selected_frames = list(selected_frames_override)
+        stride = max(1, int(stride or 1))
+        max_frames = max(0, int(max_frames or 0))
+        selected_frames = selected_frames[::stride]
+        if max_frames > 0:
+            selected_frames = selected_frames[:max_frames]
     if not selected_frames:
         raise RuntimeError(f"No lidar frames with rgb.png, depth.npy, and camera_info.json found in {stream_path}")
 

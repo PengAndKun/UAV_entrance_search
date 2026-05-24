@@ -92,6 +92,10 @@ class _Route5Harness(Route5FusionControlMixin):
         self.route5_or2_corridor_var = _Var("Corridors: --")
         self.route5_or2_capture_dir_var = _Var("OR2 capture: --")
         self.route5_or2_interval_s_var = _Var("1.0")
+        self.llm_route5_capture_analysis_status_var = _Var("V5 Capture Analysis: idle")
+        self.llm_route5_capture_analysis_run_dir_var = _Var("")
+        self.llm_route5_capture_analysis_thread = None
+        self.llm_route5_capture_analysis_stop_event = threading.Event()
         self.llm_route5_state: Dict[str, Any] = {}
         self.llm_route5_completed_facades = set()
         self.llm_route5_blocked_facades = set()
@@ -131,6 +135,10 @@ class _Route5Harness(Route5FusionControlMixin):
 
     def active_session(self):
         return getattr(self, "fake_session", None)
+
+    def route3_current_pose(self, _session=None):
+        pose = self.latest_state.get("pose", {}) if isinstance(self.latest_state, dict) else {}
+        return dict(pose if isinstance(pose, dict) else {})
 
     def stop_keyboard_control(self, *, send_hold: bool = False, force_hold: bool = False) -> None:
         self.keyboard_stopped = {"send_hold": bool(send_hold), "force_hold": bool(force_hold)}
@@ -311,6 +319,7 @@ def main() -> None:
     route5_source = (PROJECT_DIR / "control" / "route5_fusion_control.py").read_text(encoding="utf-8")
     assert "Global Pause All" in route5_source
     assert "Release Movement" in route5_source
+    assert "Analyze V5 Captures" in route5_source
     for removed in (
         "Start OR2 Monitor",
         "Stop OR2 Monitor",
@@ -512,6 +521,174 @@ def main() -> None:
         )
         assert clear_near_arrival["near_obstacle_reached"] is False, clear_near_arrival
 
+        east_original = {"x": 2125.6, "y": 2177.44, "z": 300.0, "yaw": 180.0}
+        north_side_reset = {"x": -175.276, "y": 2433.923, "z": 265.719, "yaw": 180.0}
+        east_bad_guard = harness.route5_capture_guard_state(
+            target_house_id="001",
+            stage="NAV_TO_SCAN_POINT",
+            facade="east",
+            target_id="002_scan_0026_east_single_300cm",
+            original_target_pose=east_original,
+            runtime_target_pose=north_side_reset,
+            capture_pose=north_side_reset,
+            pose_error={"reached": True, "dist_3d_cm": 0.0},
+            arrival_state={"near_obstacle_reached": True, "near_obstacle_confirmed": True},
+            config={"reach_tol_cm": 60.0},
+            capture_kind="scan",
+        )
+        assert east_bad_guard["capture_guard_passed"] is False, east_bad_guard
+        assert east_bad_guard["reason"] == "facade_corridor_mismatch", east_bad_guard
+        assert east_bad_guard["facade_corridor_check"]["same_facade_corridor"] is False, east_bad_guard
+
+        east_far_guard = harness.route5_capture_guard_state(
+            target_house_id="001",
+            stage="NAV_TO_SCAN_POINT",
+            facade="east",
+            target_id="002_scan_0026_east_single_300cm",
+            original_target_pose=east_original,
+            runtime_target_pose={"x": 2125.6, "y": 1900.0, "z": 300.0, "yaw": 180.0},
+            capture_pose={"x": 2125.6, "y": 1900.0, "z": 300.0, "yaw": 180.0},
+            pose_error={"reached": False, "dist_3d_cm": 0.0},
+            arrival_state={"near_obstacle_reached": True, "near_obstacle_confirmed": True},
+            config={"reach_tol_cm": 60.0},
+            capture_kind="scan",
+        )
+        assert east_far_guard["capture_guard_passed"] is False, east_far_guard
+        assert east_far_guard["reason"] == "original_target_distance_exceeded", east_far_guard
+        assert east_far_guard["distance_to_original_target_cm"] > 150.0, east_far_guard
+
+        south_original = {"x": 350.22, "y": 570.65, "z": 280.0, "yaw": 90.0}
+        south_capture = {"x": 337.559, "y": 484.043, "z": 278.514, "yaw": 68.596}
+        near_nav_result = {
+            "status": "ok",
+            "reason": "near_obstacle_reached",
+            "stage": "NAV_TO_OBS",
+            "facade": "south",
+            "target_id": "002_south_obs_attempt_1",
+            "pose_error": {"reached": False, "dist_xy_cm": 87.54, "dist_3d_cm": 87.54},
+            "arrival_state": {
+                "arrival_policy": "near_obstacle_reached",
+                "near_obstacle_reached": True,
+                "near_obstacle_confirmed": True,
+                "front_depth_cm": 220.0,
+                "distance_to_goal_cm": 87.54,
+                "arrival_reason": "confirmed_obstacle_within_150cm_goal_tolerance",
+            },
+        }
+        arrival_context = harness.route5_capture_guard_arrival_state(
+            nav_result=near_nav_result,
+            stage="NAV_TO_OBS",
+            facade="south",
+            target_id="002_south_obs_attempt_1",
+            original_target_pose=south_original,
+            runtime_target_pose=south_original,
+            capture_pose=south_capture,
+            config={"reach_tol_cm": 60.0},
+        )
+        south_guard = harness.route5_capture_guard_state(
+            target_house_id="001",
+            stage="NAV_TO_OBS",
+            facade="south",
+            target_id="002_south_obs_attempt_1",
+            original_target_pose=south_original,
+            runtime_target_pose=south_original,
+            capture_pose=south_capture,
+            pose_error=near_nav_result["pose_error"],
+            arrival_state=arrival_context,
+            config={"reach_tol_cm": 60.0},
+            capture_kind="observation",
+        )
+        assert south_guard["capture_guard_passed"] is True, south_guard
+        assert south_guard["reason"] == "near_obstacle_reached_original_target", south_guard
+        assert arrival_context["capture_guard_arrival_source"] == "navigation_result", arrival_context
+
+        harness.llm_route5_state["last_obstacle_event"] = {
+            "route5_stage": "NAV_TO_OBS",
+            "facade": "south",
+            "target_id": "002_south_obs_attempt_1",
+            "pointcloud_summary": {"front_min_depth_cm": 220.0, "forward_swept_clear": False},
+            "or2_prediction": {"front_risk_state": "obstacle_warning", "must_stop": False},
+            "avoidance_gate": {"front_risk_state": "obstacle_warning", "front_min_depth_cm": 220.0, "avoidance_active": True},
+        }
+        recomputed_arrival = harness.route5_capture_guard_arrival_state(
+            nav_result={"status": "ok", "reason": "target_reached", "pose_error": {"reached": False, "dist_3d_cm": 87.54}},
+            stage="NAV_TO_OBS",
+            facade="south",
+            target_id="002_south_obs_attempt_1",
+            original_target_pose=south_original,
+            runtime_target_pose=south_original,
+            capture_pose=south_capture,
+            config={"reach_tol_cm": 60.0},
+        )
+        assert recomputed_arrival["capture_guard_recomputed_arrival"] is True, recomputed_arrival
+        assert recomputed_arrival["near_obstacle_reached"] is True, recomputed_arrival
+        recomputed_guard = harness.route5_capture_guard_state(
+            target_house_id="001",
+            stage="NAV_TO_OBS",
+            facade="south",
+            target_id="002_south_obs_attempt_1",
+            original_target_pose=south_original,
+            runtime_target_pose=south_original,
+            capture_pose=south_capture,
+            pose_error={"reached": False, "dist_3d_cm": 87.54},
+            arrival_state=recomputed_arrival,
+            config={"reach_tol_cm": 60.0},
+            capture_kind="observation",
+        )
+        assert recomputed_guard["capture_guard_passed"] is True, recomputed_guard
+
+        repeat_guard = dict(recomputed_guard)
+        repeat_guard.update({"capture_guard_passed": False, "reason": "original_target_not_reached", "arrival_state": {}})
+        first_repeat = harness.route5_update_capture_guard_repeat_state(repeat_guard)
+        second_repeat = harness.route5_update_capture_guard_repeat_state(repeat_guard)
+        assert first_repeat["capture_guard_repeat_count"] == 1, first_repeat
+        assert second_repeat["capture_guard_repeat_count"] == 2, second_repeat
+        assert second_repeat["next_retry_action"] == "try_next_observation_or_rescue", second_repeat
+
+        preserved_follow = harness.route5_follow_navigation_waypoint_with_fusion
+        preserved_enable = harness.route5_enable_physics_movement
+        preserved_hold = harness.route5_hold
+        try:
+            harness.route5_enable_physics_movement = lambda _session: None
+            harness.route5_hold = lambda _session, **_kwargs: {"status": "ok"}
+            harness.latest_state = {"pose": {"x": south_capture["x"], "y": south_capture["y"], "z": south_capture["z"], "yaw": south_capture["yaw"]}}
+
+            def _fake_follow(_session, _target_pose, **_kwargs):
+                return {
+                    "status": "ok",
+                    "reason": "near_obstacle_reached",
+                    "stage": "NAV_TO_OBS",
+                    "facade": "south",
+                    "target_id": "002_south_obs_attempt_1",
+                    "final_target_id": "002_south_obs_attempt_1",
+                    "final_target_pose": south_original,
+                    "pose_error": {"reached": False, "dist_3d_cm": 87.54},
+                    "current_pose": south_capture,
+                    "arrival_state": dict(near_nav_result["arrival_state"]),
+                    "final_obstacle_event": {"frame_id": 77, "front_depth_cm": 220.0},
+                    "final_arrival_reason": "confirmed_obstacle_within_150cm_goal_tolerance",
+                }
+
+            harness.route5_follow_navigation_waypoint_with_fusion = _fake_follow
+            preserved_nav = harness.route5_navigate_to_pose_with_fusion(
+                fake_session,
+                south_original,
+                output_dir=output_dir,
+                stage="NAV_TO_OBS",
+                facade="south",
+                target_id="002_south_obs_attempt_1",
+                target_house_id="001",
+            )
+            assert preserved_nav["status"] == "ok", preserved_nav
+            assert preserved_nav["arrival_state"]["near_obstacle_reached"] is True, preserved_nav
+            assert preserved_nav["final_obstacle_event"]["frame_id"] == 77, preserved_nav
+            assert preserved_nav["final_arrival_reason"] == "confirmed_obstacle_within_150cm_goal_tolerance", preserved_nav
+            assert preserved_nav["final_current_pose"] == south_capture, preserved_nav
+        finally:
+            harness.route5_follow_navigation_waypoint_with_fusion = preserved_follow
+            harness.route5_enable_physics_movement = preserved_enable
+            harness.route5_hold = preserved_hold
+
         event = {
             "frame_id": 1,
             "route5_stage": "NAV_TO_SCAN_POINT",
@@ -673,6 +850,26 @@ def main() -> None:
         assert failed_candidate["rejected_candidates"], failed_candidate
         harness.force_unsafe_reset = False
 
+        east_tracker = harness.route5_new_target_reset_tracker("002_scan_0026_east_single_300cm", east_original, east_original)
+        east_tracker["last_direction"] = "right"
+        east_tracker["direction_counts"] = {"right": 8}
+        east_reset_candidate = harness.route5_build_target_reset_candidate(
+            target_house_id="001",
+            stage="NAV_TO_SCAN_POINT",
+            facade="east",
+            target_id="002_scan_0026_east_single_300cm",
+            current_pose={"x": -193.243, "y": 2315.276, "z": 265.719, "yaw": -8.611},
+            target_pose=east_original,
+            tracker=east_tracker,
+            reset_reason="verify_reject_cross_facade_reset",
+            reset_index=1,
+        )
+        assert east_reset_candidate["status"] == "failed", east_reset_candidate
+        assert any(
+            item.get("facade_corridor_check", {}).get("same_facade_corridor") is False
+            for item in east_reset_candidate["rejected_candidates"]
+        ), east_reset_candidate
+
         high_tracker = harness.route5_new_target_reset_tracker(
             "001_scan_0013_west_single_300cm",
             {"x": 0.0, "y": 400.0, "z": 300.0, "yaw": 0.0},
@@ -833,6 +1030,44 @@ def main() -> None:
         assert postprocess_gate["terminal"] is False, postprocess_gate
         assert harness.route5_facade_status_is_terminal("scan_incomplete") is False
         assert harness.route5_facade_status_is_terminal("postprocess_failed") is False
+        invalid_capture_gate = harness.route5_facade_completion_gate(
+            {"overall_passed": True, "coverage_report": {"captured_scan_count": 2}},
+            observation={},
+            rgb_result={"status": "ok"},
+            scan_capture_count=2,
+            valid_scan_capture_count=0,
+        )
+        assert invalid_capture_gate["completion_status"] == "invalid_capture_pose_retryable", invalid_capture_gate
+        assert invalid_capture_gate["complete"] is False, invalid_capture_gate
+        assert invalid_capture_gate["terminal"] is False, invalid_capture_gate
+
+        analysis_run = output_dir / "analysis_fixture"
+        analysis_facade_dir = analysis_run / "facade_observations" / "001_east"
+        analysis_facade_dir.mkdir(parents=True, exist_ok=True)
+        valid_dir = analysis_run / "frames" / "frame_000101"
+        invalid_dir = analysis_run / "frames" / "frame_000102"
+        legacy_dir = analysis_run / "frames" / "frame_000103"
+        obs_dir = analysis_run / "frames" / "frame_000104"
+        for capture_dir in (valid_dir, invalid_dir, legacy_dir, obs_dir):
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            (capture_dir / "rgb.png").write_bytes(b"fake")
+            np.save(capture_dir / "depth.npy", np.zeros((2, 2), dtype=np.float32))
+            (capture_dir / "camera_info.json").write_text("{}", encoding="utf-8")
+            (capture_dir / "capture.json").write_text(json.dumps({"capture_dir": str(capture_dir)}, ensure_ascii=False), encoding="utf-8")
+        for row in (
+            {"frame_index": 101, "scan_id": "001_scan_valid", "facade": "east", "capture_status": "ok", "capture_guard_passed": True, "capture_dir": str(valid_dir)},
+            {"frame_index": 102, "scan_id": "001_scan_invalid", "facade": "east", "capture_status": "ok", "capture_guard_passed": False, "capture_dir": str(invalid_dir)},
+            {"frame_index": 103, "scan_id": "001_scan_legacy", "facade": "east", "capture_status": "ok", "capture_dir": str(legacy_dir)},
+            {"frame_index": 104, "facade": "east", "capture_status": "ok", "capture_guard_passed": True, "capture_kind": "observation", "capture_dir": str(obs_dir)},
+        ):
+            harness.append_jsonl(analysis_run / "lidar_capture_log.jsonl", row)
+            harness.append_jsonl(analysis_facade_dir / "lidar_capture_log.jsonl", row)
+        manifest = harness.route5_build_capture_analysis_manifest(analysis_run)
+        assert manifest["included_count"] == 1, manifest
+        assert manifest["included_captures"][0]["scan_id"] == "001_scan_valid", manifest
+        excluded_reasons = {item["reason"] for item in manifest["excluded_captures"]}
+        assert {"capture_guard_failed", "legacy_unverified", "not_scan_capture"}.issubset(excluded_reasons), manifest
+        assert (analysis_run / "route5_capture_analysis" / "selected_capture_manifest.json").is_file()
 
         blocked_event = {
             "frame_id": 2,

@@ -3,6 +3,7 @@
 from copy import deepcopy
 
 from .common import *
+from . import lidar_yolo_analysis
 
 from obstacle_avoidance.collect_route_episodes import (
     DEFAULT_ROUTE_SIDE_CORRECTION_CM,
@@ -144,6 +145,14 @@ class Route5FusionControlMixin:
             self.llm_route5_preview_text = None
         if not hasattr(self, "llm_route5_analysis_text"):
             self.llm_route5_analysis_text = None
+        if not hasattr(self, "llm_route5_capture_analysis_status_var"):
+            self.llm_route5_capture_analysis_status_var = tk.StringVar(value="V5 Capture Analysis: idle")
+        if not hasattr(self, "llm_route5_capture_analysis_run_dir_var"):
+            self.llm_route5_capture_analysis_run_dir_var = tk.StringVar(value="")
+        if not hasattr(self, "llm_route5_capture_analysis_thread"):
+            self.llm_route5_capture_analysis_thread = None
+        if not hasattr(self, "llm_route5_capture_analysis_stop_event"):
+            self.llm_route5_capture_analysis_stop_event = threading.Event()
         if not hasattr(self, "llm_route5_rgb_label"):
             self.llm_route5_rgb_label = None
         if not hasattr(self, "llm_route5_rgb_photo"):
@@ -818,6 +827,34 @@ class Route5FusionControlMixin:
             "front_depth_cm": self.route5_event_float(event.get("front_depth_cm"), default=0.0),
             "distance_to_goal_cm": self.route5_event_float(event.get("distance_to_goal_cm", event.get("post_distance_to_goal_cm", 0.0)), default=0.0),
             "arrival_reason": str(event.get("arrival_reason", event.get("goal_completion_reason", "")) or ""),
+            "capture_guard_blocked": bool(event.get("capture_guard_blocked", False)),
+            "capture_guard_passed": bool(event.get("capture_guard_passed", False)),
+            "capture_guard_recomputed_arrival": bool(
+                event.get(
+                    "capture_guard_recomputed_arrival",
+                    (event.get("capture_guard", {}) if isinstance(event.get("capture_guard"), dict) else {}).get("capture_guard_recomputed_arrival", False),
+                )
+            ),
+            "capture_guard_repeat_count": int(
+                self.route5_event_float(
+                    event.get(
+                        "capture_guard_repeat_count",
+                        (event.get("capture_guard", {}) if isinstance(event.get("capture_guard"), dict) else {}).get("capture_guard_repeat_count", 0),
+                    ),
+                    default=0.0,
+                )
+            ),
+            "next_retry_action": str(
+                event.get(
+                    "next_retry_action",
+                    (event.get("capture_guard", {}) if isinstance(event.get("capture_guard"), dict) else {}).get("next_retry_action", ""),
+                )
+                or ""
+            ),
+            "capture_guard": self.route5_json_safe(event.get("capture_guard", {})),
+            "original_target_pose": self.route5_json_safe(event.get("original_target_pose", {})),
+            "runtime_target_pose": self.route5_json_safe(event.get("runtime_target_pose", event.get("target_waypoint", {}))),
+            "capture_pose": self.route5_json_safe(event.get("capture_pose", event.get("current_pose", {}))),
             "target_reset_candidate": self.route5_json_safe(event.get("target_reset_candidate", {})),
             "target_reset_applied": bool(event.get("target_reset_applied", False)),
             "reset_reason": str(event.get("reset_reason", "") or ""),
@@ -1095,6 +1132,7 @@ class Route5FusionControlMixin:
             "route5_target_resets.jsonl",
             "route5_plan_deviation_repairs.jsonl",
             "route5_scan_postprocess_events.jsonl",
+            "route5_capture_guard_events.jsonl",
             "route5_llm_calls.jsonl",
             "house_exploration_memory_events.jsonl",
             "avoidance_events.jsonl",
@@ -1893,6 +1931,382 @@ class Route5FusionControlMixin:
                 return True
         return False
 
+    def route5_pose_facade_corridor_check(
+        self,
+        target_house_id: str,
+        facade: str,
+        pose: Dict[str, Any],
+        *,
+        axis_margin_cm: float = 250.0,
+        side_margin_cm: float = 150.0,
+    ) -> Dict[str, Any]:
+        facade_name = str(facade or "").strip().lower()
+        pose = pose if isinstance(pose, dict) else {}
+        try:
+            bbox = self.house_world_bbox_for_id(str(target_house_id or ""))
+        except Exception:
+            bbox = {}
+        if facade_name not in {"east", "west", "north", "south"} or not isinstance(bbox, dict) or not bbox:
+            return {
+                "same_facade_corridor": True,
+                "enforced": False,
+                "reason": "facade_bbox_unavailable",
+                "facade": facade_name,
+                "pose": self.route5_json_safe(pose),
+            }
+        try:
+            x = float(pose.get("x", 0.0) or 0.0)
+            y = float(pose.get("y", 0.0) or 0.0)
+            min_x = float(bbox["min_x"])
+            max_x = float(bbox["max_x"])
+            min_y = float(bbox["min_y"])
+            max_y = float(bbox["max_y"])
+        except Exception:
+            return {
+                "same_facade_corridor": True,
+                "enforced": False,
+                "reason": "pose_or_bbox_invalid",
+                "facade": facade_name,
+                "pose": self.route5_json_safe(pose),
+                "bbox": self.route5_json_safe(bbox),
+            }
+        axis_margin = max(0.0, float(axis_margin_cm))
+        side_margin = max(0.0, float(side_margin_cm))
+        if facade_name == "east":
+            side_ok = x >= max_x - side_margin
+            axis_ok = min_y - axis_margin <= y <= max_y + axis_margin
+            side_distance_cm = x - max_x
+            axis_value = y
+            axis_min, axis_max = min_y, max_y
+        elif facade_name == "west":
+            side_ok = x <= min_x + side_margin
+            axis_ok = min_y - axis_margin <= y <= max_y + axis_margin
+            side_distance_cm = min_x - x
+            axis_value = y
+            axis_min, axis_max = min_y, max_y
+        elif facade_name == "north":
+            side_ok = y >= max_y - side_margin
+            axis_ok = min_x - axis_margin <= x <= max_x + axis_margin
+            side_distance_cm = y - max_y
+            axis_value = x
+            axis_min, axis_max = min_x, max_x
+        else:
+            side_ok = y <= min_y + side_margin
+            axis_ok = min_x - axis_margin <= x <= max_x + axis_margin
+            side_distance_cm = min_y - y
+            axis_value = x
+            axis_min, axis_max = min_x, max_x
+        return {
+            "same_facade_corridor": bool(side_ok and axis_ok),
+            "enforced": True,
+            "reason": "ok" if bool(side_ok and axis_ok) else ("wrong_facade_side" if not side_ok else "axis_outside_facade_bounds"),
+            "facade": facade_name,
+            "pose": self.route5_json_safe(pose),
+            "bbox": self.route5_json_safe(bbox),
+            "side_ok": bool(side_ok),
+            "axis_ok": bool(axis_ok),
+            "side_distance_cm": round(float(side_distance_cm), 3),
+            "axis_value_cm": round(float(axis_value), 3),
+            "axis_min_cm": round(float(axis_min), 3),
+            "axis_max_cm": round(float(axis_max), 3),
+            "axis_margin_cm": float(axis_margin),
+            "side_margin_cm": float(side_margin),
+        }
+
+    def route5_facade_corridor_check(
+        self,
+        target_house_id: str,
+        facade: str,
+        pose: Dict[str, Any],
+        *,
+        original_target_pose: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        original = original_target_pose if isinstance(original_target_pose, dict) and original_target_pose else {}
+        original_check = self.route5_pose_facade_corridor_check(target_house_id, facade, original) if original else {"same_facade_corridor": False, "enforced": False, "reason": "no_original_pose"}
+        pose_check = self.route5_pose_facade_corridor_check(target_house_id, facade, pose)
+        enforce = bool(original_check.get("enforced", False)) and bool(original_check.get("same_facade_corridor", False))
+        same = bool(pose_check.get("same_facade_corridor", True)) if enforce else True
+        return {
+            "same_facade_corridor": bool(same),
+            "enforced": bool(enforce),
+            "reason": str(pose_check.get("reason", "ok") if enforce else "original_reference_not_corridor_enforced"),
+            "facade": str(facade or "").strip().lower(),
+            "original_reference_valid": bool(original_check.get("same_facade_corridor", False)),
+            "original_check": self.route5_json_safe(original_check),
+            "pose_check": self.route5_json_safe(pose_check),
+        }
+
+    def route5_capture_guard_state(
+        self,
+        *,
+        target_house_id: str,
+        stage: str,
+        facade: str,
+        target_id: str,
+        original_target_pose: Dict[str, Any],
+        runtime_target_pose: Dict[str, Any],
+        capture_pose: Dict[str, Any],
+        pose_error: Optional[Dict[str, Any]] = None,
+        arrival_state: Optional[Dict[str, Any]] = None,
+        config: Optional[Dict[str, Any]] = None,
+        capture_kind: str = "scan",
+    ) -> Dict[str, Any]:
+        original = dict(original_target_pose if isinstance(original_target_pose, dict) else {})
+        runtime = dict(runtime_target_pose if isinstance(runtime_target_pose, dict) else {})
+        capture = dict(capture_pose if isinstance(capture_pose, dict) else {})
+        pose_error = pose_error if isinstance(pose_error, dict) else {}
+        arrival_state = arrival_state if isinstance(arrival_state, dict) else {}
+        config = config if isinstance(config, dict) else {}
+        reach_tol = self.route5_event_float(config.get("reach_tol_cm", 60.0), default=60.0)
+        near_tol = 150.0
+        if not original:
+            original = dict(runtime)
+        if not capture:
+            capture = dict(runtime)
+        distance_original = distance_3d_cm(capture, original) if original and capture else float("inf")
+        distance_runtime = distance_3d_cm(capture, runtime) if runtime and capture else float("inf")
+        corridor_check = self.route5_facade_corridor_check(target_house_id, facade, capture, original_target_pose=original)
+        if not bool(corridor_check.get("same_facade_corridor", True)):
+            passed = False
+            reason = "facade_corridor_mismatch"
+            policy = "blocked_wrong_facade_corridor"
+        else:
+            standard_original_reached = bool(distance_original <= max(5.0, reach_tol))
+            near_obstacle_confirmed = bool(arrival_state.get("near_obstacle_confirmed", False) or arrival_state.get("near_obstacle_reached", False))
+            near_obstacle_reached_original = bool(near_obstacle_confirmed and distance_original <= near_tol)
+            if standard_original_reached:
+                passed = True
+                reason = "standard_reach_original_target"
+                policy = "standard_reach_tolerance_original_target"
+            elif near_obstacle_reached_original:
+                passed = True
+                reason = "near_obstacle_reached_original_target"
+                policy = "near_obstacle_original_target_150cm"
+            else:
+                passed = False
+                policy = "blocked_not_near_original_target"
+                reason = "original_target_distance_exceeded" if distance_original > near_tol else "original_target_not_reached"
+        return {
+            "schema": "route5_capture_guard_v1",
+            "capture_guard_passed": bool(passed),
+            "status": "ok" if passed else "rejected",
+            "reason": reason,
+            "capture_policy": policy,
+            "capture_kind": str(capture_kind or ""),
+            "stage": str(stage or ""),
+            "facade": str(facade or "").strip().lower(),
+            "target_id": str(target_id or ""),
+            "target_house_id": str(target_house_id or ""),
+            "original_target_pose": self.route5_json_safe(original),
+            "runtime_target_pose": self.route5_json_safe(runtime),
+            "capture_pose": self.route5_json_safe(capture),
+            "pose_error": self.route5_json_safe(pose_error),
+            "arrival_state": self.route5_json_safe(arrival_state),
+            "facade_corridor_check": self.route5_json_safe(corridor_check),
+            "distance_to_original_target_cm": round(float(distance_original), 3) if math.isfinite(distance_original) else 0.0,
+            "distance_to_runtime_target_cm": round(float(distance_runtime), 3) if math.isfinite(distance_runtime) else 0.0,
+            "reach_tol_cm": round(float(reach_tol), 3),
+            "near_obstacle_capture_tol_cm": near_tol,
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+
+    def route5_capture_guard_event_matches(
+        self,
+        event: Dict[str, Any],
+        *,
+        stage: str,
+        facade: str,
+        target_id: str,
+    ) -> bool:
+        event = event if isinstance(event, dict) else {}
+        expected_stage = str(stage or "").strip().lower()
+        expected_facade = str(facade or "").strip().lower()
+        expected_target = str(target_id or "").strip()
+        event_stage = str(event.get("route5_stage", event.get("stage", "")) or "").strip().lower()
+        event_facade = str(event.get("facade", "") or "").strip().lower()
+        event_target = str(event.get("target_id", "") or "").strip()
+        if event_stage and expected_stage and event_stage != expected_stage:
+            return False
+        if event_facade and expected_facade and event_facade != expected_facade:
+            return False
+        if event_target and expected_target and event_target != expected_target:
+            return False
+        return bool(event)
+
+    def route5_capture_guard_arrival_state(
+        self,
+        *,
+        nav_result: Dict[str, Any],
+        stage: str,
+        facade: str,
+        target_id: str,
+        original_target_pose: Dict[str, Any],
+        runtime_target_pose: Dict[str, Any],
+        capture_pose: Dict[str, Any],
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        nav_result = nav_result if isinstance(nav_result, dict) else {}
+        existing = dict(nav_result.get("arrival_state", {}) if isinstance(nav_result.get("arrival_state"), dict) else {})
+        has_navigation_arrival = bool(
+            existing.get("arrival_policy")
+            or existing.get("near_obstacle_reached", False)
+            or existing.get("near_obstacle_confirmed", False)
+        )
+        if has_navigation_arrival:
+            existing.setdefault("capture_guard_arrival_source", "navigation_result")
+            existing.setdefault("capture_guard_recomputed_arrival", False)
+            return existing
+
+        original = dict(original_target_pose if isinstance(original_target_pose, dict) else {})
+        runtime = dict(runtime_target_pose if isinstance(runtime_target_pose, dict) else {})
+        capture = dict(capture_pose if isinstance(capture_pose, dict) else {})
+        if not original:
+            original = dict(runtime)
+        if not capture:
+            capture = dict(runtime)
+        config = config if isinstance(config, dict) else {}
+        reach_tol = self.route5_event_float(config.get("reach_tol_cm", 60.0), default=60.0)
+        if original and capture:
+            distance_original = distance_3d_cm(capture, original)
+            dist_xy = math.hypot(
+                float(capture.get("x", 0.0) or 0.0) - float(original.get("x", 0.0) or 0.0),
+                float(capture.get("y", 0.0) or 0.0) - float(original.get("y", 0.0) or 0.0),
+            )
+        else:
+            distance_original = self.route5_event_float((nav_result.get("pose_error", {}) if isinstance(nav_result.get("pose_error"), dict) else {}).get("dist_3d_cm", 0.0), default=0.0)
+            dist_xy = self.route5_event_float((nav_result.get("pose_error", {}) if isinstance(nav_result.get("pose_error"), dict) else {}).get("dist_xy_cm", distance_original), default=distance_original)
+        error = dict(nav_result.get("pose_error", {}) if isinstance(nav_result.get("pose_error"), dict) else {})
+        error.update(
+            {
+                "reached": bool(distance_original <= max(5.0, reach_tol)),
+                "dist_xy_cm": round(float(dist_xy), 3),
+                "dist_3d_cm": round(float(distance_original), 3),
+            }
+        )
+
+        candidates: List[Tuple[str, Dict[str, Any]]] = []
+        for name in ("final_obstacle_event", "obstacle_event", "event"):
+            if isinstance(nav_result.get(name), dict):
+                candidates.append((f"navigation_{name}", nav_result.get(name, {})))
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        for name in ("last_obstacle_event", "last_or2_event"):
+            if isinstance(state.get(name), dict):
+                candidates.append((name, state.get(name, {})))
+
+        for source, event in candidates:
+            if not self.route5_capture_guard_event_matches(event, stage=stage, facade=facade, target_id=target_id):
+                continue
+            summary = event.get("pointcloud_summary", event.get("depth_obstacle_summary", {}))
+            summary = summary if isinstance(summary, dict) else {}
+            prediction = event.get("or2_prediction", {}) if isinstance(event.get("or2_prediction"), dict) else {}
+            gate = dict(event.get("avoidance_gate", {}) if isinstance(event.get("avoidance_gate"), dict) else {})
+            gate.setdefault("front_risk_state", prediction.get("front_risk_state", event.get("or2_front_risk_state", "")))
+            gate.setdefault("front_min_depth_cm", summary.get("front_min_depth_cm", event.get("front_depth_cm", 0.0)))
+            gate.setdefault("must_stop", bool(prediction.get("must_stop", event.get("or2_must_stop", False))))
+            risk = str(gate.get("front_risk_state", "") or "").strip().lower()
+            gate.setdefault("avoidance_active", bool(risk in {"obstacle_warning", "must_stop"} or gate.get("must_stop", False)))
+            arrival_event = dict(event)
+            arrival_event["distance_to_goal_cm"] = round(float(distance_original), 3)
+            arrival_event["pointcloud_summary"] = summary
+            recomputed = self.route5_near_obstacle_arrival_state(error, gate, arrival_event)
+            recomputed.update(
+                {
+                    "capture_guard_arrival_source": source,
+                    "capture_guard_recomputed_arrival": True,
+                    "capture_guard_recomputed_reason": "navigation_arrival_state_missing",
+                }
+            )
+            return recomputed
+
+        existing.setdefault("capture_guard_arrival_source", "missing")
+        existing.setdefault("capture_guard_recomputed_arrival", False)
+        return existing
+
+    def route5_update_capture_guard_repeat_state(self, guard: Dict[str, Any]) -> Dict[str, Any]:
+        record = dict(guard if isinstance(guard, dict) else {})
+        if bool(record.get("capture_guard_passed", False)):
+            record["capture_guard_repeat_count"] = 0
+            record["next_retry_action"] = "capture_allowed"
+            return record
+        key = "|".join(
+            [
+                str(record.get("capture_kind", "") or ""),
+                str(record.get("stage", "") or ""),
+                str(record.get("facade", "") or ""),
+                str(record.get("target_id", "") or ""),
+                str(record.get("reason", "") or ""),
+            ]
+        )
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        counts = dict(state.get("capture_guard_repeat_counts", {}) if isinstance(state.get("capture_guard_repeat_counts"), dict) else {})
+        count = int(counts.get(key, 0) or 0) + 1
+        counts[key] = count
+        distance_original = self.route5_event_float(record.get("distance_to_original_target_cm", 0.0), default=0.0)
+        reason = str(record.get("reason", "") or "")
+        capture_kind = str(record.get("capture_kind", "") or "").strip().lower()
+        if capture_kind == "observation" and reason == "original_target_not_reached" and distance_original <= 150.0 and count >= 2:
+            next_action = "try_next_observation_or_rescue"
+            skip_targets = dict(state.get("capture_guard_skip_targets", {}) if isinstance(state.get("capture_guard_skip_targets"), dict) else {})
+            target_key = str(record.get("target_id", "") or "")
+            if target_key:
+                skip_targets[target_key] = {
+                    "reason": reason,
+                    "facade": str(record.get("facade", "") or ""),
+                    "repeat_count": count,
+                    "next_retry_action": next_action,
+                    "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+                }
+                self.route5_update_state(capture_guard_repeat_counts=counts, capture_guard_skip_targets=skip_targets)
+            else:
+                self.route5_update_state(capture_guard_repeat_counts=counts)
+        else:
+            next_action = "retry_same_target"
+            self.route5_update_state(capture_guard_repeat_counts=counts)
+        record["capture_guard_repeat_count"] = int(count)
+        record["next_retry_action"] = next_action
+        return record
+
+    def route5_record_capture_guard(self, output_dir: Optional[Path], guard: Dict[str, Any]) -> Dict[str, Any]:
+        record = self.route5_update_capture_guard_repeat_state(guard if isinstance(guard, dict) else {})
+        record = self.route5_json_safe(record)
+        if output_dir is not None:
+            self.append_jsonl(output_dir / "route5_capture_guard_events.jsonl", record)
+            self.route5_log_event(output_dir, "capture_guard", record)
+        return record
+
+    def route5_write_capture_guard_blocked_decision(
+        self,
+        output_dir: Path,
+        guard: Dict[str, Any],
+        *,
+        current_pose: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        try:
+            frame_id = int(self.route2_next_frame_index(output_dir))
+        except Exception:
+            frame_id = int(time.time() * 1000) % 1000000
+        event = {
+            "frame_id": frame_id,
+            "route5_stage": str(guard.get("stage", "") or ""),
+            "facade": str(guard.get("facade", "") or ""),
+            "target_id": str(guard.get("target_id", "") or ""),
+            "capture_dir": str(output_dir / "frames" / f"frame_{frame_id:06d}"),
+            "current_pose": self.route5_json_safe(current_pose),
+            "target_waypoint": self.route5_json_safe(guard.get("runtime_target_pose", {})),
+            "original_target_pose": self.route5_json_safe(guard.get("original_target_pose", {})),
+            "runtime_target_pose": self.route5_json_safe(guard.get("runtime_target_pose", {})),
+            "capture_pose": self.route5_json_safe(guard.get("capture_pose", current_pose)),
+            "capture_guard": self.route5_json_safe(guard),
+            "capture_guard_blocked": True,
+            "capture_guard_passed": False,
+            "selected_action": "route5_capture_guard_hold",
+            "selected_action_reason": str(guard.get("reason", "capture_guard_blocked") or "capture_guard_blocked"),
+            "selected_action_payload": action_payload("hold"),
+            "collision_state": False,
+            "avoidance_failed": False,
+        }
+        return self.route5_write_frame_decision(output_dir, self.route5_normalize_avoidance_event(event), final_payload=action_payload("hold"))
+
     def route5_facade_completion_gate(
         self,
         validation: Dict[str, Any],
@@ -1900,13 +2314,18 @@ class Route5FusionControlMixin:
         observation: Dict[str, Any],
         rgb_result: Dict[str, Any],
         scan_capture_count: int = 0,
+        valid_scan_capture_count: Optional[int] = None,
         scan_loop_stopped: bool = False,
         postprocess_result: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         validation = validation if isinstance(validation, dict) else {}
         observation = observation if isinstance(observation, dict) else {}
         postprocess_result = postprocess_result if isinstance(postprocess_result, dict) else {}
-        captured_scan_count = self.route5_validation_captured_scan_count(validation, scan_capture_count=scan_capture_count)
+        raw_captured_scan_count = self.route5_validation_captured_scan_count(validation, scan_capture_count=scan_capture_count)
+        if valid_scan_capture_count is None:
+            captured_scan_count = raw_captured_scan_count
+        else:
+            captured_scan_count = max(0, int(valid_scan_capture_count or 0))
         validation_passed = bool(validation.get("overall_passed", False))
         degraded_observation = bool(observation.get("route5_degraded_observation", False))
         rgb_ok = self.route5_rgb_capture_ok(rgb_result)
@@ -1914,6 +2333,10 @@ class Route5FusionControlMixin:
             status = "scan_incomplete"
             complete = False
             reason = "scan_loop_stopped_before_completion"
+        elif valid_scan_capture_count is not None and raw_captured_scan_count > 0 and captured_scan_count <= 0:
+            status = "invalid_capture_pose_retryable"
+            complete = False
+            reason = "no_capture_guard_passed_scan_captures"
         elif (
             captured_scan_count > 0
             and not validation_passed
@@ -1946,6 +2369,8 @@ class Route5FusionControlMixin:
             "reason": reason,
             "validation_passed": validation_passed,
             "captured_scan_count": int(captured_scan_count),
+            "raw_captured_scan_count": int(raw_captured_scan_count),
+            "valid_scan_capture_count": int(captured_scan_count),
             "degraded_observation": degraded_observation,
             "rgb_capture_ok": rgb_ok,
             "scan_loop_stopped": bool(scan_loop_stopped),
@@ -1999,6 +2424,10 @@ class Route5FusionControlMixin:
                 continue
             capture_dir = self.route5_resolve_capture_dir(output_dir, item.get("capture_dir", ""))
             if capture_dir is None:
+                updated_rows.append(item)
+                continue
+            if "capture_guard_passed" in item and not bool(item.get("capture_guard_passed", False)):
+                item.update({"point_count": 0, "postprocess_status": "invalid_capture_pose", "postprocess_error": str(item.get("capture_guard_reason", "capture_guard_failed") or "capture_guard_failed")})
                 updated_rows.append(item)
                 continue
             cache_key = str(capture_dir.resolve())
@@ -2087,6 +2516,80 @@ class Route5FusionControlMixin:
             updated_rows.append(item)
         self.route5_rewrite_jsonl_artifact(path, updated_rows)
         return updated_rows
+
+    def route5_scan_capture_guard_passed(self, row: Dict[str, Any]) -> bool:
+        row = row if isinstance(row, dict) else {}
+        return bool(row.get("capture_guard_passed", False))
+
+    def route5_valid_scan_capture_count_from_logs(self, output_dir: Path, facade_dir: Path, facade: str) -> int:
+        rows = self.read_jsonl_artifact(facade_dir / "lidar_capture_log.jsonl") or self.read_jsonl_artifact(output_dir / "lidar_capture_log.jsonl")
+        valid_scan_ids: set[str] = set()
+        for row in rows:
+            if str(row.get("facade", "") or "").strip().lower() != str(facade or "").strip().lower():
+                continue
+            scan_id = str(row.get("scan_id", "") or "").strip()
+            if not scan_id:
+                continue
+            status = str(row.get("capture_status", row.get("status", "ok")) or "ok").strip().lower()
+            if status not in {"ok", "captured", "done", ""}:
+                continue
+            if self.route5_scan_capture_guard_passed(row):
+                valid_scan_ids.add(scan_id)
+        return len(valid_scan_ids)
+
+    def route5_annotate_scan_capture_guard(
+        self,
+        output_dir: Path,
+        facade_dir: Path,
+        *,
+        scan_id: str,
+        guard: Dict[str, Any],
+        original_target_pose: Dict[str, Any],
+        runtime_target_pose: Dict[str, Any],
+        capture_pose: Dict[str, Any],
+        capture: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        guard_payload = self.route5_json_safe(guard if isinstance(guard, dict) else {})
+        metadata = {
+            "capture_guard_passed": bool(guard_payload.get("capture_guard_passed", False)),
+            "capture_guard_reason": str(guard_payload.get("reason", "") or ""),
+            "capture_guard": guard_payload,
+            "original_target_pose": self.route5_json_safe(original_target_pose),
+            "runtime_target_pose": self.route5_json_safe(runtime_target_pose),
+            "capture_pose": self.route5_json_safe(capture_pose),
+        }
+        capture = dict(capture if isinstance(capture, dict) else {})
+        capture["capture_guard"] = guard_payload
+        capture["capture_guard_passed"] = metadata["capture_guard_passed"]
+        capture["original_target_pose"] = metadata["original_target_pose"]
+        capture["runtime_target_pose"] = metadata["runtime_target_pose"]
+        capture["capture_pose"] = metadata["capture_pose"]
+
+        for path in (output_dir / "lidar_capture_log.jsonl", facade_dir / "lidar_capture_log.jsonl"):
+            rows = self.read_jsonl_artifact(path)
+            if not rows:
+                continue
+            updated: List[Dict[str, Any]] = []
+            for row in rows:
+                item = dict(row if isinstance(row, dict) else {})
+                if str(item.get("scan_id", "") or "") == str(scan_id or ""):
+                    item.update(metadata)
+                    item["capture_status"] = str(item.get("capture_status", item.get("status", "ok")) or "ok")
+                updated.append(item)
+            self.route5_rewrite_jsonl_artifact(path, updated)
+
+        for path in (output_dir / "scan_execution_log.jsonl", facade_dir / "scan_execution_log.jsonl"):
+            rows = self.read_jsonl_artifact(path)
+            if not rows:
+                continue
+            updated = []
+            for row in rows:
+                item = dict(row if isinstance(row, dict) else {})
+                if str(item.get("scan_id", "") or "") == str(scan_id or ""):
+                    item.update(metadata)
+                updated.append(item)
+            self.route5_rewrite_jsonl_artifact(path, updated)
+        return capture
 
     def route5_refresh_facade_scan_pointcloud_rows(self, output_dir: Path, facade_dir: Path, facade: str) -> Dict[str, Any]:
         result_cache: Dict[str, Dict[str, Any]] = {}
@@ -3444,9 +3947,16 @@ class Route5FusionControlMixin:
                     pose["z"] = float(corridor["max_z_cm"])
                     height_clamped = True
                 pose["yaw"] = float(target_pose.get("yaw", target_pose.get("yaw_deg", current_pose.get("yaw", 0.0))) or 0.0)
+                facade_corridor_check = self.route5_facade_corridor_check(
+                    target_house_id,
+                    facade,
+                    pose,
+                    original_target_pose=original_target_pose,
+                )
                 safety = self.route3_safety_report_for_pose(target_house_id, pose)
+                accepted = bool(safety.get("safe", False)) and bool(facade_corridor_check.get("same_facade_corridor", True))
                 candidate = {
-                    "status": "ok" if bool(safety.get("safe", False)) else "rejected",
+                    "status": "ok" if accepted else "rejected",
                     "stage": str(stage or ""),
                     "facade": str(facade or ""),
                     "target_id": str(target_id or ""),
@@ -3455,17 +3965,19 @@ class Route5FusionControlMixin:
                     "reset_direction": direction,
                     "reset_step_cm": float(step_cm),
                     "reset_reason": str(reset_reason or ""),
-                    "original_target_pose": self.route5_json_safe(target_pose),
+                    "original_target_pose": self.route5_json_safe(original_target_pose),
+                    "runtime_target_pose": self.route5_json_safe(target_pose),
                     "planned_target_pose": self.route5_json_safe(original_target_pose),
                     "current_pose": self.route5_json_safe(current_pose),
                     "reset_target_pose": self.route5_json_safe(pose),
                     "height_corridor": self.route5_json_safe(corridor),
                     "height_clamped": bool(height_clamped),
+                    "facade_corridor_check": self.route5_json_safe(facade_corridor_check),
                     "safety": self.route5_json_safe(safety),
                     "tracker": self.route5_json_safe(tracker),
                     "created_at": datetime.now().isoformat(timespec="milliseconds"),
                 }
-                if bool(safety.get("safe", False)):
+                if accepted:
                     return candidate
                 rejected.append(candidate)
         return {
@@ -3476,7 +3988,8 @@ class Route5FusionControlMixin:
             "reset_index": int(reset_index),
             "reset_direction": primary,
             "reset_reason": str(reset_reason or ""),
-            "original_target_pose": self.route5_json_safe(target_pose),
+            "original_target_pose": self.route5_json_safe(original_target_pose),
+            "runtime_target_pose": self.route5_json_safe(target_pose),
             "planned_target_pose": self.route5_json_safe(original_target_pose),
             "height_corridor": self.route5_json_safe(corridor),
             "current_pose": self.route5_json_safe(current_pose),
@@ -3699,6 +4212,15 @@ class Route5FusionControlMixin:
                     "pose_error": error,
                     "elapsed_s": round(time.time() - started_at, 3),
                     "current_pose": current,
+                    "final_current_pose": current,
+                    "arrival_state": {
+                        "arrival_policy": "standard_reach_tolerance",
+                        "near_obstacle_reached": False,
+                        "near_obstacle_confirmed": False,
+                        "distance_to_goal_cm": round(float(error.get("dist_3d_cm", error.get("dist_xy_cm", 0.0)) or 0.0), 3),
+                        "arrival_reason": "standard_reach_tolerance",
+                    },
+                    "final_arrival_reason": "standard_reach_tolerance",
                 }
             if time.time() - started_at > float(config["max_stage_s"]):
                 self.route5_hold(session, output_dir=output_dir, reason="nav_timeout")
@@ -3821,7 +4343,10 @@ class Route5FusionControlMixin:
                             "pose_error": error,
                             "elapsed_s": round(time.time() - started_at, 3),
                             "current_pose": current,
+                            "final_current_pose": current,
                             "arrival_state": arrival_state,
+                            "final_obstacle_event": self.route5_json_safe(event),
+                            "final_arrival_reason": str(arrival_state.get("arrival_reason", "near_obstacle_reached") or "near_obstacle_reached"),
                         }
                     try:
                         monitor_result = self.route5_or2_monitor_result_from_event(event)
@@ -4255,17 +4780,28 @@ class Route5FusionControlMixin:
                 continue
             return {
                 "status": "ok",
-                "reason": "target_reached",
+                "reason": str(last_result.get("reason", "target_reached") if isinstance(last_result, dict) else "target_reached") or "target_reached",
                 "stage": stage,
                 "facade": facade,
                 "target_id": target_id,
                 "final_target_id": str(last_result.get("final_target_id", target_id) if isinstance(last_result, dict) else target_id),
                 "final_target_pose": last_result.get("final_target_pose", target_pose) if isinstance(last_result, dict) else target_pose,
+                "current_pose": last_result.get("current_pose", current) if isinstance(last_result, dict) else current,
+                "final_current_pose": last_result.get("final_current_pose", last_result.get("current_pose", current)) if isinstance(last_result, dict) else current,
                 "target_reset_count": int(last_result.get("target_reset_count", 0) or 0) if isinstance(last_result, dict) else 0,
                 "navigation_plan": plan,
                 "replan_count": replan_count,
                 "waypoint_count": waypoint_count,
                 "pose_error": last_result.get("pose_error", {}),
+                "arrival_state": last_result.get("arrival_state", {}) if isinstance(last_result.get("arrival_state", {}), dict) else {},
+                "final_obstacle_event": last_result.get("final_obstacle_event", {}) if isinstance(last_result.get("final_obstacle_event", {}), dict) else {},
+                "final_arrival_reason": str(
+                    last_result.get(
+                        "final_arrival_reason",
+                        (last_result.get("arrival_state", {}) if isinstance(last_result.get("arrival_state", {}), dict) else {}).get("arrival_reason", last_result.get("reason", "")),
+                    )
+                    or ""
+                ),
                 "elapsed_s": round(time.time() - started_at, 3),
             }
         self.route5_hold(session, output_dir=output_dir, reason="replan_exhausted")
@@ -4360,6 +4896,7 @@ class Route5FusionControlMixin:
                 observation_attempts = self.route3_ordered_observation_attempts(selected)
                 observation: Dict[str, Any] = {}
                 obs_pose: Dict[str, float] = {}
+                original_obs_pose: Dict[str, float] = {}
                 nav_result: Dict[str, Any] = {}
                 for attempt_index, attempt in enumerate(observation_attempts, start=1):
                     if self.llm_route5_stop_event.is_set():
@@ -4371,7 +4908,16 @@ class Route5FusionControlMixin:
                     self.apply_route2_observation_plan(target_house_id, attempt, ranked_candidates, status_label=f"v5 selected attempt {attempt_index}/{len(observation_attempts)}")
                     observation = self.route2_selected_state().get("observation_point", attempt)
                     obs_pose = self.route3_target_pose_from_point(observation)
+                    original_obs_pose = dict(obs_pose)
                     obs_target_id = f"{target_house_id}_{facade}_obs_attempt_{attempt_index}"
+                    skip_targets = self.llm_route5_state.get("capture_guard_skip_targets", {}) if isinstance(self.llm_route5_state, dict) else {}
+                    if isinstance(skip_targets, dict) and obs_target_id in skip_targets:
+                        self.route5_log_event(
+                            output_dir,
+                            "observation_attempt_skipped_capture_guard_repeat",
+                            {"facade": facade, "attempt_index": attempt_index, "target_id": obs_target_id, "skip": skip_targets.get(obs_target_id, {})},
+                        )
+                        continue
                     self.route5_update_state(
                         selected_observation_attempt=observation,
                         current_exploration_status={
@@ -4450,6 +4996,7 @@ class Route5FusionControlMixin:
                         )
                         observation = degraded_observation
                         obs_pose = self.route3_target_pose_from_point(degraded_observation)
+                        original_obs_pose = dict(obs_pose)
                         nav_result = {
                             "status": "ok",
                             "reason": "route5_degraded_observation_capture",
@@ -4511,6 +5058,47 @@ class Route5FusionControlMixin:
                         if single_facade:
                             break
                         continue
+                capture_pose = self.route3_current_pose(session)
+                observation_arrival = self.route5_capture_guard_arrival_state(
+                    nav_result=nav_result,
+                    stage="NAV_TO_OBS",
+                    facade=facade,
+                    target_id=str(nav_result.get("target_id", f"{target_house_id}_{facade}_obs") or f"{target_house_id}_{facade}_obs"),
+                    original_target_pose=original_obs_pose or obs_pose,
+                    runtime_target_pose=obs_pose,
+                    capture_pose=capture_pose,
+                    config=self.route5_nav_config(),
+                )
+                observation_guard = self.route5_capture_guard_state(
+                    target_house_id=target_house_id,
+                    stage="NAV_TO_OBS",
+                    facade=facade,
+                    target_id=str(nav_result.get("target_id", f"{target_house_id}_{facade}_obs") or f"{target_house_id}_{facade}_obs"),
+                    original_target_pose=original_obs_pose or obs_pose,
+                    runtime_target_pose=obs_pose,
+                    capture_pose=capture_pose,
+                    pose_error=nav_result.get("pose_error", {}) if isinstance(nav_result.get("pose_error"), dict) else {},
+                    arrival_state=observation_arrival,
+                    config=self.route5_nav_config(),
+                    capture_kind="observation",
+                )
+                observation_guard = self.route5_record_capture_guard(output_dir, observation_guard)
+                if not bool(observation_guard.get("capture_guard_passed", False)):
+                    self.route5_write_capture_guard_blocked_decision(output_dir, observation_guard, current_pose=capture_pose)
+                    self.route5_update_house_memory(
+                        output_dir,
+                        target_house_id,
+                        facade,
+                        status="invalid_capture_pose_retryable",
+                        reason=str(observation_guard.get("reason", "capture_guard_failed") or "capture_guard_failed"),
+                        observation_attempt=observation if isinstance(observation, dict) else selected,
+                        nav_result=nav_result,
+                    )
+                    self.route5_log_event(output_dir, "observation_capture_guard_blocked", observation_guard)
+                    if single_facade:
+                        status = "single_facade_capture_guard_blocked"
+                        break
+                    continue
                 self.route5_set_stage("CAPTURE_RGB", output_dir=output_dir, facade=facade, target=obs_pose, message=f"capturing {facade} RGB")
                 rgb_result = self.route3_capture_facade_rgb_current(session, output_dir=output_dir, facade_dir=facade_dir, house_id=target_house_id, facade=facade, planned_pose=obs_pose)
                 self.route5_log_event(output_dir, "facade_rgb_capture", rgb_result)
@@ -4564,7 +5152,9 @@ class Route5FusionControlMixin:
                         scan_loop_stopped = True
                         break
                     scan_id = str(point.get("scan_id", "") or f"{facade}_{idx}")
-                    target_pose = self.route3_target_pose_from_point(point)
+                    original_scan_pose = self.route3_target_pose_from_point(point)
+                    target_pose = dict(original_scan_pose)
+                    point["route5_original_target_pose"] = self.route5_json_safe(original_scan_pose)
                     self.route5_update_state(
                         current_exploration_status={
                             "stage": "NAV_TO_SCAN_POINT",
@@ -4594,12 +5184,51 @@ class Route5FusionControlMixin:
                     if isinstance(nav_scan.get("final_target_pose"), dict):
                         target_pose = dict(nav_scan.get("final_target_pose", target_pose))
                         point["route5_target_reset_navigation"] = self.route5_json_safe(nav_scan)
-                        point["x"] = target_pose.get("x", point.get("x"))
-                        point["y"] = target_pose.get("y", point.get("y"))
-                        point["z"] = target_pose.get("z", point.get("z"))
-                        point["yaw"] = target_pose.get("yaw", point.get("yaw", point.get("yaw_deg", 0.0)))
+                        point["route5_runtime_target_pose"] = self.route5_json_safe(target_pose)
+                    capture_pose = self.route3_current_pose(session)
+                    scan_arrival = self.route5_capture_guard_arrival_state(
+                        nav_result=nav_scan,
+                        stage="NAV_TO_SCAN_POINT",
+                        facade=facade,
+                        target_id=scan_id,
+                        original_target_pose=original_scan_pose,
+                        runtime_target_pose=target_pose,
+                        capture_pose=capture_pose,
+                        config=self.route5_nav_config(),
+                    )
+                    scan_guard = self.route5_capture_guard_state(
+                        target_house_id=target_house_id,
+                        stage="NAV_TO_SCAN_POINT",
+                        facade=facade,
+                        target_id=scan_id,
+                        original_target_pose=original_scan_pose,
+                        runtime_target_pose=target_pose,
+                        capture_pose=capture_pose,
+                        pose_error=nav_scan.get("pose_error", {}) if isinstance(nav_scan.get("pose_error"), dict) else {},
+                        arrival_state=scan_arrival,
+                        config=self.route5_nav_config(),
+                        capture_kind="scan",
+                    )
+                    scan_guard = self.route5_record_capture_guard(output_dir, scan_guard)
+                    point["route5_capture_guard"] = self.route5_json_safe(scan_guard)
+                    if not bool(scan_guard.get("capture_guard_passed", False)):
+                        point["status"] = "invalid_capture_pose_retryable"
+                        point["block_reason"] = str(scan_guard.get("reason", "capture_guard_failed") or "capture_guard_failed")
+                        self.route5_write_capture_guard_blocked_decision(output_dir, scan_guard, current_pose=capture_pose)
+                        self.route5_log_event(output_dir, "scan_capture_guard_blocked", {"scan_id": scan_id, "guard": scan_guard})
+                        continue
                     self.route5_set_stage("CAPTURE_SCAN", output_dir=output_dir, facade=facade, target=target_pose, message=f"capturing {scan_id}")
                     capture = self.route3_capture_scan_point_current(session, output_dir=output_dir, facade_dir=facade_dir, point=point, planned_pose=target_pose)
+                    capture = self.route5_annotate_scan_capture_guard(
+                        output_dir,
+                        facade_dir,
+                        scan_id=scan_id,
+                        guard=scan_guard,
+                        original_target_pose=original_scan_pose,
+                        runtime_target_pose=target_pose,
+                        capture_pose=capture_pose,
+                        capture=capture if isinstance(capture, dict) else {},
+                    )
                     self.route5_log_event(output_dir, "scan_capture", {"scan_id": scan_id, **capture})
                     capture_status = str((capture if isinstance(capture, dict) else {}).get("status", (capture if isinstance(capture, dict) else {}).get("capture_status", "")) or "").strip().lower()
                     if capture_status == "ok":
@@ -4614,6 +5243,7 @@ class Route5FusionControlMixin:
                     break
                 self.route5_set_stage("VALIDATE_FACADE", output_dir=output_dir, facade=facade, message=f"validating {facade}")
                 postprocess_result = self.route5_refresh_facade_scan_pointcloud_rows(output_dir, facade_dir, facade)
+                valid_scan_capture_count = self.route5_valid_scan_capture_count_from_logs(output_dir, facade_dir, facade)
                 self.route2_write_lidar_summary(output_dir, running=False)
                 validation = self.route2_validate_facade()
                 self.route5_log_event(output_dir, "facade_validation", validation)
@@ -4622,6 +5252,7 @@ class Route5FusionControlMixin:
                     observation=observation if isinstance(observation, dict) else {},
                     rgb_result=rgb_result if isinstance(rgb_result, dict) else {},
                     scan_capture_count=scan_capture_count,
+                    valid_scan_capture_count=valid_scan_capture_count,
                     scan_loop_stopped=False,
                     postprocess_result=postprocess_result,
                 )
@@ -4773,7 +5404,12 @@ class Route5FusionControlMixin:
         state = self.route2_selected_state()
         analysis = state.get("facade_analysis", {}) if isinstance(state.get("facade_analysis"), dict) else {}
         obstacle_event = self.llm_route5_state.get("last_obstacle_event", {}) if isinstance(self.llm_route5_state, dict) else {}
-        payload = {"facade_analysis": analysis or {"status": "No facade analysis yet."}, "last_obstacle_event": obstacle_event}
+        capture_analysis = self.llm_route5_state.get("last_capture_analysis", {}) if isinstance(self.llm_route5_state, dict) else {}
+        payload = {
+            "facade_analysis": analysis or {"status": "No facade analysis yet."},
+            "last_obstacle_event": obstacle_event,
+            "last_capture_analysis": capture_analysis,
+        }
         try:
             if not analysis_text.winfo_exists():
                 self.llm_route5_analysis_text = None
@@ -4809,6 +5445,304 @@ class Route5FusionControlMixin:
                 self.llm_route5_rgb_photo = None
             except tk.TclError:
                 self.llm_route5_rgb_label = None
+
+    def route5_capture_analysis_dir(self, run_dir: Path) -> Path:
+        return Path(run_dir).resolve() / "route5_capture_analysis"
+
+    def route5_capture_analysis_paths_for_row(self, run_dir: Path, row: Dict[str, Any]) -> Dict[str, Path]:
+        row = row if isinstance(row, dict) else {}
+        capture_dir = self.route5_resolve_capture_dir(run_dir, row.get("capture_dir", ""))
+        if capture_dir is None:
+            capture_dir = Path()
+        rgb_path = self.route5_resolve_capture_dir(run_dir, row.get("rgb_path", ""))
+        if rgb_path is None or not rgb_path.is_file():
+            rgb_path = capture_dir / "rgb.png"
+        depth_path = self.route5_resolve_capture_dir(run_dir, row.get("depth_npy_path", row.get("depth_path", "")))
+        if depth_path is None or not depth_path.is_file():
+            depth_path = capture_dir / "depth.npy"
+        camera_info_path = self.route5_resolve_capture_dir(run_dir, row.get("camera_info_path", ""))
+        if camera_info_path is None or not camera_info_path.is_file():
+            camera_info_path = capture_dir / "camera_info.json"
+        return {"capture_dir": capture_dir, "rgb_path": rgb_path, "depth_npy_path": depth_path, "camera_info_path": camera_info_path}
+
+    def route5_read_capture_analysis_log_rows(self, run_dir: Path) -> List[Dict[str, Any]]:
+        run_dir = Path(run_dir).resolve()
+        sources = [run_dir / "lidar_capture_log.jsonl"]
+        facade_root = run_dir / "facade_observations"
+        if facade_root.is_dir():
+            sources.extend(sorted(facade_root.glob("*/lidar_capture_log.jsonl")))
+        rows: List[Dict[str, Any]] = []
+        seen: set[Tuple[str, str]] = set()
+        for path in sources:
+            for row in self.read_jsonl_artifact(path):
+                item = dict(row if isinstance(row, dict) else {})
+                scan_id = str(item.get("scan_id", "") or "")
+                capture_dir = str(item.get("capture_dir", "") or "")
+                key = (scan_id, capture_dir)
+                if key in seen:
+                    continue
+                seen.add(key)
+                item["source_log_path"] = str(path)
+                rows.append(item)
+        return rows
+
+    def route5_build_capture_analysis_manifest(self, run_dir: Path) -> Dict[str, Any]:
+        run_dir = Path(run_dir).resolve()
+        analysis_dir = self.route5_capture_analysis_dir(run_dir)
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+        included: List[Dict[str, Any]] = []
+        excluded: List[Dict[str, Any]] = []
+        for index, row in enumerate(self.route5_read_capture_analysis_log_rows(run_dir), start=1):
+            item = dict(row)
+            scan_id = str(item.get("scan_id", "") or "").strip()
+            capture_kind = str(item.get("capture_kind", "") or "").strip().lower()
+            status = str(item.get("capture_status", item.get("status", "ok")) or "ok").strip().lower()
+            paths = self.route5_capture_analysis_paths_for_row(run_dir, item)
+            reason = ""
+            if not scan_id:
+                reason = "not_scan_capture"
+            elif "observation" in capture_kind and "scan" not in capture_kind:
+                reason = "not_scan_capture"
+            elif status not in {"ok", "captured", "done", ""}:
+                reason = f"capture_status_{status or 'unknown'}"
+            elif "capture_guard_passed" not in item:
+                reason = "legacy_unverified"
+            elif not bool(item.get("capture_guard_passed", False)):
+                reason = "capture_guard_failed"
+            elif not paths["capture_dir"].is_dir():
+                reason = "capture_dir_missing"
+            elif not paths["rgb_path"].is_file():
+                reason = "rgb_missing"
+            elif not paths["depth_npy_path"].is_file():
+                reason = "depth_missing"
+            elif not paths["camera_info_path"].is_file():
+                reason = "camera_info_missing"
+            manifest_row = {
+                **self.route5_json_safe(item),
+                "manifest_index": index,
+                "capture_dir": str(paths["capture_dir"]),
+                "rgb_path": str(paths["rgb_path"]),
+                "depth_npy_path": str(paths["depth_npy_path"]),
+                "camera_info_path": str(paths["camera_info_path"]),
+            }
+            if reason:
+                excluded.append({**manifest_row, "reason": reason})
+            else:
+                included.append(manifest_row)
+        manifest = {
+            "schema": "route5_capture_analysis_manifest_v1",
+            "run_dir": str(run_dir),
+            "analysis_dir": str(analysis_dir),
+            "included_count": len(included),
+            "excluded_count": len(excluded),
+            "included_captures": included,
+            "excluded_captures": excluded,
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        self.write_json_artifact(analysis_dir / "selected_capture_manifest.json", manifest)
+        return manifest
+
+    def route5_capture_manifest_frames(self, manifest: Dict[str, Any]) -> List[lidar_yolo_analysis.LidarYoloFrame]:
+        frames: List[lidar_yolo_analysis.LidarYoloFrame] = []
+        for row in manifest.get("included_captures", []) if isinstance(manifest.get("included_captures"), list) else []:
+            if not isinstance(row, dict):
+                continue
+            capture_dir = Path(str(row.get("capture_dir", "") or ""))
+            rgb_path = Path(str(row.get("rgb_path", "") or ""))
+            depth_path = Path(str(row.get("depth_npy_path", "") or ""))
+            camera_info_path = Path(str(row.get("camera_info_path", "") or ""))
+            try:
+                frame_index = int(float(row.get("frame_index", 0) or lidar_yolo_analysis.parse_frame_index(capture_dir.name)))
+            except Exception:
+                frame_index = lidar_yolo_analysis.parse_frame_index(capture_dir.name)
+            if capture_dir.is_dir() and rgb_path.is_file() and depth_path.is_file() and camera_info_path.is_file():
+                frames.append(
+                    lidar_yolo_analysis.LidarYoloFrame(
+                        frame_index=frame_index,
+                        frame_name=capture_dir.name,
+                        capture_dir=capture_dir,
+                        rgb_path=rgb_path,
+                        depth_npy_path=depth_path,
+                        camera_info_path=camera_info_path,
+                        capture_json_path=capture_dir / "capture.json",
+                    )
+                )
+        return frames
+
+    def route5_write_capture_analysis_reports(
+        self,
+        run_dir: Path,
+        manifest: Dict[str, Any],
+        yolo_result: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        analysis_dir = self.route5_capture_analysis_dir(run_dir)
+        yolo_result = yolo_result if isinstance(yolo_result, dict) else {}
+        yolo_rows: List[Dict[str, Any]] = []
+        for frame in yolo_result.get("frames", []) if isinstance(yolo_result.get("frames"), list) else []:
+            row = dict(frame if isinstance(frame, dict) else {})
+            yolo_rows.append(row)
+        with (analysis_dir / "yolo_detections.jsonl").open("w", encoding="utf-8") as fh:
+            for row in yolo_rows:
+                fh.write(json.dumps(self.route5_json_safe(row), ensure_ascii=False) + "\n")
+        pointcloud_manifest = {
+            "semantic_point_count": int(yolo_result.get("semantic_point_count", 0) or 0),
+            "semantic_points_path": str(yolo_result.get("semantic_points_path", "") or ""),
+            "semantic_points_ply_path": str(yolo_result.get("semantic_points_ply_path", "") or ""),
+            "semantic_points_pcd_path": str(yolo_result.get("semantic_points_pcd_path", "") or ""),
+            "selected_capture_count": int(manifest.get("included_count", 0) or 0),
+        }
+        self.write_json_artifact(analysis_dir / "pointcloud_manifest.json", pointcloud_manifest)
+        by_facade: Dict[str, Dict[str, Any]] = {}
+        for row in manifest.get("included_captures", []) if isinstance(manifest.get("included_captures"), list) else []:
+            facade = str(row.get("facade", "") or "unknown")
+            slot = by_facade.setdefault(facade, {"facade": facade, "capture_count": 0, "scan_ids": []})
+            slot["capture_count"] += 1
+            scan_id = str(row.get("scan_id", "") or "")
+            if scan_id:
+                slot["scan_ids"].append(scan_id)
+        coverage = {"facades": sorted(by_facade.values(), key=lambda item: item["facade"]), "included_capture_count": int(manifest.get("included_count", 0) or 0)}
+        self.write_json_artifact(analysis_dir / "facade_coverage_report.json", coverage)
+        labels_path = str(yolo_result.get("semantic_labels_path", "") or "")
+        entrance_candidates: List[Dict[str, Any]] = []
+        if labels_path and Path(labels_path).is_file():
+            labels_payload = lidar_yolo_analysis.load_json(Path(labels_path), {})
+            for label in labels_payload.get("labels", []) if isinstance(labels_payload.get("labels"), list) else []:
+                if isinstance(label, dict):
+                    class_name = str(label.get("class_name", label.get("class_name_normalized", "")) or "").lower()
+                    if "door" in class_name:
+                        entrance_candidates.append(label)
+        self.write_json_artifact(analysis_dir / "entrance_candidates.json", {"candidate_count": len(entrance_candidates), "candidates": entrance_candidates})
+        summary = {
+            "status": str(yolo_result.get("status", "manifest_only") or "manifest_only"),
+            "run_dir": str(Path(run_dir).resolve()),
+            "analysis_dir": str(analysis_dir),
+            "included_count": int(manifest.get("included_count", 0) or 0),
+            "excluded_count": int(manifest.get("excluded_count", 0) or 0),
+            "yolo_processed_frame_count": int(yolo_result.get("processed_frame_count", len(yolo_rows)) or 0),
+            "semantic_label_count": int(yolo_result.get("semantic_label_count", 0) or 0),
+            "semantic_point_count": int(yolo_result.get("semantic_point_count", 0) or 0),
+            "latest_annotated_path": str((yolo_rows[-1].get("yolo_annotated_path", "") if yolo_rows else "") or ""),
+            "manifest_path": str(analysis_dir / "selected_capture_manifest.json"),
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        self.write_json_artifact(analysis_dir / "analysis_summary.json", summary)
+        return summary
+
+    def route5_run_capture_analysis(
+        self,
+        run_dir: Path,
+        *,
+        weights_path: Optional[Path] = None,
+        stop_event: Optional[threading.Event] = None,
+        progress_callback: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        run_dir = Path(run_dir).resolve()
+        manifest = self.route5_build_capture_analysis_manifest(run_dir)
+        frames = self.route5_capture_manifest_frames(manifest)
+        if not frames:
+            summary = self.route5_write_capture_analysis_reports(run_dir, manifest, {"status": "no_valid_scan_captures", "frames": []})
+            self.route5_update_state(last_capture_analysis=summary)
+            self.route5_write_state_artifact()
+            return {**summary, "manifest": manifest}
+        raw_weights = ""
+        weights_var = getattr(self, "lidar_yolo_weights_var", None)
+        if weights_var is not None and hasattr(weights_var, "get"):
+            try:
+                raw_weights = str(weights_var.get() or "")
+            except Exception:
+                raw_weights = ""
+        selected_weights = weights_path or Path(raw_weights or str(lidar_yolo_analysis.DEFAULT_LIDAR_YOLO_WEIGHTS_PATH))
+        yolo_result = lidar_yolo_analysis.run_lidar_yolo_analysis(
+            stream_dir=run_dir,
+            weights_path=selected_weights,
+            device=lidar_yolo_analysis.default_lidar_yolo_device(),
+            selected_frames_override=frames,
+            stop_event=stop_event,
+            progress_callback=progress_callback,
+        )
+        summary = self.route5_write_capture_analysis_reports(run_dir, manifest, yolo_result)
+        self.route5_update_state(last_capture_analysis=summary)
+        self.route5_write_state_artifact()
+        return {**summary, "manifest": manifest, "yolo_result": self.route5_json_safe(yolo_result)}
+
+    def open_route5_capture_analysis_window(self) -> None:
+        self.ensure_route5_state()
+        output_dir = self.route5_state_output_dir()
+        initial_dir = output_dir or self.resolve_project_path("llm_route5_fusion_runs")
+        if not self.llm_route5_capture_analysis_run_dir_var.get().strip() and output_dir is not None:
+            self.llm_route5_capture_analysis_run_dir_var.set(str(output_dir))
+        dialog = tk.Toplevel(self.llm_route5_window if getattr(self, "llm_route5_window", None) is not None else self.root)
+        dialog.title("Analyze V5 Captures")
+        dialog.geometry("920x420")
+        dialog.grid_columnconfigure(1, weight=1)
+        tk.Label(dialog, text="V5 Run").grid(row=0, column=0, sticky="w", padx=8, pady=(10, 4))
+        tk.Entry(dialog, textvariable=self.llm_route5_capture_analysis_run_dir_var).grid(row=0, column=1, sticky="ew", padx=4, pady=(10, 4))
+
+        def browse() -> None:
+            selected = filedialog.askdirectory(title="Select V5 route run folder", initialdir=str(initial_dir))
+            if selected:
+                self.llm_route5_capture_analysis_run_dir_var.set(str(Path(selected)))
+
+        def use_current() -> None:
+            current = self.route5_state_output_dir()
+            if current is not None:
+                self.llm_route5_capture_analysis_run_dir_var.set(str(current))
+
+        tk.Button(dialog, text="Browse", command=browse).grid(row=0, column=2, padx=4, pady=(10, 4))
+        tk.Button(dialog, text="Current", command=use_current).grid(row=0, column=3, padx=4, pady=(10, 4))
+        status = tk.Label(dialog, textvariable=self.llm_route5_capture_analysis_status_var, anchor="w", justify="left", wraplength=880)
+        status.grid(row=1, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
+        preview = tk.Text(dialog, height=14, wrap="word", font=("Consolas", 9))
+        preview.grid(row=2, column=0, columnspan=4, sticky="nsew", padx=8, pady=6)
+        dialog.grid_rowconfigure(2, weight=1)
+
+        def set_preview(payload: Dict[str, Any]) -> None:
+            try:
+                preview.configure(state="normal")
+                preview.delete("1.0", "end")
+                preview.insert("1.0", json.dumps(self.route5_json_safe(payload), indent=2, ensure_ascii=False))
+                preview.configure(state="disabled")
+            except tk.TclError:
+                pass
+
+        def start() -> None:
+            if self.llm_route5_capture_analysis_thread is not None and self.llm_route5_capture_analysis_thread.is_alive():
+                self.llm_route5_capture_analysis_status_var.set("V5 Capture Analysis: already running")
+                return
+            run_dir = Path(self.llm_route5_capture_analysis_run_dir_var.get().strip()).resolve()
+            if not run_dir.exists():
+                self.llm_route5_capture_analysis_status_var.set(f"V5 Capture Analysis: folder missing: {run_dir}")
+                return
+            self.llm_route5_capture_analysis_stop_event.clear()
+            self.llm_route5_capture_analysis_status_var.set(f"V5 Capture Analysis: running -> {run_dir / 'route5_capture_analysis'}")
+
+            def progress(payload: Dict[str, Any]) -> None:
+                self.root.after(0, lambda p=payload: self.llm_route5_capture_analysis_status_var.set(str(p.get("message", "V5 Capture Analysis running"))))
+
+            def worker() -> None:
+                try:
+                    result = self.route5_run_capture_analysis(run_dir, stop_event=self.llm_route5_capture_analysis_stop_event, progress_callback=progress)
+                except Exception as exc:
+                    self.root.after(0, lambda e=exc: self.llm_route5_capture_analysis_status_var.set(f"V5 Capture Analysis failed: {e}"))
+                    return
+                self.root.after(
+                    0,
+                    lambda r=result: (
+                        self.llm_route5_capture_analysis_status_var.set(
+                            f"V5 Capture Analysis: {r.get('status')} included={r.get('included_count')} excluded={r.get('excluded_count')} -> {r.get('analysis_dir')}"
+                        ),
+                        set_preview(r),
+                    ),
+                )
+
+            self.llm_route5_capture_analysis_thread = threading.Thread(target=worker, daemon=True)
+            self.llm_route5_capture_analysis_thread.start()
+
+        buttons = tk.Frame(dialog)
+        buttons.grid(row=3, column=0, columnspan=4, sticky="e", padx=8, pady=(0, 8))
+        tk.Button(buttons, text="Run V5 Capture Analysis", command=start).pack(side="left", padx=4)
+        tk.Button(buttons, text="Stop", command=lambda: self.llm_route5_capture_analysis_stop_event.set()).pack(side="left", padx=4)
+        tk.Button(buttons, text="Close", command=dialog.destroy).pack(side="left", padx=4)
 
     def route5_map_canvas_size_for_width(self, available_width_px: float, *, image_size: Optional[Tuple[int, int]] = None) -> Dict[str, int]:
         width = max(760, min(1800, int(float(available_width_px or 0.0)) - 24))
@@ -4861,6 +5795,8 @@ class Route5FusionControlMixin:
                         continue
                     status = str(row.get("status", row.get("capture_status", "")) or "").strip().lower()
                     if status and status != "ok":
+                        continue
+                    if "capture_guard_passed" in row and not bool(row.get("capture_guard_passed", False)):
                         continue
                     scan_id = str(row.get("scan_id", row.get("point_id", row.get("capture_id", ""))) or "")
                     if scan_id:
@@ -5516,6 +6452,7 @@ class Route5FusionControlMixin:
         tk.Button(actions, text="Stop", command=self.on_route5_stop).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Clear", command=self.on_route5_clear).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Validate Run", command=self.on_route5_validate_run).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Analyze V5 Captures", command=self.open_route5_capture_analysis_window).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Global Pause All", command=self.on_route5_global_pause_all).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Release Movement", command=self.on_route5_release_movement).pack(side="left", padx=6, pady=4)
 
@@ -5529,6 +6466,7 @@ class Route5FusionControlMixin:
         tk.Label(status, textvariable=self.llm_route5_avoidance_status_var, anchor="w", wraplength=980, justify="left").grid(row=2, column=0, columnspan=3, sticky="ew", pady=(2, 0))
         tk.Label(status, textvariable=self.llm_route5_representation_status_var, anchor="w", wraplength=980, justify="left").grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 0))
         tk.Label(status, textvariable=self.llm_route5_thinking_status_var, anchor="w", wraplength=980, justify="left").grid(row=4, column=0, columnspan=3, sticky="ew", pady=(2, 0))
+        tk.Label(status, textvariable=self.llm_route5_capture_analysis_status_var, anchor="w", wraplength=980, justify="left").grid(row=5, column=0, columnspan=3, sticky="ew", pady=(2, 0))
         tk.Label(route, textvariable=self.llm_route5_status_var, anchor="w", wraplength=1080, justify="left").grid(row=8, column=0, columnspan=6, sticky="ew", padx=6, pady=(0, 4))
         preview_frame = tk.Frame(route)
         preview_frame.grid(row=9, column=0, columnspan=6, sticky="nsew", padx=6, pady=(0, 6))
@@ -5660,6 +6598,10 @@ class Route5FusionControlMixin:
             self.route5_or2_mask_photo = None
             self.route5_or2_report_text = None
             self.stop_route5_or2_monitor()
+            try:
+                self.llm_route5_capture_analysis_stop_event.set()
+            except Exception:
+                pass
             self.cancel_route5_auto_refresh()
             window.destroy()
 
