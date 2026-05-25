@@ -165,7 +165,7 @@ LLM_ROUTE_OUTPUT_SCHEMA: Dict[str, Any] = {
     "preferred_facade_order": ["south", "east", "north", "west"],
     "avoid_house_ids": ["001", "003"],
     "replan_triggers": ["depth_blocked", "off_route", "target_switch"],
-    "reason": "Short map-level route planning rationale.",
+    "reason": "Short map-level Route6_entrance_search planning rationale.",
 }
 LLM_TASK_PLAN_OUTPUT_SCHEMA: Dict[str, Any] = {
     "plan_id": "llm_task_plan_20260507_123000",

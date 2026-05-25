@@ -92,7 +92,7 @@ class ObstacleAvoidanceLLMPolicyTests(unittest.TestCase):
                 "flyover_z_cm": 850,
                 "lateral_preference": "right",
                 "vertical_policy": "flyover_then_descend_near_xy",
-                "strategy_reason": "Fence-like obstacle across the route.",
+                "strategy_reason": "Fence-like obstacle across the Route6_entrance_search.",
             }
         )
         updated = apply_strategy_to_episode_metadata(episode, strategy)

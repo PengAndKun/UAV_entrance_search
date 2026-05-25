@@ -49,7 +49,7 @@ def test_panel_button_wiring() -> None:
     )
     assert_true(
         'text="Open Active NBV Scan"' in source or "text='Open Active NBV Scan'" in source,
-        "main route actions row must expose the Open Active NBV Scan button",
+        "main Route6_entrance_search actions row must expose the Open Active NBV Scan button",
     )
     assert_true(
         "command=self.open_active_nbv_scan_window" in source,

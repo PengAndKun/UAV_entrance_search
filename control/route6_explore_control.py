@@ -1,9 +1,32 @@
 from __future__ import annotations
 
+import csv
+
+from PIL import ImageDraw
+
 from .common import *
+from . import route6_map_builder
 
 
 ROUTE6_DESIGN_DOC = "overleaf/route6_nearest_house_pointcloud_map_design.md"
+
+
+class _Route6FallbackVar:
+    def __init__(self, value: Any = "") -> None:
+        self.value = value
+
+    def get(self) -> Any:
+        return self.value
+
+    def set(self, value: Any) -> None:
+        self.value = value
+
+
+def _route6_string_var(value: str) -> Any:
+    try:
+        return tk.StringVar(value=value)
+    except RuntimeError:
+        return _Route6FallbackVar(value)
 
 
 class Route6ExploreControlMixin:
@@ -12,10 +35,52 @@ class Route6ExploreControlMixin:
             self.llm_route6_window = None
         if not hasattr(self, "llm_route6_summary_text"):
             self.llm_route6_summary_text = None
+        if not hasattr(self, "llm_route6_map_widget"):
+            self.llm_route6_map_widget = None
+        if not hasattr(self, "llm_route6_map_frame"):
+            self.llm_route6_map_frame = None
+        if not hasattr(self, "route6_update_map_window"):
+            self.route6_update_map_window = None
+        if not hasattr(self, "route6_update_map_scroll_canvas"):
+            self.route6_update_map_scroll_canvas = None
+        if not hasattr(self, "route6_update_map_content_frame"):
+            self.route6_update_map_content_frame = None
+        if not hasattr(self, "route6_update_map_preview_label"):
+            self.route6_update_map_preview_label = None
+        if not hasattr(self, "route6_update_map_preview_photo"):
+            self.route6_update_map_preview_photo = None
+        if not hasattr(self, "route6_update_map_layer_combo"):
+            self.route6_update_map_layer_combo = None
+        if not hasattr(self, "route6_update_map_capture_thread"):
+            self.route6_update_map_capture_thread = None
+        if not hasattr(self, "route6_update_map_capture_stop_event"):
+            self.route6_update_map_capture_stop_event = threading.Event()
+        if not hasattr(self, "route6_update_map_realtime_thread"):
+            self.route6_update_map_realtime_thread = None
+        if not hasattr(self, "route6_update_map_realtime_stop_event"):
+            self.route6_update_map_realtime_stop_event = threading.Event()
+        if not hasattr(self, "route6_update_map_pose_after_id"):
+            self.route6_update_map_pose_after_id = None
+        if not hasattr(self, "route6_capture_folder_reader_window"):
+            self.route6_capture_folder_reader_window = None
+        if not hasattr(self, "route6_capture_folder_listbox"):
+            self.route6_capture_folder_listbox = None
+        if not hasattr(self, "route6_pointcloud_report_text"):
+            self.route6_pointcloud_report_text = None
+        if not hasattr(self, "route6_capture_folder_records"):
+            self.route6_capture_folder_records = []
         if not hasattr(self, "llm_route6_state"):
             self.llm_route6_state = {}
+        if not hasattr(self, "llm_route6_thread"):
+            self.llm_route6_thread = None
         if not hasattr(self, "llm_route6_stop_event"):
             self.llm_route6_stop_event = threading.Event()
+        if not hasattr(self, "llm_route6_pause_event"):
+            self.llm_route6_pause_event = threading.Event()
+        if not hasattr(self, "llm_route6_force_next_event"):
+            self.llm_route6_force_next_event = threading.Event()
+        if not hasattr(self, "route6_runtime_map_config"):
+            self.route6_runtime_map_config = None
         if not hasattr(self, "llm_route6_status_var"):
             self.llm_route6_status_var = tk.StringVar(value="LLM Route V6: idle")
         if not hasattr(self, "llm_route6_stage_var"):
@@ -28,6 +93,8 @@ class Route6ExploreControlMixin:
             self.llm_route6_map_status_var = tk.StringVar(value="Map: idle")
         if not hasattr(self, "llm_route6_output_dir_var"):
             self.llm_route6_output_dir_var = tk.StringVar(value="Output: n/a")
+        if not hasattr(self, "llm_route6_metrics_var"):
+            self.llm_route6_metrics_var = tk.StringVar(value="Metrics: mapped=0 searched=0 blocked=0 confidence=n/a corrected=n/a")
         if not hasattr(self, "llm_route6_max_houses_var"):
             self.llm_route6_max_houses_var = tk.StringVar(value="3")
         if not hasattr(self, "llm_route6_runtime_min_var"):
@@ -43,9 +110,3188 @@ class Route6ExploreControlMixin:
             self.llm_route6_coverage_threshold_var = tk.StringVar(value="0.75")
         if not hasattr(self, "llm_route6_allow_save_corrected_var"):
             self.llm_route6_allow_save_corrected_var = tk.BooleanVar(value=False)
+        if not hasattr(self, "route6_update_map_layer_var"):
+            self.route6_update_map_layer_var = _route6_string_var("z_050")
+        if not hasattr(self, "route6_update_map_status_var"):
+            self.route6_update_map_status_var = _route6_string_var("Route 6 Update Map: idle")
+        if not hasattr(self, "route6_update_map_pose_var"):
+            self.route6_update_map_pose_var = _route6_string_var("UAV x=n/a y=n/a z=n/a yaw=n/a")
+        if not hasattr(self, "route6_update_map_capture_interval_s_var"):
+            self.route6_update_map_capture_interval_s_var = _route6_string_var("1.0")
+        if not hasattr(self, "route6_update_map_min_move_cm_var"):
+            self.route6_update_map_min_move_cm_var = _route6_string_var("50")
+        if not hasattr(self, "route6_update_map_min_yaw_deg_var"):
+            self.route6_update_map_min_yaw_deg_var = _route6_string_var("5")
+        if not hasattr(self, "route6_capture_folder_status_var"):
+            self.route6_capture_folder_status_var = _route6_string_var("Route 6 Capture Folder Reader: idle")
+        if not hasattr(self, "route6_selected_capture_folder_var"):
+            self.route6_selected_capture_folder_var = _route6_string_var("")
 
     def route6_design_doc_path(self) -> Path:
         return PROJECT_ROOT / ROUTE6_DESIGN_DOC
+
+    def route6_output_root(self) -> Path:
+        override = getattr(self, "llm_route6_output_root_override", None)
+        return Path(override) if override is not None else self.resolve_project_path("route6_explore_runs")
+
+    def make_route6_output_dir(self) -> Path:
+        root = self.route6_output_root()
+        root.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        candidate = root / f"route6_nearest_map_{timestamp}"
+        suffix = 1
+        while candidate.exists():
+            suffix += 1
+            candidate = root / f"route6_nearest_map_{timestamp}_{suffix}"
+        (candidate / "map").mkdir(parents=True, exist_ok=True)
+        (candidate / "houses").mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def route6_json_safe(self, payload: Any) -> Any:
+        if isinstance(payload, Path):
+            return str(payload)
+        if isinstance(payload, np.ndarray):
+            return payload.tolist()
+        if isinstance(payload, np.integer):
+            return int(payload)
+        if isinstance(payload, np.floating):
+            return float(payload)
+        if isinstance(payload, dict):
+            return {str(key): self.route6_json_safe(value) for key, value in payload.items()}
+        if isinstance(payload, list):
+            return [self.route6_json_safe(value) for value in payload]
+        return payload
+
+    def route6_write_json_artifact(self, path: Path, payload: Dict[str, Any]) -> None:
+        if hasattr(self, "write_json_artifact"):
+            self.write_json_artifact(path, self.route6_json_safe(payload))
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.route6_json_safe(payload), indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def route6_append_jsonl(self, path: Path, payload: Dict[str, Any]) -> None:
+        if hasattr(self, "append_jsonl"):
+            self.append_jsonl(path, self.route6_json_safe(payload))
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(self.route6_json_safe(payload), ensure_ascii=False) + "\n")
+
+    def route6_current_pose(self) -> Dict[str, float]:
+        try:
+            pose = self.route3_current_pose()
+            if isinstance(pose, dict) and pose:
+                return {
+                    "x": float(pose.get("x", 0.0) or 0.0),
+                    "y": float(pose.get("y", 0.0) or 0.0),
+                    "z": float(pose.get("z", 0.0) or 0.0),
+                    "yaw": float(pose.get("yaw", pose.get("yaw_deg", 0.0)) or 0.0),
+                }
+        except Exception:
+            pass
+        state = getattr(self, "latest_state", {}) if isinstance(getattr(self, "latest_state", {}), dict) else {}
+        raw_pose = state.get("pose", state.get("location", []))
+        if isinstance(raw_pose, dict):
+            return {
+                "x": float(raw_pose.get("x", 0.0) or 0.0),
+                "y": float(raw_pose.get("y", 0.0) or 0.0),
+                "z": float(raw_pose.get("z", 0.0) or 0.0),
+                "yaw": float(raw_pose.get("yaw", raw_pose.get("yaw_deg", 0.0)) or 0.0),
+            }
+        if isinstance(raw_pose, (list, tuple)) and len(raw_pose) >= 3:
+            return {
+                "x": float(raw_pose[0] or 0.0),
+                "y": float(raw_pose[1] or 0.0),
+                "z": float(raw_pose[2] or 0.0),
+                "yaw": float(raw_pose[3] if len(raw_pose) > 3 else 0.0),
+            }
+        return {"x": 0.0, "y": 0.0, "z": 0.0, "yaw": 0.0}
+
+    def route6_house_states(self) -> Dict[str, Dict[str, Any]]:
+        state = getattr(self, "llm_route6_state", {}) if isinstance(getattr(self, "llm_route6_state", {}), dict) else {}
+        house_states = state.get("house_states", {}) if isinstance(state.get("house_states", {}), dict) else {}
+        return dict(house_states)
+
+    def route6_get_runtime_map_config(self) -> Dict[str, Any]:
+        runtime = getattr(self, "route6_runtime_map_config", None)
+        if isinstance(runtime, dict) and runtime:
+            return runtime
+        config = getattr(self, "map_config", {}) if isinstance(getattr(self, "map_config", {}), dict) else {}
+        try:
+            runtime = json.loads(json.dumps(config))
+        except Exception:
+            runtime = dict(config)
+        self.route6_runtime_map_config = runtime
+        return runtime
+
+    def route6_rank_house_candidates(self) -> List[Dict[str, Any]]:
+        self.ensure_route6_state()
+        map_config = self.route6_get_runtime_map_config()
+        standoff = float(self.llm_route6_standoff_cm_var.get() or 850.0)
+        scan_z = float(self.llm_route6_scan_z_cm_var.get() or 450.0)
+        return route6_map_builder.rank_house_candidates(
+            map_config,
+            self.route6_current_pose(),
+            house_states=self.route6_house_states(),
+            standoff_cm=standoff,
+            scan_z_cm=scan_z,
+        )
+
+    def route6_int_param(self, variable: Any, default: int, *, min_value: int = 1, max_value: int = 100) -> int:
+        try:
+            value = variable.get() if hasattr(variable, "get") else variable
+            number = int(float(value))
+        except Exception:
+            number = int(default)
+        return max(int(min_value), min(int(max_value), int(number)))
+
+    def route6_float_param(self, variable: Any, default: float, *, min_value: float = 0.0, max_value: float = 1e9) -> float:
+        try:
+            value = variable.get() if hasattr(variable, "get") else variable
+            number = float(value)
+            if not math.isfinite(number):
+                number = float(default)
+        except Exception:
+            number = float(default)
+        return max(float(min_value), min(float(max_value), float(number)))
+
+    def route6_mapping_house_states(self) -> Dict[str, Dict[str, Any]]:
+        states = {str(hid): dict(state) for hid, state in self.route6_house_states().items() if isinstance(state, dict)}
+        for state in states.values():
+            status = str(state.get("status", "") or "").strip()
+            if status in {"mapped_complete", "mapped_partial", "needs_capture", "searched", "searched_no_entry", "terminal_blocked"}:
+                state["cooldown_active"] = True
+        return states
+
+    def route6_rank_mapping_house_candidates(self) -> List[Dict[str, Any]]:
+        self.ensure_route6_state()
+        map_config = self.route6_get_runtime_map_config()
+        standoff = float(self.llm_route6_standoff_cm_var.get() or 850.0)
+        scan_z = float(self.llm_route6_scan_z_cm_var.get() or 450.0)
+        return route6_map_builder.rank_house_candidates(
+            map_config,
+            self.route6_current_pose(),
+            house_states=self.route6_mapping_house_states(),
+            standoff_cm=standoff,
+            scan_z_cm=scan_z,
+        )
+
+    def route6_write_house_queue(self, output_dir: Path, candidates: List[Dict[str, Any]], selected: Dict[str, Any]) -> None:
+        selected_house_id = str((selected or {}).get("house_id", "") or "")
+        queue = {
+            "schema": "route6_house_queue_v1",
+            "selected_house_id": selected_house_id,
+            "selected_candidate": selected,
+            "candidates": candidates,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(Path(output_dir) / "route6_house_queue.json", queue)
+        self.llm_route6_state["selected_house_id"] = selected_house_id
+        self.llm_route6_state["selected_candidate"] = selected
+        self.llm_route6_state["candidate_count"] = len(candidates)
+        self.llm_route6_state["current_pose"] = self.route6_current_pose()
+        self.llm_route6_state["stage"] = "SELECT_HOUSE" if selected else "DONE"
+        self.llm_route6_state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self.llm_route6_stage_var.set(f"Stage: {self.llm_route6_state['stage']}")
+        self.llm_route6_current_house_var.set(f"Current house: {selected_house_id or 'n/a'}")
+        self.llm_route6_queue_var.set(f"House queue: candidates={len(candidates)}")
+        self.route6_write_state_artifact()
+        self.route6_log_event(
+            Path(output_dir),
+            "select_house",
+            {
+                "stage": self.llm_route6_state["stage"],
+                "selected_house_id": selected_house_id,
+                "candidate_count": len(candidates),
+            },
+        )
+
+    def route6_select_next_house_for_mapping(self, output_dir: Path) -> Dict[str, Any]:
+        candidates = self.route6_rank_mapping_house_candidates()
+        selected = route6_map_builder.select_next_house_candidate(candidates)
+        self.route6_write_house_queue(Path(output_dir), candidates, selected)
+        return selected
+
+    def route6_wait_if_paused(self, output_dir: Path) -> bool:
+        paused_logged = False
+        while self.llm_route6_pause_event.is_set() and not self.llm_route6_stop_event.is_set():
+            if not paused_logged:
+                self.route6_set_stage("PAUSED", "Route 6 paused.")
+                self.route6_log_event(Path(output_dir), "pause", {"stage": "PAUSED"})
+                paused_logged = True
+            time.sleep(0.1)
+        return not self.llm_route6_stop_event.is_set()
+
+    def route6_log_event(self, output_dir: Path, event_type: str, payload: Dict[str, Any]) -> None:
+        record = {
+            "event_type": str(event_type),
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+            **(payload if isinstance(payload, dict) else {}),
+        }
+        self.route6_append_jsonl(Path(output_dir) / "route6_events.jsonl", record)
+
+    def route6_write_state_artifact(self) -> None:
+        state = getattr(self, "llm_route6_state", {}) if isinstance(getattr(self, "llm_route6_state", {}), dict) else {}
+        output_dir = state.get("output_dir")
+        if not output_dir:
+            return
+        self.route6_write_json_artifact(Path(str(output_dir)) / "route6_state.json", state)
+
+    def route6_house_output_dir(self, output_dir: Path, house_id: str) -> Path:
+        house_dir = Path(output_dir) / "houses" / f"house_{str(house_id or '').strip()}"
+        (house_dir / "pointcloud").mkdir(parents=True, exist_ok=True)
+        (house_dir / "map").mkdir(parents=True, exist_ok=True)
+        (house_dir / "entrance").mkdir(parents=True, exist_ok=True)
+        return house_dir
+
+    def route6_initialize_run(self, *, force_new: bool = False) -> Path:
+        self.ensure_route6_state()
+        state = getattr(self, "llm_route6_state", {}) if isinstance(getattr(self, "llm_route6_state", {}), dict) else {}
+        prior_house_states = self.route6_house_states()
+        output_dir = Path(str(state.get("output_dir", ""))) if state.get("output_dir") else None
+        if force_new or output_dir is None or not output_dir.exists():
+            output_dir = self.make_route6_output_dir()
+        base_config = getattr(self, "map_config", {}) if isinstance(getattr(self, "map_config", {}), dict) else {}
+        try:
+            self.route6_runtime_map_config = json.loads(json.dumps(base_config))
+        except Exception:
+            self.route6_runtime_map_config = dict(base_config)
+        self.llm_route6_state = {
+            "schema": "route6_state_v1",
+            "mode": "route6_nearest_house_pointcloud_map",
+            "stage": "INIT_RUN",
+            "output_dir": str(output_dir),
+            "design_doc": str(self.route6_design_doc_path()),
+            "house_states": prior_house_states,
+            "processed_house_ids": list(state.get("processed_house_ids", [])) if isinstance(state.get("processed_house_ids", []), list) and not force_new else [],
+            "created_at": state.get("created_at", datetime.now().isoformat(timespec="seconds")),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(output_dir / "route6_state.json", self.llm_route6_state)
+        self.route6_set_stage("INIT_RUN", "initializing Route 6 nearest-house exploration.")
+        self.route6_set_stage("LOAD_MAP", "using current map config for Route 6 ranking.")
+        self.route6_set_stage("RANK_HOUSES", "ranking nearest reachable houses.")
+        candidates = self.route6_rank_mapping_house_candidates()
+        selected = route6_map_builder.select_next_house_candidate(candidates)
+        selected_house_id = str(selected.get("house_id", "") or "")
+        self.llm_route6_state.update({
+            "stage": "SELECT_HOUSE" if selected else "FAILED",
+            "current_pose": self.route6_current_pose(),
+            "selected_house_id": selected_house_id,
+            "selected_candidate": selected,
+            "candidate_count": len(candidates),
+            "max_houses": self.llm_route6_max_houses_var.get(),
+            "runtime_minutes": self.llm_route6_runtime_min_var.get(),
+            "standoff_cm": self.llm_route6_standoff_cm_var.get(),
+            "scan_z_cm": self.llm_route6_scan_z_cm_var.get(),
+            "occupancy_resolution_m": self.llm_route6_occupancy_resolution_m_var.get(),
+            "coverage_threshold": self.llm_route6_coverage_threshold_var.get(),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        self.route6_write_json_artifact(output_dir / "route6_state.json", self.llm_route6_state)
+        self.route6_write_house_queue(output_dir, candidates, selected)
+        self.route6_set_stage("SELECT_HOUSE" if selected else "FAILED", f"selected house={selected_house_id or 'n/a'} from candidates={len(candidates)}.")
+        self.route6_log_event(
+            output_dir,
+            "init_run",
+            {
+                "stage": self.llm_route6_state["stage"],
+                "selected_house_id": selected_house_id,
+                "candidate_count": len(candidates),
+            },
+        )
+        self.llm_route6_stage_var.set(f"Stage: {self.llm_route6_state['stage']}")
+        self.llm_route6_current_house_var.set(f"Current house: {selected_house_id or 'n/a'}")
+        self.llm_route6_queue_var.set(f"House queue: candidates={len(candidates)}")
+        self.llm_route6_output_dir_var.set(f"Output: {output_dir}")
+        self.llm_route6_map_status_var.set("Map: waiting for pointcloud artifacts")
+        return output_dir
+
+    def route6_write_cumulative_polygon_artifact(self, output_dir: Path, house_id: str, polygon: Dict[str, Any]) -> Path:
+        out_path = Path(output_dir)
+        hid = str(house_id or "").strip()
+        by_house = self.llm_route6_state.setdefault("map_polygons_by_house", {})
+        if not isinstance(by_house, dict):
+            by_house = {}
+            self.llm_route6_state["map_polygons_by_house"] = by_house
+        if hid and isinstance(polygon, dict):
+            by_house[hid] = self.route6_json_safe(polygon)
+        polygons = [
+            item
+            for _hid, item in sorted(by_house.items(), key=lambda pair: str(pair[0]))
+            if isinstance(item, dict)
+        ]
+        path = out_path / "map" / "route6_polygons.json"
+        self.route6_write_json_artifact(
+            path,
+            {
+                "schema": "route6_polygons_v1",
+                "polygons": polygons,
+                "polygon_count": len(polygons),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        self.route6_write_state_artifact()
+        return path
+
+    def route6_write_cumulative_corrected_config(
+        self,
+        output_dir: Path,
+        house_id: str,
+        corrected_house: Dict[str, Any],
+    ) -> Path:
+        out_path = Path(output_dir)
+        hid = str(house_id or "").strip()
+        records = self.llm_route6_state.setdefault("corrected_house_records_by_id", {})
+        if not isinstance(records, dict):
+            records = {}
+            self.llm_route6_state["corrected_house_records_by_id"] = records
+        if hid and isinstance(corrected_house, dict) and corrected_house:
+            records[hid] = self.route6_json_safe(corrected_house)
+        base_config = getattr(self, "map_config", {}) if isinstance(getattr(self, "map_config", {}), dict) else {}
+        try:
+            cumulative = json.loads(json.dumps(base_config))
+        except Exception:
+            cumulative = dict(base_config)
+        houses = cumulative.get("houses", []) if isinstance(cumulative.get("houses"), list) else []
+        for house in houses:
+            if not isinstance(house, dict):
+                continue
+            record = records.get(str(house.get("id", house.get("house_id", "")) or "").strip())
+            if isinstance(record, dict):
+                house.update(record)
+        path = out_path / "map" / "route6_corrected_houses_config.json"
+        self.route6_write_json_artifact(path, cumulative)
+        self.route6_runtime_map_config = cumulative
+        self.route6_write_state_artifact()
+        return path
+
+    def route6_write_cumulative_global_occupancy(self, output_dir: Path) -> Dict[str, Any]:
+        out_path = Path(output_dir)
+        map_dir = out_path / "map"
+        map_dir.mkdir(parents=True, exist_ok=True)
+        states = self.route6_house_states()
+        clouds: List[np.ndarray] = []
+        house_ids: List[str] = []
+        source_paths: List[str] = []
+        for hid, state in sorted(states.items(), key=lambda pair: str(pair[0])):
+            item = state if isinstance(state, dict) else {}
+            status = str(item.get("status", "") or "")
+            if status not in {"mapped_complete", "mapped_partial", "searched", "searched_no_entry"}:
+                continue
+            pointcloud_path = Path(str(item.get("merged_pointcloud_path", "") or ""))
+            if not pointcloud_path.is_file():
+                continue
+            try:
+                cloud = np.load(pointcloud_path)
+            except Exception as exc:
+                self.route6_log_event(out_path, "global_occupancy_warning", {"house_id": str(hid), "path": str(pointcloud_path), "error": str(exc)})
+                continue
+            cloud = np.asarray(cloud)
+            if cloud.ndim != 2 or cloud.shape[0] <= 0 or cloud.shape[1] < 3:
+                continue
+            clouds.append(cloud.astype(np.float32, copy=False))
+            house_ids.append(str(hid))
+            source_paths.append(str(pointcloud_path))
+        if not clouds:
+            self.llm_route6_state["global_occupancy"] = {}
+            self.route6_write_state_artifact()
+            return {}
+        raw_point_count = int(sum(int(cloud.shape[0]) for cloud in clouds))
+        resolution_m = self.route6_float_param(self.llm_route6_occupancy_resolution_m_var, 0.25, min_value=0.05, max_value=5.0)
+        merged = route6_map_builder.voxel_downsample_point_cloud(
+            np.concatenate(clouds, axis=0),
+            voxel_size_m=float(resolution_m),
+            fixed_world_bounds_cm=route6_map_builder.DEFAULT_ROUTE6_FIXED_WORLD_BOUNDS_CM,
+            max_points=route6_map_builder.DEFAULT_ROUTE6_UPDATE_MAP_MAX_POINTS,
+        )
+        max_points_global = int(route6_map_builder.DEFAULT_ROUTE6_UPDATE_MAP_MAX_POINTS)
+        occupancy = route6_map_builder.build_occupancy_grid(
+            merged,
+            resolution_m=float(resolution_m),
+            occupied_threshold=1,
+            fixed_world_bounds_cm=route6_map_builder.DEFAULT_ROUTE6_FIXED_WORLD_BOUNDS_CM,
+        )
+        grid_path = map_dir / "route6_occupancy_grid.npy"
+        metadata_path = map_dir / "route6_occupancy_grid.json"
+        preview_path = map_dir / "route6_occupancy_grid.png"
+        np.save(grid_path, np.asarray(occupancy["grid"], dtype=np.int16))
+        cv2.imwrite(str(preview_path), route6_map_builder.occupancy_preview_image(occupancy))
+        metadata = route6_map_builder.occupancy_metadata(occupancy)
+        metadata.update({
+            "schema": "route6_global_occupancy_grid_v1",
+            "scope": "run_global",
+            "house_ids": house_ids,
+            "house_count": len(house_ids),
+            "source_pointcloud_count": len(source_paths),
+            "source_pointcloud_paths": source_paths,
+            "raw_point_count": int(raw_point_count),
+            "merged_point_count": int(merged.shape[0]),
+            "max_points_global": int(max_points_global),
+            "pointcloud_voxel_size_m": float(resolution_m),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        self.route6_write_json_artifact(metadata_path, metadata)
+        record = {
+            "schema": metadata["schema"],
+            "scope": metadata["scope"],
+            "house_ids": house_ids,
+            "source_pointcloud_count": len(source_paths),
+            "raw_point_count": int(raw_point_count),
+            "merged_point_count": int(merged.shape[0]),
+            "pointcloud_voxel_size_m": float(resolution_m),
+            "occupied_cell_count": int(metadata.get("occupied_cell_count", 0) or 0),
+            "grid_path": str(grid_path),
+            "metadata_path": str(metadata_path),
+            "preview_path": str(preview_path),
+            "updated_at": metadata["updated_at"],
+        }
+        self.llm_route6_state["global_occupancy"] = record
+        try:
+            layered = route6_map_builder.write_route6_layered_occupancy_artifacts(
+                out_path,
+                merged,
+                layer_z_cm=route6_map_builder.DEFAULT_ROUTE6_LAYER_Z_CM,
+                layer_band_cm=route6_map_builder.DEFAULT_ROUTE6_LAYER_BAND_CM,
+                resolution_m=float(resolution_m),
+                occupied_threshold=route6_map_builder.DEFAULT_ROUTE6_LAYER_OCCUPIED_THRESHOLD,
+            )
+            record["layered_occupancy_dir"] = str(layered.get("layered_occupancy_dir", "") or "")
+            record["layered_manifest_path"] = str(layered.get("manifest_path", "") or "")
+            record["layer_count"] = int(layered.get("layer_count", 0) or 0)
+            self.llm_route6_state["route6_update_map"] = {
+                "schema": "route6_update_map_state_v1",
+                "source": "route6_global_occupancy",
+                "manifest_path": record["layered_manifest_path"],
+                "layered_occupancy_dir": record["layered_occupancy_dir"],
+                "layer_count": record["layer_count"],
+                "source_pointcloud_count": len(source_paths),
+                "source_pointcloud_paths": source_paths,
+                "raw_point_count": int(raw_point_count),
+                "merged_point_count": int(merged.shape[0]),
+                "pointcloud_voxel_size_m": float(resolution_m),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        except Exception as exc:
+            self.route6_log_event(out_path, "route6_update_map_warning", {"error": str(exc)})
+        self.route6_log_event(out_path, "global_occupancy_updated", record)
+        self.route6_write_state_artifact()
+        return record
+
+    def route6_plan_selected_house_scan_points(self, output_dir: Path, house_id: str) -> List[Dict[str, Any]]:
+        self.ensure_route6_state()
+        hid = str(house_id or "").strip()
+        points: List[Dict[str, Any]] = []
+        selected = self.llm_route6_state.get("selected_candidate", {}) if isinstance(self.llm_route6_state.get("selected_candidate"), dict) else {}
+        pose = dict(selected.get("nearest_scan_pose", {}) if isinstance(selected.get("nearest_scan_pose"), dict) else {})
+        scout_point: Dict[str, Any] = {}
+        if hid and pose:
+            facade = str(pose.get("facade", selected.get("nearest_facade", "west")) or "west")
+            scout_point = {
+                "scan_id": f"{hid}_{facade}_route6_nearest_scout_000",
+                "house_id": hid,
+                "facade": facade,
+                "facade_id": f"{hid}_{facade}",
+                "x": float(pose.get("x", 0.0) or 0.0),
+                "y": float(pose.get("y", 0.0) or 0.0),
+                "z": float(pose.get("z", self.llm_route6_scan_z_cm_var.get() or 450.0) or 450.0),
+                "yaw_deg": float(pose.get("yaw_deg", 0.0) or 0.0),
+                "standoff_cm": float(pose.get("standoff_cm", self.llm_route6_standoff_cm_var.get() or 850.0) or 850.0),
+                "capture_trigger": "arrive_align_hover_capture",
+                "status": "planned",
+                "view_type": "route6_nearest_facade_scout",
+                "route6_source": "nearest_candidate_scout",
+            }
+        if hid and callable(getattr(self, "active_nbv_initial_scan_points", None)):
+            try:
+                points = [
+                    dict(point)
+                    for point in self.active_nbv_initial_scan_points(hid)
+                    if isinstance(point, dict)
+                ]
+            except Exception as exc:
+                self.route6_log_event(Path(output_dir), "scan_point_plan_warning", {"house_id": hid, "error": str(exc)})
+                points = []
+        if scout_point:
+            def _same_scan_pose(point: Dict[str, Any]) -> bool:
+                try:
+                    return (
+                        str(point.get("facade", "") or "") == str(scout_point.get("facade", "") or "")
+                        and abs(float(point.get("x", 0.0)) - float(scout_point.get("x", 0.0))) <= 1.0
+                        and abs(float(point.get("y", 0.0)) - float(scout_point.get("y", 0.0))) <= 1.0
+                    )
+                except Exception:
+                    return False
+
+            if not any(_same_scan_pose(point) for point in points if isinstance(point, dict)):
+                points = [scout_point] + points
+            elif not points:
+                points = [scout_point]
+        try:
+            scan_point_limit = int(float(getattr(self, "llm_route6_scan_point_limit_override", 0) or 0))
+        except Exception:
+            scan_point_limit = 0
+        if scan_point_limit > 0:
+            points = points[:scan_point_limit]
+        house_dir = self.route6_house_output_dir(Path(output_dir), hid)
+        payload = {
+            "schema": "route6_scan_points_v1",
+            "target_house_id": hid,
+            "scan_points": points,
+            "planned_scan_count": len(points),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(house_dir / "scan_points.json", payload)
+        self.route6_write_json_artifact(Path(output_dir) / "scan_points.json", payload)
+        self.llm_route6_state["scan_points"] = points
+        self.llm_route6_state["planned_scan_count"] = len(points)
+        self.route6_write_state_artifact()
+        self.route6_log_event(Path(output_dir), "scan_points_planned", {"house_id": hid, "planned_scan_count": len(points)})
+        return points
+
+    def route6_read_lidar_rows(self, output_dir: Path) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        candidates = [Path(output_dir) / "lidar_capture_log.jsonl"]
+        candidates.extend(sorted((Path(output_dir) / "facade_observations").glob("*/lidar_capture_log.jsonl")))
+        candidates.extend(sorted((Path(output_dir) / "houses").glob("house_*/lidar_capture_log.jsonl")))
+        for path in candidates:
+            if not path.is_file():
+                continue
+            if callable(getattr(self, "read_jsonl_artifact", None)):
+                rows.extend(self.read_jsonl_artifact(path))
+            else:
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    text = line.strip()
+                    if text:
+                        rows.append(json.loads(text))
+        return rows
+
+    def route6_filter_rows_for_house(
+        self,
+        rows: List[Dict[str, Any]],
+        house_id: str,
+        scan_points: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        hid = str(house_id or "").strip()
+        if not hid:
+            return list(rows)
+        scan_ids = {
+            str(point.get("scan_id", "") or "").strip()
+            for point in (scan_points or [])
+            if isinstance(point, dict) and str(point.get("scan_id", "") or "").strip()
+        }
+        has_house_tags = any(str(row.get("house_id", row.get("target_house_id", "")) or "").strip() for row in rows if isinstance(row, dict))
+        selected: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_house = str(row.get("house_id", row.get("target_house_id", "")) or "").strip()
+            row_scan = str(row.get("scan_id", "") or "").strip()
+            if has_house_tags:
+                if row_house == hid:
+                    selected.append(row)
+            elif not scan_ids or row_scan in scan_ids:
+                selected.append(row)
+        return selected
+
+    def route6_resolve_artifact_path(self, output_dir: Path, value: Any) -> Path:
+        raw = str(value or "").strip()
+        if not raw:
+            return Path(output_dir) / ".route6_missing_artifact"
+        path = Path(raw)
+        if path.is_absolute():
+            return path
+        return (Path(output_dir) / path).resolve()
+
+    def route6_build_entrance_capture_manifest(
+        self,
+        output_dir: Path,
+        house_id: str,
+        scan_points: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        out_path = Path(output_dir)
+        hid = str(house_id or "").strip()
+        rows = self.route6_filter_rows_for_house(self.route6_read_lidar_rows(out_path), hid, scan_points)
+        included: List[Dict[str, Any]] = []
+        excluded: List[Dict[str, Any]] = []
+        for index, row in enumerate(rows, start=1):
+            item = dict(row if isinstance(row, dict) else {})
+            capture_dir = self.route6_resolve_artifact_path(out_path, item.get("capture_dir", ""))
+            rgb_path = self.route6_resolve_artifact_path(out_path, item.get("rgb_path", ""))
+            depth_path = self.route6_resolve_artifact_path(out_path, item.get("depth_npy_path", item.get("depth_path", "")))
+            camera_info_path = self.route6_resolve_artifact_path(out_path, item.get("camera_info_path", ""))
+            if not str(item.get("rgb_path", "") or "").strip() and capture_dir.is_dir():
+                rgb_path = capture_dir / "rgb.png"
+            if not str(item.get("depth_npy_path", item.get("depth_path", "")) or "").strip() and capture_dir.is_dir():
+                depth_path = capture_dir / "depth.npy"
+            if not str(item.get("camera_info_path", "") or "").strip() and capture_dir.is_dir():
+                camera_info_path = capture_dir / "camera_info.json"
+            try:
+                point_count = int(float(item.get("point_count", 0) or 0))
+            except Exception:
+                point_count = 0
+            reason = ""
+            if not str(item.get("scan_id", "") or "").strip():
+                reason = "not_scan_capture"
+            elif item.get("capture_guard_passed") is not True:
+                reason = "capture_guard_failed_or_missing"
+            elif point_count <= 0:
+                reason = "point_count_not_positive"
+            elif not capture_dir.is_dir():
+                reason = "capture_dir_missing"
+            elif not rgb_path.is_file():
+                reason = "rgb_missing"
+            elif not depth_path.is_file():
+                reason = "depth_missing"
+            elif not camera_info_path.is_file():
+                reason = "camera_info_missing"
+            manifest_row = {
+                **self.route6_json_safe(item),
+                "manifest_index": index,
+                "capture_dir": str(capture_dir),
+                "rgb_path": str(rgb_path),
+                "depth_npy_path": str(depth_path),
+                "camera_info_path": str(camera_info_path),
+            }
+            if reason:
+                excluded.append({**manifest_row, "reason": reason})
+            else:
+                included.append(manifest_row)
+        return {
+            "schema": "route6_entrance_capture_manifest_v1",
+            "run_dir": str(out_path),
+            "house_id": hid,
+            "included_count": len(included),
+            "excluded_count": len(excluded),
+            "included_captures": included,
+            "excluded_captures": excluded,
+            "route5_capture_analysis_available": bool(callable(getattr(self, "route5_run_capture_analysis", None))),
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+
+    def route6_load_json_artifact(self, path: Path, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        try:
+            target = Path(path)
+            if target.is_file():
+                payload = json.loads(target.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    return payload
+        except Exception:
+            pass
+        return dict(default or {})
+
+    def route6_build_close_confirm_scan_plan(
+        self,
+        output_dir: Path,
+        house_id: str,
+        candidates: List[Dict[str, Any]],
+        house_state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        out_path = Path(output_dir)
+        hid = str(house_id or "").strip()
+        house_dir = self.route6_house_output_dir(out_path, hid)
+        entrance_dir = house_dir / "entrance"
+        entrance_dir.mkdir(parents=True, exist_ok=True)
+        state = house_state if isinstance(house_state, dict) else {}
+        map_artifacts = state.get("map_artifacts", {}) if isinstance(state.get("map_artifacts", {}), dict) else {}
+        polygon = map_artifacts.get("polygon", {}) if isinstance(map_artifacts.get("polygon", {}), dict) else {}
+        bbox = polygon.get("bbox", {}) if isinstance(polygon.get("bbox", {}), dict) else {}
+        map_config = self.route6_get_runtime_map_config()
+        if not bbox:
+            houses = map_config.get("houses", []) if isinstance(map_config.get("houses"), list) else []
+            house = next(
+                (item for item in houses if isinstance(item, dict) and str(item.get("id", item.get("house_id", ""))) == hid),
+                None,
+            )
+            bbox = route6_map_builder.house_world_bbox(map_config, house) if isinstance(house, dict) else {}
+        scan_points = self.llm_route6_state.get("scan_points", []) if isinstance(self.llm_route6_state.get("scan_points", []), list) else []
+        selected = self.llm_route6_state.get("selected_candidate", {}) if isinstance(self.llm_route6_state.get("selected_candidate", {}), dict) else {}
+        fallback_facade = str(selected.get("nearest_facade", "") or "")
+        if not fallback_facade and scan_points:
+            fallback_facade = str((scan_points[0] if isinstance(scan_points[0], dict) else {}).get("facade", "") or "")
+        if fallback_facade not in route6_map_builder.ROUTE6_FACADES:
+            fallback_facade = "west"
+        base_standoff = self.route6_float_param(self.llm_route6_standoff_cm_var, 850.0, min_value=350.0, max_value=5000.0)
+        confirm_standoff = max(350.0, min(float(base_standoff), float(base_standoff) * 0.65))
+        scan_z = self.route6_float_param(self.llm_route6_scan_z_cm_var, 450.0, min_value=100.0, max_value=5000.0)
+        valid_candidates = [item for item in candidates if isinstance(item, dict)]
+        planned_points: List[Dict[str, Any]] = []
+        for idx, candidate in enumerate(valid_candidates[:3]):
+            facade = str(candidate.get("facade", candidate.get("source_facade", fallback_facade)) or fallback_facade).lower()
+            if facade not in route6_map_builder.ROUTE6_FACADES:
+                facade = fallback_facade
+            pose: Dict[str, Any] = {}
+            if isinstance(bbox, dict) and all(key in bbox for key in ("min_x", "max_x", "min_y", "max_y")):
+                pose = route6_map_builder.facade_scan_pose_for_bbox(
+                    bbox,
+                    facade,
+                    current_pose=self.route6_current_pose(),
+                    standoff_cm=confirm_standoff,
+                    scan_z_cm=scan_z,
+                )
+            source_scan = scan_points[min(idx, len(scan_points) - 1)] if scan_points and isinstance(scan_points[min(idx, len(scan_points) - 1)], dict) else {}
+            if not pose and source_scan:
+                pose = {
+                    "x": float(source_scan.get("x", 0.0) or 0.0),
+                    "y": float(source_scan.get("y", 0.0) or 0.0),
+                    "z": float(source_scan.get("z", scan_z) or scan_z),
+                    "yaw_deg": float(source_scan.get("yaw_deg", 0.0) or 0.0),
+                    "facade": facade,
+                    "standoff_cm": confirm_standoff,
+                }
+            if not pose:
+                continue
+            planned_points.append({
+                **self.route6_json_safe(pose),
+                "scan_id": f"{hid}_{facade}_route6_close_confirm_{idx:03d}",
+                "house_id": hid,
+                "facade": facade,
+                "candidate_index": idx,
+                "candidate_class": str(candidate.get("class_name", candidate.get("class_name_normalized", "candidate")) or "candidate"),
+                "candidate_confidence": candidate.get("confidence", ""),
+                "source_frame_name": str(candidate.get("frame_name", candidate.get("image_name", "")) or ""),
+                "source_candidate": self.route6_json_safe(candidate),
+                "view_type": "route6_close_confirm_scan",
+                "capture_trigger": "arrive_align_hover_capture",
+                "status": "planned",
+                "recommended_validator": "route5_capture_guard_plus_obstacle_validation",
+            })
+        payload = {
+            "schema": "route6_close_confirm_scan_plan_v1",
+            "house_id": hid,
+            "candidate_count": len(valid_candidates),
+            "planned_scan_count": len(planned_points),
+            "scan_points": planned_points,
+            "source": "route5_entrance_candidates",
+            "obstacle_validation_status": "pending",
+            "recommended_executor": "active_nbv_execute_scan_points",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(entrance_dir / "close_confirm_scan_plan.json", payload)
+        return payload
+
+    def route6_run_route5_capture_analysis_for_house(
+        self,
+        output_dir: Path,
+        house_id: str,
+        manifest: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        included_count = int(manifest.get("included_count", 0) or 0)
+        if included_count <= 0:
+            return {"ran": False, "reason": "no_included_captures"}
+        runner = getattr(self, "route5_run_capture_analysis", None)
+        if not callable(runner):
+            return {"ran": False, "reason": "route5_capture_analysis_unavailable"}
+        out_path = Path(output_dir)
+        try:
+            try:
+                summary = runner(out_path, stop_event=self.llm_route6_stop_event)
+            except TypeError:
+                summary = runner(out_path)
+        except Exception as exc:
+            return {"ran": False, "reason": "route5_capture_analysis_failed", "error": str(exc)}
+        summary = summary if isinstance(summary, dict) else {}
+        analysis_dir = Path(str(summary.get("analysis_dir", "") or out_path / "route5_capture_analysis"))
+        if not analysis_dir.is_absolute():
+            analysis_dir = (out_path / analysis_dir).resolve()
+        candidates_path = analysis_dir / "entrance_candidates.json"
+        candidates_payload = self.route6_load_json_artifact(candidates_path, {"candidate_count": 0, "candidates": []})
+        candidates = candidates_payload.get("candidates", []) if isinstance(candidates_payload.get("candidates", []), list) else []
+        candidate_count = int(candidates_payload.get("candidate_count", len(candidates)) or len(candidates))
+        return {
+            "ran": True,
+            "house_id": str(house_id),
+            "status": str(summary.get("status", "unknown") or "unknown"),
+            "summary": self.route6_json_safe(summary),
+            "analysis_dir": str(analysis_dir),
+            "summary_path": str(analysis_dir / "analysis_summary.json"),
+            "entrance_candidates_path": str(candidates_path),
+            "candidate_count": candidate_count,
+            "candidates": candidates,
+        }
+
+    def route6_write_exploration_summary(self, output_dir: Path) -> Path:
+        out_path = Path(output_dir)
+        path = out_path / "route6_exploration_summary.csv"
+        fields = [
+            "house_id",
+            "status",
+            "search_status",
+            "entrance_status",
+            "valid_scan_capture_count",
+            "merged_point_count",
+            "map_status",
+            "map_confidence",
+            "entrance_report_path",
+            "coverage_report_path",
+            "corrected_config_path",
+        ]
+        states = self.route6_house_states()
+        rows: List[Dict[str, Any]] = []
+        for hid, state in sorted(states.items(), key=lambda item: str(item[0])):
+            item = state if isinstance(state, dict) else {}
+            artifacts = item.get("map_artifacts", {}) if isinstance(item.get("map_artifacts", {}), dict) else {}
+            quality = artifacts.get("quality_report", {}) if isinstance(artifacts.get("quality_report", {}), dict) else {}
+            polygon = artifacts.get("polygon", {}) if isinstance(artifacts.get("polygon", {}), dict) else {}
+            polygon_quality = polygon.get("quality", {}) if isinstance(polygon.get("quality", {}), dict) else {}
+            confidence = item.get("map_confidence", quality.get("mean_map_confidence", polygon_quality.get("confidence", "")))
+            rows.append({
+                "house_id": str(hid),
+                "status": str(item.get("status", "") or ""),
+                "search_status": str(item.get("search_status", "") or ""),
+                "entrance_status": str(item.get("entrance_status", "") or ""),
+                "valid_scan_capture_count": int(item.get("valid_scan_capture_count", 0) or 0),
+                "merged_point_count": int(item.get("merged_point_count", 0) or 0),
+                "map_status": str(item.get("map_status", "") or ""),
+                "map_confidence": confidence,
+                "entrance_report_path": str(item.get("entrance_report_path", "") or ""),
+                "coverage_report_path": str(item.get("coverage_report_path", "") or ""),
+                "corrected_config_path": str(artifacts.get("corrected_config_path", "") or ""),
+            })
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+        return path
+
+    def route6_write_run_quality_report(self, output_dir: Path) -> Dict[str, Any]:
+        out_path = Path(output_dir)
+        states = self.route6_house_states()
+        map_config = getattr(self, "map_config", {}) if isinstance(getattr(self, "map_config", {}), dict) else {}
+        houses = map_config.get("houses", []) if isinstance(map_config.get("houses"), list) else []
+        total = len(houses)
+        mapped_statuses = {"mapped_complete", "mapped_partial", "searched", "searched_no_entry"}
+        searched_statuses = {"searched", "searched_no_entry"}
+        blocked_statuses = {"blocked", "terminal_blocked"}
+        occupied_cells = 0
+        polygon_count = 0
+        confidences: List[float] = []
+        corrected_path = str(out_path / "map" / "route6_corrected_houses_config.json")
+        warnings: List[str] = []
+        for hid, state in states.items():
+            item = state if isinstance(state, dict) else {}
+            artifacts = item.get("map_artifacts", {}) if isinstance(item.get("map_artifacts", {}), dict) else {}
+            quality = artifacts.get("quality_report", {}) if isinstance(artifacts.get("quality_report", {}), dict) else {}
+            polygon = artifacts.get("polygon", {}) if isinstance(artifacts.get("polygon", {}), dict) else {}
+            polygon_quality = polygon.get("quality", {}) if isinstance(polygon.get("quality", {}), dict) else {}
+            occupied_cells += int(quality.get("global_occupied_cell_count", 0) or 0)
+            polygon_count += int(quality.get("global_polygon_count", 1 if polygon.get("points") else 0) or 0)
+            confidence_value = polygon_quality.get("confidence", quality.get("mean_map_confidence", item.get("map_confidence", None)))
+            try:
+                confidences.append(float(confidence_value))
+            except Exception:
+                pass
+            if artifacts.get("corrected_config_path"):
+                corrected_path = str(artifacts.get("corrected_config_path"))
+            if item.get("blocked_reason"):
+                warnings.append(f"house_{hid}: {item.get('blocked_reason')}")
+        statuses = [str(state.get("status", "") or "") for state in states.values() if isinstance(state, dict)]
+        global_occupancy = self.llm_route6_state.get("global_occupancy", {}) if isinstance(self.llm_route6_state.get("global_occupancy", {}), dict) else {}
+        global_occupied_cells = occupied_cells
+        try:
+            if global_occupancy.get("occupied_cell_count", "") != "":
+                global_occupied_cells = int(global_occupancy.get("occupied_cell_count", 0) or 0)
+        except Exception:
+            global_occupied_cells = occupied_cells
+        quality_report = {
+            "schema": "route6_map_quality_report_v1",
+            "run_dir": str(out_path),
+            "house_count_total": total,
+            "house_count_mapped": len([status for status in statuses if status in mapped_statuses]),
+            "house_count_searched": len([status for status in statuses if status in searched_statuses]),
+            "house_count_blocked": len([status for status in statuses if status in blocked_statuses]),
+            "house_count_needs_rescan": len([status for status in statuses if status == "needs_rescan"]),
+            "global_occupied_cell_count": int(global_occupied_cells),
+            "global_polygon_count": int(polygon_count),
+            "mean_map_confidence": round(float(sum(confidences) / max(1, len(confidences))), 4) if confidences else 0.0,
+            "corrected_config_path": corrected_path,
+            "exploration_summary_path": str(out_path / "route6_exploration_summary.csv"),
+            "global_occupancy_grid_path": str(global_occupancy.get("grid_path", "") or ""),
+            "global_occupancy_metadata_path": str(global_occupancy.get("metadata_path", "") or ""),
+            "global_occupancy_preview_path": str(global_occupancy.get("preview_path", "") or ""),
+            "global_occupancy_house_ids": list(global_occupancy.get("house_ids", [])) if isinstance(global_occupancy.get("house_ids", []), list) else [],
+            "global_occupancy_source_pointcloud_count": int(global_occupancy.get("source_pointcloud_count", 0) or 0),
+            "global_occupancy_merged_point_count": int(global_occupancy.get("merged_point_count", 0) or 0),
+            "warnings": warnings,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(out_path / "map" / "route6_map_quality_report.json", quality_report)
+        return quality_report
+
+    def route6_write_run_artifacts(self, output_dir: Path) -> Dict[str, Any]:
+        out_path = Path(output_dir)
+        summary_path = self.route6_write_exploration_summary(out_path)
+        global_occupancy = self.route6_write_cumulative_global_occupancy(out_path)
+        quality = self.route6_write_run_quality_report(out_path)
+        self.llm_route6_state["exploration_summary_path"] = str(summary_path)
+        self.llm_route6_state["run_quality_report"] = quality
+        self.route6_write_state_artifact()
+        return {"summary_path": str(summary_path), "quality_report": quality, "global_occupancy": global_occupancy}
+
+    def route6_map_status_style(self, status: str) -> Dict[str, str]:
+        status = str(status or "").strip().lower()
+        colors = {
+            "active": "#22d3ee",
+            "captured": "#22c55e",
+            "searched": "#22c55e",
+            "searched_no_entry": "#94a3b8",
+            "mapped_complete": "#22c55e",
+            "mapped_partial": "#facc15",
+            "needs_rescan": "#fb923c",
+            "blocked": "#ef4444",
+            "terminal_blocked": "#ef4444",
+            "planned": "#facc15",
+        }
+        return {"color": colors.get(status, "#a78bfa"), "outline_color": "#111827"}
+
+    def route6_map_route_points(self) -> List[Dict[str, Any]]:
+        state = getattr(self, "llm_route6_state", {}) if isinstance(getattr(self, "llm_route6_state", {}), dict) else {}
+        points: List[Dict[str, Any]] = []
+        selected = state.get("selected_candidate", {}) if isinstance(state.get("selected_candidate", {}), dict) else {}
+        pose = selected.get("nearest_scan_pose", {}) if isinstance(selected.get("nearest_scan_pose", {}), dict) else {}
+        if pose:
+            points.append({
+                **self.route6_json_safe(pose),
+                "label": f"{selected.get('house_id', '')}_nearest",
+                "route_point_type": "current_target",
+                "status": "active",
+                **self.route6_map_status_style("active"),
+            })
+        for idx, point in enumerate(state.get("scan_points", []) if isinstance(state.get("scan_points", []), list) else [], start=1):
+            if not isinstance(point, dict):
+                continue
+            try:
+                float(point.get("x"))
+                float(point.get("y"))
+            except Exception:
+                continue
+            status = str(point.get("status", "planned") or "planned").strip().lower()
+            scan_id = str(point.get("scan_id", "") or f"route6_scan_{idx}")
+            points.append({
+                **self.route6_json_safe(point),
+                "label": scan_id,
+                "route_point_type": "scan_point",
+                "status": status,
+                "scan_id": scan_id,
+                "facade": str(point.get("facade", "") or ""),
+                **self.route6_map_status_style(status),
+            })
+        return points
+
+    def route6_map_overlay_points(self) -> List[Dict[str, Any]]:
+        states = self.route6_house_states()
+        points: List[Dict[str, Any]] = []
+        for hid, state in sorted(states.items(), key=lambda item: str(item[0])):
+            item = state if isinstance(state, dict) else {}
+            artifacts = item.get("map_artifacts", {}) if isinstance(item.get("map_artifacts", {}), dict) else {}
+            polygon = artifacts.get("polygon", {}) if isinstance(artifacts.get("polygon", {}), dict) else {}
+            polygon_points = polygon.get("points", []) if isinstance(polygon.get("points", []), list) else []
+            for idx, point in enumerate(polygon_points):
+                if not isinstance(point, dict):
+                    continue
+                try:
+                    wx = float(point.get("x"))
+                    wy = float(point.get("y"))
+                except Exception:
+                    continue
+                points.append({
+                    "x": wx,
+                    "y": wy,
+                    "label": f"{hid}_poly_{idx}",
+                    "status": "polygon",
+                    "color": "#a78bfa",
+                    "outline_color": "#312e81",
+                    "radius_px": 3,
+                })
+            bbox = item.get("map_artifacts", {}).get("polygon", {}).get("bbox", {}) if isinstance(item.get("map_artifacts", {}), dict) else {}
+            if isinstance(bbox, dict) and all(key in bbox for key in ("min_x", "max_x", "min_y", "max_y")):
+                corners = [
+                    (bbox["min_x"], bbox["min_y"]),
+                    (bbox["max_x"], bbox["min_y"]),
+                    (bbox["max_x"], bbox["max_y"]),
+                    (bbox["min_x"], bbox["max_y"]),
+                ]
+                for idx, (wx, wy) in enumerate(corners):
+                    points.append({
+                        "x": float(wx),
+                        "y": float(wy),
+                        "label": f"{hid}_bbox_{idx}",
+                        "status": "corrected_bbox",
+                        "color": "#38bdf8",
+                        "outline_color": "#0f172a",
+                        "radius_px": 4,
+                    })
+        return points
+
+    def refresh_llm_route6_map(self) -> None:
+        self.ensure_route6_state()
+        widget = getattr(self, "llm_route6_map_widget", None)
+        if widget is None:
+            return
+        try:
+            if callable(getattr(self, "load_map_resources", None)) and not self.load_map_resources(force=not bool(getattr(self, "map_config", {}))):
+                self.llm_route6_map_status_var.set("Map: unavailable")
+                return
+            pose = self.route6_current_pose()
+            pose_x = float(pose.get("x", 0.0) or 0.0)
+            pose_y = float(pose.get("y", 0.0) or 0.0)
+            pose_yaw = float(pose.get("yaw", 0.0) or 0.0)
+            houses: List[Dict[str, Any]] = []
+            boxes: List[Dict[str, Any]] = []
+            if callable(getattr(self, "build_map_display", None)):
+                try:
+                    houses, boxes = self.build_map_display({"x": pose_x, "y": pose_y, "yaw": pose_yaw})
+                except Exception:
+                    houses, boxes = [], []
+            map_frame = getattr(self, "llm_route6_map_frame", None)
+            if map_frame is not None and hasattr(widget, "resize_canvas"):
+                try:
+                    available_w = float(map_frame.winfo_width() or widget.canvas.winfo_width() or 1040)
+                    if callable(getattr(self, "route5_map_canvas_size_for_width", None)):
+                        size = self.route5_map_canvas_size_for_width(available_w, image_size=self.map_image_size())
+                    else:
+                        size = {"width": max(760, int(available_w) - 24), "height": 320}
+                    if abs(int(getattr(widget, "_canvas_w", 0)) - size["width"]) > 12 or abs(int(getattr(widget, "_canvas_h", 0)) - size["height"]) > 12:
+                        widget.resize_canvas(size["width"], size["height"])
+                except Exception:
+                    pass
+            widget.set_background_image(getattr(self, "map_image", None))
+            calibration = getattr(self, "map_calibration", {}) if isinstance(getattr(self, "map_calibration", {}), dict) else {}
+            widget.set_calibration(
+                calibration.get("affine_world_to_image"),
+                self.map_image_size() if callable(getattr(self, "map_image_size", None)) else None,
+                [],
+                calibration.get("homography_world_to_image"),
+            )
+            widget.set_image_layer_offset(*getattr(self, "map_display_offset_px", (0.0, 0.0)))
+            widget.set_house_boxes(boxes)
+            widget.update_houses([])
+            widget.update_uav(pose_x, pose_y, pose_yaw)
+            route_points = self.route6_map_route_points()
+            overlay_points = self.route6_map_overlay_points()
+            widget.set_route_plan({"route_points": route_points})
+            widget.set_point_overlay_points(overlay_points)
+            self.llm_route6_map_status_var.set(
+                f"Map: route_points={len(route_points)} overlay_points={len(overlay_points)}"
+            )
+        except tk.TclError:
+            pass
+        except Exception as exc:
+            LOGGER.warning("Refresh LLM Route6_entrance_search v6 map failed: %s", exc)
+            self.llm_route6_map_status_var.set(f"Map: failed: {exc}")
+
+    def route6_update_map_latest_output_dir(self) -> Optional[Path]:
+        self.ensure_route6_state()
+        state_output = str((self.llm_route6_state or {}).get("output_dir", "") or "")
+        if state_output:
+            path = Path(state_output)
+            if path.exists():
+                return path
+        root = self.route6_output_root()
+        if not root.exists():
+            return None
+        candidates = [
+            path
+            for pattern in ("route6_update_map_*", "route6_nearest_map_*")
+            for path in root.glob(pattern)
+            if path.is_dir()
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    def route6_path_is_under(self, path: Path, parent: Path) -> bool:
+        try:
+            Path(path).resolve().relative_to(Path(parent).resolve())
+            return True
+        except Exception:
+            return False
+
+    def route6_capture_folder_pointcloud_paths(self, output_dir: Path) -> List[Path]:
+        out_path = Path(output_dir)
+        paths: List[Path] = []
+        for path in sorted(out_path.glob("houses/house_*/pointcloud/merged_point_cloud_world_standard_m.npy")):
+            if path.is_file() and path not in paths:
+                paths.append(path)
+        logged_frame_dirs = self.route6_logged_capture_frame_dirs(out_path)
+        if logged_frame_dirs:
+            frame_candidates = [frame_dir / "point_cloud_world_standard_m.npy" for frame_dir in logged_frame_dirs]
+        else:
+            frame_candidates = sorted(out_path.glob("frames/frame_*/point_cloud_world_standard_m.npy"))
+        for path in frame_candidates:
+            if path.is_file() and path not in paths:
+                paths.append(path)
+        return paths
+
+    def route6_logged_capture_frame_dirs(self, output_dir: Path) -> List[Path]:
+        out_path = Path(output_dir)
+        log_paths = [
+            out_path / "route6_update_map_capture_log.jsonl",
+            out_path / "lidar_capture_log.jsonl",
+        ]
+        frame_dirs: List[Path] = []
+        seen: set[str] = set()
+        for log_path in log_paths:
+            if not log_path.is_file():
+                continue
+            try:
+                lines = log_path.read_text(encoding="utf-8").splitlines()
+            except Exception:
+                continue
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if str(row.get("capture_kind", "") or "") != "route6_update_map_capture":
+                    continue
+                capture_dir = Path(str(row.get("capture_dir", "") or ""))
+                if not capture_dir:
+                    frame_index = int(row.get("frame_index", 0) or 0)
+                    capture_dir = out_path / "frames" / f"frame_{frame_index:06d}"
+                if not self.route6_path_is_under(capture_dir, out_path):
+                    continue
+                key = str(capture_dir.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    frame_dirs.append(capture_dir)
+            if frame_dirs:
+                break
+        return frame_dirs
+
+    def route6_capture_folder_pointcloud_report_path(self, output_dir: Path) -> Path:
+        return Path(output_dir) / "map" / "pointcloud_processing_report.json"
+
+    def route6_capture_folder_candidate_pointcloud_paths(self, output_dir: Path) -> List[Path]:
+        out_path = Path(output_dir)
+        paths: List[Path] = []
+        allowed_suffixes = {".npy", ".npz", ".csv", ".txt", ".xyz"}
+        name_tokens = ("point", "cloud", "lidar", "xyz")
+        for path in sorted(out_path.rglob("*")):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in allowed_suffixes:
+                continue
+            relative = path.relative_to(out_path)
+            parts = {part.lower() for part in relative.parts}
+            if "map" in parts or "frames" in parts or "houses" in parts:
+                continue
+            if path.name == "point_cloud_world_standard_m.npy":
+                continue
+            lowered = path.name.lower()
+            if path.suffix.lower() == ".xyz" or any(token in lowered for token in name_tokens):
+                paths.append(path)
+        return paths
+
+    def route6_capture_folder_raw_depth_frame_dirs(self, output_dir: Path) -> List[Path]:
+        frames_root = Path(output_dir) / "frames"
+        if not frames_root.exists():
+            return []
+        frame_dirs: List[Path] = []
+        for frame_dir in sorted(path for path in frames_root.glob("frame_*") if path.is_dir()):
+            if (frame_dir / "point_cloud_world_standard_m.npy").is_file():
+                continue
+            if (frame_dir / "depth.npy").is_file() and (frame_dir / "rgb.png").is_file() and (frame_dir / "camera_info.json").is_file():
+                frame_dirs.append(frame_dir)
+        return frame_dirs
+
+    def route6_load_candidate_pointcloud(self, path: Path) -> Tuple[np.ndarray, str]:
+        point_path = Path(path)
+        suffix = point_path.suffix.lower()
+        if suffix == ".npy":
+            cloud = np.asarray(np.load(point_path, allow_pickle=False), dtype=np.float32)
+            return cloud, "npy"
+        if suffix == ".npz":
+            with np.load(point_path, allow_pickle=False) as payload:
+                preferred = [key for key in ("points", "pointcloud", "point_cloud", "cloud", "xyz") if key in payload.files]
+                keys = preferred + [key for key in payload.files if key not in preferred]
+                for key in keys:
+                    cloud = np.asarray(payload[key], dtype=np.float32)
+                    if cloud.ndim == 2 and cloud.shape[1] >= 3 and cloud.shape[0] > 0:
+                        return cloud, f"npz:{key}"
+            return np.zeros((0, 6), dtype=np.float32), "npz:no_usable_array"
+        if suffix in {".csv", ".txt", ".xyz"}:
+            try:
+                cloud = np.asarray(np.genfromtxt(point_path, delimiter=","), dtype=np.float32)
+                if cloud.ndim == 2 and cloud.shape[1] >= 3 and cloud.shape[0] > 0:
+                    return cloud, f"{suffix[1:]}:comma"
+            except Exception:
+                pass
+            cloud = np.asarray(np.genfromtxt(point_path), dtype=np.float32)
+            return cloud, f"{suffix[1:]}:whitespace"
+        return np.zeros((0, 6), dtype=np.float32), f"{suffix}:unsupported"
+
+    def route6_standardize_pointcloud_array(self, cloud: np.ndarray) -> np.ndarray:
+        arr = np.asarray(cloud, dtype=np.float32)
+        if arr.ndim == 1:
+            if arr.size < 3 or arr.size % 3 != 0:
+                return np.zeros((0, 6), dtype=np.float32)
+            arr = arr.reshape((-1, 3))
+        if arr.ndim != 2 or arr.shape[0] <= 0 or arr.shape[1] < 3:
+            return np.zeros((0, 6), dtype=np.float32)
+        arr = arr[np.all(np.isfinite(arr[:, :3]), axis=1)]
+        if arr.shape[0] <= 0:
+            return np.zeros((0, 6), dtype=np.float32)
+        if arr.shape[1] >= 6:
+            return arr[:, :6].astype(np.float32, copy=False)
+        pad = np.zeros((arr.shape[0], 6 - arr.shape[1]), dtype=np.float32)
+        return np.hstack([arr[:, :3], pad]).astype(np.float32, copy=False)
+
+    def route6_update_pointcloud_report_text(self, report: Dict[str, Any]) -> None:
+        text_widget = getattr(self, "route6_pointcloud_report_text", None)
+        if text_widget is None:
+            return
+        try:
+            text_widget.configure(state="normal")
+            text_widget.delete("1.0", tk.END)
+            text_widget.insert(tk.END, json.dumps(self.route6_json_safe(report), indent=2, ensure_ascii=False))
+            text_widget.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+    def route6_process_capture_folder_pointclouds(self, output_dir: Path) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        out_path = Path(output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        report_path = self.route6_capture_folder_pointcloud_report_path(out_path)
+        standard_paths = self.route6_capture_folder_pointcloud_paths(out_path)
+        candidate_paths = self.route6_capture_folder_candidate_pointcloud_paths(out_path)
+        raw_depth_frame_dirs = self.route6_capture_folder_raw_depth_frame_dirs(out_path)
+        log_files = [
+            path
+            for path in (
+                out_path / "lidar_capture_log.jsonl",
+                out_path / "route6_update_map_capture_log.jsonl",
+                out_path / "route6_events.jsonl",
+            )
+            if path.is_file()
+        ]
+        frame_entries: List[Dict[str, Any]] = []
+        postprocessed_paths: List[str] = []
+        args = getattr(self, "args", None)
+        lidar_depth_projection = str(getattr(args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION))
+        min_depth_cm = float(getattr(args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM))
+        max_depth_cm = float(getattr(args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM))
+        for frame_dir in raw_depth_frame_dirs:
+            frame_entry: Dict[str, Any] = {
+                "capture_dir": str(frame_dir),
+                "status": "pending",
+            }
+            try:
+                capture_payload = flight.read_json_object(frame_dir / "capture.json")
+                ensured = flight.ensure_standard_world_cloud_for_capture(
+                    frame_dir,
+                    capture_payload=capture_payload,
+                    lidar_depth_projection=lidar_depth_projection,
+                    min_depth_cm=min_depth_cm,
+                    max_depth_cm=max_depth_cm,
+                )
+                pointcloud_path = Path(str(ensured.get("point_cloud_world_standard_m_npy_path", "") or ""))
+                point_count = int(ensured.get("point_count", 0) or 0)
+                if pointcloud_path.is_file():
+                    if point_count <= 0:
+                        try:
+                            point_count = int(np.load(pointcloud_path, mmap_mode="r").shape[0])
+                        except Exception:
+                            point_count = 0
+                    frame_entry.update(
+                        {
+                            "status": "depth_postprocessed",
+                            "point_cloud_world_standard_m_npy_path": str(pointcloud_path),
+                            "point_count": int(point_count),
+                            "depth_projection_selected": ensured.get("depth_projection_selected", ""),
+                        }
+                    )
+                    postprocessed_paths.append(str(pointcloud_path))
+                else:
+                    frame_entry.update({"status": "no_pointcloud_output", "result": ensured})
+            except Exception as exc:
+                frame_entry.update({"status": "failed", "error": str(exc)})
+            frame_entries.append(frame_entry)
+        standard_paths = self.route6_capture_folder_pointcloud_paths(out_path)
+        entries: List[Dict[str, Any]] = []
+        created_paths: List[str] = []
+        next_index = len(standard_paths) + 1
+        for candidate in candidate_paths:
+            entry: Dict[str, Any] = {
+                "path": str(candidate),
+                "size_bytes": int(candidate.stat().st_size),
+                "status": "pending",
+            }
+            try:
+                raw_cloud, loader = self.route6_load_candidate_pointcloud(candidate)
+                standard_cloud = self.route6_standardize_pointcloud_array(raw_cloud)
+                entry["loader"] = loader
+                entry["raw_shape"] = list(np.asarray(raw_cloud).shape)
+                entry["standard_shape"] = list(standard_cloud.shape)
+                if standard_cloud.shape[0] <= 0:
+                    entry["status"] = "invalid_shape"
+                    entries.append(entry)
+                    continue
+                frame_dir = out_path / "frames" / f"frame_{next_index:06d}"
+                frame_dir.mkdir(parents=True, exist_ok=True)
+                standard_path = frame_dir / "point_cloud_world_standard_m.npy"
+                np.save(standard_path, standard_cloud)
+                entry["status"] = "standardized"
+                entry["standard_pointcloud_path"] = str(standard_path)
+                entry["point_count"] = int(standard_cloud.shape[0])
+                created_paths.append(str(standard_path))
+                next_index += 1
+            except Exception as exc:
+                entry["status"] = "failed"
+                entry["error"] = str(exc)
+            entries.append(entry)
+        refreshed_standard_paths = self.route6_capture_folder_pointcloud_paths(out_path)
+        all_created_paths = postprocessed_paths + created_paths
+        if refreshed_standard_paths:
+            status = "processed" if all_created_paths else "ready"
+        elif candidate_paths:
+            status = "failed"
+        else:
+            status = "missing_pointcloud"
+        report = {
+            "schema": "route6_pointcloud_processing_report_v1",
+            "status": status,
+            "output_dir": str(out_path),
+            "report_path": str(report_path),
+            "standard_pointcloud_count": len(refreshed_standard_paths),
+            "standard_pointcloud_paths": [str(path) for path in refreshed_standard_paths],
+            "candidate_file_count": len(candidate_paths),
+            "candidate_files": [str(path) for path in candidate_paths],
+            "raw_depth_frame_count": len(raw_depth_frame_dirs),
+            "postprocessed_frame_count": len(postprocessed_paths),
+            "failed_frame_count": len([entry for entry in frame_entries if entry.get("status") == "failed"]),
+            "created_standard_pointcloud_count": len(all_created_paths),
+            "created_standard_pointcloud_paths": all_created_paths,
+            "log_file_count": len(log_files),
+            "log_files": [str(path) for path in log_files],
+            "frame_entries": frame_entries,
+            "entries": entries,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(report_path, report)
+        self.route6_update_pointcloud_report_text(report)
+        return report
+
+    def route6_list_capture_folders(self, root: Optional[Path] = None) -> List[Dict[str, Any]]:
+        self.ensure_route6_state()
+        root_path = Path(root) if root is not None else self.route6_output_root()
+        if not root_path.exists():
+            return []
+        records: List[Dict[str, Any]] = []
+        for run_dir in sorted((path for path in root_path.iterdir() if path.is_dir()), key=lambda path: path.name):
+            manifest_path = run_dir / "map" / "layered_occupancy" / "route6_layered_occupancy.json"
+            pointcloud_paths = self.route6_capture_folder_pointcloud_paths(run_dir)
+            looks_like_capture = (
+                run_dir.name.startswith(("route6_update_map_", "route6_nearest_map_"))
+                or (run_dir / "frames").exists()
+                or (run_dir / "houses").exists()
+                or (run_dir / "lidar_capture_log.jsonl").is_file()
+                or (run_dir / "route6_update_map_capture_log.jsonl").is_file()
+                or manifest_path.is_file()
+            )
+            if not looks_like_capture:
+                continue
+            mtime_candidates = [run_dir]
+            for candidate in (
+                manifest_path,
+                run_dir / "lidar_capture_log.jsonl",
+                run_dir / "route6_update_map_capture_log.jsonl",
+            ):
+                if candidate.exists():
+                    mtime_candidates.append(candidate)
+            mtime_candidates.extend(pointcloud_paths)
+            try:
+                mtime = max(path.stat().st_mtime for path in mtime_candidates if path.exists())
+            except Exception:
+                mtime = 0.0
+            try:
+                updated_at = datetime.fromtimestamp(float(mtime)).isoformat(timespec="seconds")
+            except Exception:
+                updated_at = ""
+            records.append(
+                {
+                    "schema": "route6_capture_folder_record_v1",
+                    "name": run_dir.name,
+                    "path": str(run_dir),
+                    "mtime": float(mtime),
+                    "updated_at": updated_at,
+                    "pointcloud_count": len(pointcloud_paths),
+                    "has_layered_map": manifest_path.is_file(),
+                    "manifest_path": str(manifest_path) if manifest_path.is_file() else "",
+                }
+            )
+        records.sort(key=lambda record: (float(record.get("mtime", 0.0) or 0.0), str(record.get("name", ""))), reverse=True)
+        return records
+
+    def route6_set_selected_capture_folder(self, folder_path: Path) -> Path:
+        self.ensure_route6_state()
+        selected = Path(folder_path)
+        self.route6_selected_capture_folder_var.set(str(selected))
+        self.llm_route6_state["output_dir"] = str(selected)
+        return selected
+
+    def route6_selected_capture_folder_path(self) -> Optional[Path]:
+        self.ensure_route6_state()
+        listbox = getattr(self, "route6_capture_folder_listbox", None)
+        records = getattr(self, "route6_capture_folder_records", []) or []
+        if listbox is not None and records:
+            try:
+                selection = listbox.curselection()
+                if selection:
+                    record = records[int(selection[0])]
+                    path = Path(str(record.get("path", "") or ""))
+                    if path.exists():
+                        return self.route6_set_selected_capture_folder(path)
+            except Exception:
+                pass
+        selected_raw = str(self.route6_selected_capture_folder_var.get() or "")
+        if selected_raw:
+            path = Path(selected_raw)
+            if path.exists():
+                return self.route6_set_selected_capture_folder(path)
+        if records:
+            path = Path(str(records[0].get("path", "") or ""))
+            if path.exists():
+                return self.route6_set_selected_capture_folder(path)
+        return None
+
+    def on_route6_capture_folder_select(self, _event: Optional[tk.Event] = None) -> None:
+        selected = self.route6_selected_capture_folder_path()
+        if selected is not None:
+            self.route6_capture_folder_status_var.set(f"Route 6 Capture Folder Reader: selected {selected}")
+
+    def on_route6_capture_folder_process_pointcloud(self) -> Dict[str, Any]:
+        selected = self.route6_selected_capture_folder_path()
+        if selected is None:
+            self.route6_capture_folder_status_var.set("Route 6 Capture Folder Reader: select a capture folder first.")
+            self.route6_update_map_status_var.set("Route 6 Update Map: select a capture folder first.")
+            return {}
+        self.route6_set_selected_capture_folder(selected)
+        report = self.route6_process_capture_folder_pointclouds(selected)
+        self.refresh_route6_capture_folder_list()
+        status = str(report.get("status", "") or "")
+        standard_count = int(report.get("standard_pointcloud_count", 0) or 0)
+        candidate_count = int(report.get("candidate_file_count", 0) or 0)
+        if status == "missing_pointcloud":
+            message = f"Route 6 Capture Folder Reader: no pointcloud files found under {selected}"
+        elif status == "failed":
+            message = f"Route 6 Capture Folder Reader: pointcloud processing failed candidates={candidate_count} -> {selected}"
+        else:
+            message = f"Route 6 Capture Folder Reader: pointcloud {status} standard={standard_count} candidates={candidate_count}"
+        self.route6_capture_folder_status_var.set(message)
+        self.route6_update_map_status_var.set(message.replace("Route 6 Capture Folder Reader", "Route 6 Update Map"))
+        return report
+
+    def refresh_route6_capture_folder_list(self) -> List[Dict[str, Any]]:
+        self.ensure_route6_state()
+        records = self.route6_list_capture_folders()
+        self.route6_capture_folder_records = records
+        listbox = getattr(self, "route6_capture_folder_listbox", None)
+        selected_raw = str(self.route6_selected_capture_folder_var.get() or "")
+        selected_index = 0
+        if listbox is not None:
+            try:
+                listbox.delete(0, tk.END)
+                for index, record in enumerate(records):
+                    if selected_raw and str(record.get("path", "") or "") == selected_raw:
+                        selected_index = index
+                    map_flag = "map=yes" if record.get("has_layered_map") else "map=no"
+                    label = (
+                        f"{record.get('name', '')} | pc={int(record.get('pointcloud_count', 0) or 0)} "
+                        f"| {map_flag} | {record.get('updated_at', '')}"
+                    )
+                    listbox.insert(tk.END, label)
+                if records:
+                    selected_index = min(max(0, selected_index), len(records) - 1)
+                    listbox.selection_set(selected_index)
+                    listbox.activate(selected_index)
+                    self.route6_set_selected_capture_folder(Path(str(records[selected_index].get("path", "") or "")))
+            except tk.TclError:
+                pass
+        root = self.route6_output_root()
+        self.route6_capture_folder_status_var.set(f"Route 6 Capture Folder Reader: folders={len(records)} root={root}")
+        return records
+
+    def on_route6_capture_folder_generate_map(self) -> Dict[str, Any]:
+        selected = self.route6_selected_capture_folder_path()
+        if selected is None:
+            self.route6_capture_folder_status_var.set("Route 6 Capture Folder Reader: select a capture folder first.")
+            self.route6_update_map_status_var.set("Route 6 Update Map: select a capture folder first.")
+            return {}
+        self.route6_set_selected_capture_folder(selected)
+        result = self.route6_update_map_build_from_pointcloud(selected)
+        self.refresh_route6_update_map_window()
+        self.refresh_route6_capture_folder_list()
+        if result:
+            self.route6_capture_folder_status_var.set(
+                f"Route 6 Capture Folder Reader: generated map layers={int(result.get('layer_count', 0) or 0)} -> {selected}"
+            )
+        else:
+            self.route6_capture_folder_status_var.set(f"Route 6 Capture Folder Reader: no pointcloud found under {selected}")
+        return result
+
+    def on_route6_capture_folder_load_map(self) -> Dict[str, Any]:
+        selected = self.route6_selected_capture_folder_path()
+        if selected is None:
+            self.route6_capture_folder_status_var.set("Route 6 Capture Folder Reader: select a capture folder first.")
+            self.route6_update_map_status_var.set("Route 6 Update Map: select a capture folder first.")
+            return {}
+        self.route6_set_selected_capture_folder(selected)
+        manifest = self.route6_update_map_load_manifest(build_if_missing=False, output_dir=selected)
+        if not manifest:
+            self.route6_capture_folder_status_var.set(f"Route 6 Capture Folder Reader: no map found under {selected}")
+            self.route6_update_map_status_var.set(f"Route 6 Update Map: no layered map under {selected}")
+            return {}
+        manifest_path = self.route6_update_map_manifest_path(selected)
+        record = {
+            "schema": "route6_update_map_state_v1",
+            "source": "manual_route6_update_map_load",
+            "output_dir": str(selected),
+            "manifest_path": str(manifest_path),
+            "layered_occupancy_dir": str(manifest_path.parent),
+            "layer_count": int(manifest.get("layer_count", len(manifest.get("layers", []) if isinstance(manifest.get("layers", []), list) else [])) or 0),
+            "fixed_world_bounds_cm": dict(manifest.get("fixed_world_bounds_cm", {}) or {}),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.llm_route6_state["output_dir"] = str(selected)
+        self.llm_route6_state["route6_update_map"] = record
+        self.route6_write_state_artifact()
+        self.refresh_route6_update_map_window()
+        self.refresh_route6_capture_folder_list()
+        self.route6_update_map_status_var.set(
+            f"Route 6 Update Map: loaded map layers={record['layer_count']} -> {selected}"
+        )
+        self.route6_capture_folder_status_var.set(
+            f"Route 6 Capture Folder Reader: loaded map layers={record['layer_count']} -> {selected}"
+        )
+        return manifest
+
+    def make_route6_update_map_output_dir(self) -> Path:
+        self.ensure_route6_state()
+        root = self.route6_output_root()
+        root.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        candidate = root / f"route6_update_map_{timestamp}"
+        suffix = 1
+        while candidate.exists():
+            suffix += 1
+            candidate = root / f"route6_update_map_{timestamp}_{suffix}"
+        (candidate / "map").mkdir(parents=True, exist_ok=True)
+        (candidate / "frames").mkdir(parents=True, exist_ok=True)
+        return candidate
+
+    def route6_update_map_capture_interval_s(self) -> float:
+        return self.route6_float_param(
+            self.route6_update_map_capture_interval_s_var,
+            1.0,
+            min_value=0.05,
+            max_value=60.0,
+        )
+
+    def route6_update_map_min_move_cm(self) -> float:
+        return self.route6_float_param(
+            self.route6_update_map_min_move_cm_var,
+            50.0,
+            min_value=0.0,
+            max_value=5000.0,
+        )
+
+    def route6_update_map_min_yaw_deg(self) -> float:
+        return self.route6_float_param(
+            self.route6_update_map_min_yaw_deg_var,
+            5.0,
+            min_value=0.0,
+            max_value=180.0,
+        )
+
+    def route6_update_map_pose_delta(self, current_pose: Dict[str, Any], last_pose: Optional[Dict[str, Any]]) -> Dict[str, float]:
+        if not isinstance(last_pose, dict) or not last_pose:
+            return {"position_cm": float("inf"), "yaw_deg": float("inf")}
+        try:
+            dx = float(current_pose.get("x", 0.0) or 0.0) - float(last_pose.get("x", 0.0) or 0.0)
+            dy = float(current_pose.get("y", 0.0) or 0.0) - float(last_pose.get("y", 0.0) or 0.0)
+            dz = float(current_pose.get("z", 0.0) or 0.0) - float(last_pose.get("z", 0.0) or 0.0)
+            yaw_delta = abs(float(current_pose.get("yaw", 0.0) or 0.0) - float(last_pose.get("yaw", 0.0) or 0.0))
+            yaw_delta = min(yaw_delta % 360.0, (360.0 - yaw_delta) % 360.0)
+            return {"position_cm": float(math.sqrt(dx * dx + dy * dy + dz * dz)), "yaw_deg": float(yaw_delta)}
+        except Exception:
+            return {"position_cm": float("inf"), "yaw_deg": float("inf")}
+
+    def route6_update_map_should_capture_pose(self, current_pose: Dict[str, Any], last_pose: Optional[Dict[str, Any]]) -> Tuple[bool, Dict[str, float]]:
+        delta = self.route6_update_map_pose_delta(current_pose, last_pose)
+        min_move = self.route6_update_map_min_move_cm()
+        min_yaw = self.route6_update_map_min_yaw_deg()
+        if not isinstance(last_pose, dict) or not last_pose:
+            return True, delta
+        if min_move <= 0.0 and min_yaw <= 0.0:
+            return True, delta
+        should_capture = bool(float(delta.get("position_cm", 0.0) or 0.0) >= min_move or float(delta.get("yaw_deg", 0.0) or 0.0) >= min_yaw)
+        return should_capture, delta
+
+    def route6_update_map_capture_once(self, session: Any, output_dir: Path) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        if session is None:
+            return {"capture_status": "failed", "error": "missing_session"}
+        out_path = Path(output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        frame_index = int((self.llm_route6_state or {}).get("route6_update_map_capture_frame_index", 0) or 0) + 1
+        action_detail = {
+            "schema_version": 1,
+            "source": "route6_update_map",
+            "capture_kind": "route6_update_map_capture",
+            "frame_index": frame_index,
+            "layer_z_cm": list(route6_map_builder.DEFAULT_ROUTE6_LAYER_Z_CM),
+            "capture_interval_s": self.route6_update_map_capture_interval_s(),
+        }
+        capture = session.capture_lidar_stream_frame(out_path, frame_index, action_detail=action_detail)
+        capture = capture if isinstance(capture, dict) else {"status": "failed", "error": "capture_returned_non_dict"}
+        pointcloud_path = str(capture.get("point_cloud_world_standard_m_npy_path", "") or "")
+        if not pointcloud_path:
+            capture_dir = Path(str(capture.get("capture_dir", "") or ""))
+            candidate = capture_dir / "point_cloud_world_standard_m.npy"
+            if candidate.is_file():
+                pointcloud_path = str(candidate)
+                capture["point_cloud_world_standard_m_npy_path"] = pointcloud_path
+        point_count = int(capture.get("point_count", 0) or 0)
+        if point_count <= 0 and pointcloud_path and Path(pointcloud_path).is_file():
+            try:
+                point_count = int(np.asarray(np.load(pointcloud_path)).shape[0])
+                capture["point_count"] = point_count
+            except Exception:
+                pass
+        capture_status = str(capture.get("capture_status", capture.get("status", "")) or "").strip().lower()
+        if capture_status == "ok":
+            capture_status = "ok"
+        elif str(capture.get("status", "") or "").strip().lower() == "ok":
+            capture_status = "ok"
+        else:
+            capture_status = capture_status or "failed"
+        row = {
+            **self.route6_json_safe(capture),
+            "schema": "route6_update_map_capture_row_v1",
+            "capture_kind": "route6_update_map_capture",
+            "capture_status": capture_status,
+            "frame_index": frame_index,
+            "point_count": int(point_count),
+            "point_cloud_world_standard_m_npy_path": pointcloud_path,
+            "capture_guard_passed": bool(point_count > 0 and Path(pointcloud_path).is_file()) if pointcloud_path else False,
+            "capture_time": capture.get("capture_time", datetime.now().isoformat(timespec="seconds")),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_append_jsonl(out_path / "lidar_capture_log.jsonl", row)
+        self.route6_append_jsonl(out_path / "route6_update_map_capture_log.jsonl", row)
+        self.llm_route6_state["output_dir"] = str(out_path)
+        self.llm_route6_state["route6_update_map_capture_frame_index"] = frame_index
+        self.llm_route6_state["route6_update_map_capture"] = {
+            "schema": "route6_update_map_capture_state_v1",
+            "running": not self.route6_update_map_capture_stop_event.is_set(),
+            "output_dir": str(out_path),
+            "frame_count": frame_index,
+            "last_capture_status": capture_status,
+            "last_point_count": int(point_count),
+            "last_pointcloud_path": pointcloud_path,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_state_artifact()
+        self.route6_update_map_status_var.set(f"Route 6 Update Map: captured frame={frame_index} points={point_count}")
+        return row
+
+    def route6_update_map_capture_worker(self, session: Any, output_dir: Path) -> None:
+        self.ensure_route6_state()
+        out_path = Path(output_dir)
+        self.route6_update_map_status_var.set(f"Route 6 Update Map: capture running -> {out_path}")
+        while not self.route6_update_map_capture_stop_event.is_set():
+            try:
+                self.route6_update_map_capture_once(session, out_path)
+            except Exception as exc:
+                self.route6_update_map_status_var.set(f"Route 6 Update Map: capture failed: {exc}")
+                self.route6_log_event(out_path, "route6_update_map_capture_error", {"error": str(exc)})
+                break
+            if self.route6_update_map_capture_stop_event.wait(self.route6_update_map_capture_interval_s()):
+                break
+        capture_state = self.llm_route6_state.get("route6_update_map_capture", {}) if isinstance(self.llm_route6_state.get("route6_update_map_capture", {}), dict) else {}
+        capture_state["running"] = False
+        capture_state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self.llm_route6_state["route6_update_map_capture"] = capture_state
+        self.route6_write_state_artifact()
+        self.route6_update_map_status_var.set(f"Route 6 Update Map: capture stopped -> {out_path}")
+
+    def route6_update_map_request_window_refresh(self) -> None:
+        window = getattr(self, "route6_update_map_window", None)
+        if window is None:
+            return
+        try:
+            if not window.winfo_exists():
+                return
+            window.after(0, lambda: self.refresh_route6_update_map_window(build_if_missing=False))
+        except Exception:
+            return
+
+    def route6_update_map_ensure_capture_pointcloud(self, capture: Dict[str, Any], output_dir: Path) -> Dict[str, Any]:
+        out_path = Path(output_dir)
+        payload = capture if isinstance(capture, dict) else {}
+        pointcloud_path = Path(str(payload.get("point_cloud_world_standard_m_npy_path", "") or ""))
+        point_count = int(payload.get("point_count", 0) or 0)
+        if pointcloud_path.is_file() and point_count > 0:
+            return {
+                "status": "ready",
+                "point_cloud_world_standard_m_npy_path": str(pointcloud_path),
+                "point_count": int(point_count),
+                "postprocessed_frame_count": 0,
+            }
+        capture_dir = Path(str(payload.get("capture_dir", "") or ""))
+        if not capture_dir or not self.route6_path_is_under(capture_dir, out_path):
+            return {"status": "missing_capture_dir", "point_cloud_world_standard_m_npy_path": "", "point_count": 0, "postprocessed_frame_count": 0}
+        required = [capture_dir / "depth.npy", capture_dir / "rgb.png", capture_dir / "camera_info.json"]
+        if not all(path.is_file() for path in required):
+            return {"status": "missing_raw_depth_inputs", "point_cloud_world_standard_m_npy_path": "", "point_count": 0, "postprocessed_frame_count": 0}
+        args = getattr(self, "args", None)
+        lidar_depth_projection = str(getattr(args, "lidar_depth_projection", flight.DEFAULT_LIDAR_DEPTH_PROJECTION))
+        min_depth_cm = float(getattr(args, "lidar_depth_min_cm", flight.DEFAULT_LIDAR_DEPTH_MIN_CM))
+        max_depth_cm = float(getattr(args, "lidar_depth_max_cm", flight.DEFAULT_LIDAR_DEPTH_MAX_CM))
+        try:
+            capture_payload = flight.read_json_object(capture_dir / "capture.json")
+        except Exception:
+            capture_payload = payload
+        try:
+            ensured = flight.ensure_standard_world_cloud_for_capture(
+                capture_dir,
+                capture_payload=capture_payload,
+                lidar_depth_projection=lidar_depth_projection,
+                min_depth_cm=min_depth_cm,
+                max_depth_cm=max_depth_cm,
+            )
+            pointcloud_path = Path(str(ensured.get("point_cloud_world_standard_m_npy_path", "") or ""))
+            point_count = int(ensured.get("point_count", 0) or 0)
+            if pointcloud_path.is_file() and point_count <= 0:
+                try:
+                    point_count = int(np.load(pointcloud_path, mmap_mode="r").shape[0])
+                except Exception:
+                    point_count = 0
+            return {
+                "status": "processed" if pointcloud_path.is_file() else "no_pointcloud_output",
+                "point_cloud_world_standard_m_npy_path": str(pointcloud_path) if pointcloud_path.is_file() else "",
+                "point_count": int(point_count),
+                "postprocessed_frame_count": 1 if pointcloud_path.is_file() else 0,
+                "depth_projection_selected": ensured.get("depth_projection_selected", ""),
+            }
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "error": str(exc),
+                "point_cloud_world_standard_m_npy_path": "",
+                "point_count": 0,
+                "postprocessed_frame_count": 0,
+            }
+
+    def route6_update_map_realtime_worker(
+        self,
+        session: Any,
+        output_dir: Path,
+        *,
+        max_iterations: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        out_path = Path(output_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        self.llm_route6_state["output_dir"] = str(out_path)
+        capture_count = 0
+        map_count = 0
+        loop_count = 0
+        skipped_stationary_count = 0
+        last_manifest_path = ""
+        last_pointcloud_process_status = ""
+        last_postprocessed_frame_count = 0
+        last_accepted_pose: Optional[Dict[str, Any]] = None
+        last_pose_delta: Dict[str, float] = {}
+        final_error = ""
+        self.llm_route6_state["route6_update_map_realtime"] = {
+            "schema": "route6_update_map_realtime_state_v1",
+            "running": True,
+            "output_dir": str(out_path),
+            "capture_count": 0,
+            "map_count": 0,
+            "skipped_stationary_count": 0,
+            "last_manifest_path": "",
+            "last_pointcloud_process_status": "",
+            "last_postprocessed_frame_count": 0,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_state_artifact()
+        self.route6_update_map_status_var.set(f"Route 6 Update Map: realtime update running -> {out_path}")
+
+        while not self.route6_update_map_realtime_stop_event.is_set():
+            loop_count += 1
+            current_pose = self.route6_current_pose()
+            should_capture, last_pose_delta = self.route6_update_map_should_capture_pose(current_pose, last_accepted_pose)
+            if not should_capture:
+                skipped_stationary_count += 1
+                self.llm_route6_state["route6_update_map_realtime"] = {
+                    "schema": "route6_update_map_realtime_state_v1",
+                    "running": True,
+                    "output_dir": str(out_path),
+                    "capture_count": int(capture_count),
+                    "map_count": int(map_count),
+                    "skipped_stationary_count": int(skipped_stationary_count),
+                    "last_manifest_path": last_manifest_path,
+                    "last_pointcloud_process_status": last_pointcloud_process_status,
+                    "last_postprocessed_frame_count": int(last_postprocessed_frame_count),
+                    "last_pose_delta": last_pose_delta,
+                    "last_accepted_pose": last_accepted_pose or {},
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                self.route6_write_state_artifact()
+                self.route6_update_map_status_var.set(
+                    "Route 6 Update Map: realtime waiting for movement "
+                    f"move={last_pose_delta.get('position_cm', 0.0):.1f}cm yaw={last_pose_delta.get('yaw_deg', 0.0):.1f}deg "
+                    f"skipped={skipped_stationary_count}"
+                )
+                if max_iterations is not None and loop_count >= int(max_iterations):
+                    break
+                if self.route6_update_map_realtime_stop_event.wait(self.route6_update_map_capture_interval_s()):
+                    break
+                continue
+            try:
+                capture = self.route6_update_map_capture_once(session, out_path)
+                capture_count += 1
+                pointcloud_report = self.route6_update_map_ensure_capture_pointcloud(capture, out_path)
+                last_pointcloud_process_status = str(pointcloud_report.get("status", "") or "")
+                last_postprocessed_frame_count = int(pointcloud_report.get("postprocessed_frame_count", 0) or 0)
+                build = self.route6_update_map_build_from_pointcloud(out_path)
+                if build:
+                    map_count += 1
+                    last_manifest_path = str(build.get("manifest_path", "") or "")
+                    self.route6_update_map_request_window_refresh()
+                last_accepted_pose = current_pose
+            except Exception as exc:
+                final_error = str(exc)
+                self.route6_update_map_status_var.set(f"Route 6 Update Map: realtime update failed: {exc}")
+                self.route6_log_event(out_path, "route6_update_map_realtime_error", {"error": final_error})
+                break
+
+            self.llm_route6_state["route6_update_map_realtime"] = {
+                "schema": "route6_update_map_realtime_state_v1",
+                "running": True,
+                "output_dir": str(out_path),
+                "capture_count": int(capture_count),
+                "map_count": int(map_count),
+                "skipped_stationary_count": int(skipped_stationary_count),
+                "last_manifest_path": last_manifest_path,
+                "last_pointcloud_process_status": last_pointcloud_process_status,
+                "last_postprocessed_frame_count": int(last_postprocessed_frame_count),
+                "last_pose_delta": last_pose_delta,
+                "last_accepted_pose": last_accepted_pose or {},
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            self.route6_write_state_artifact()
+            if max_iterations is not None and loop_count >= int(max_iterations):
+                break
+            if self.route6_update_map_realtime_stop_event.wait(self.route6_update_map_capture_interval_s()):
+                break
+
+        final_state = {
+            "schema": "route6_update_map_realtime_state_v1",
+            "running": False,
+            "output_dir": str(out_path),
+            "capture_count": int(capture_count),
+            "map_count": int(map_count),
+            "skipped_stationary_count": int(skipped_stationary_count),
+            "last_manifest_path": last_manifest_path,
+            "last_pointcloud_process_status": last_pointcloud_process_status,
+            "last_postprocessed_frame_count": int(last_postprocessed_frame_count),
+            "last_pose_delta": last_pose_delta,
+            "last_accepted_pose": last_accepted_pose or {},
+            "last_error": final_error,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.llm_route6_state["route6_update_map_realtime"] = final_state
+        capture_state = self.llm_route6_state.get("route6_update_map_capture", {}) if isinstance(self.llm_route6_state.get("route6_update_map_capture", {}), dict) else {}
+        if capture_state:
+            capture_state["running"] = False
+            capture_state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            self.llm_route6_state["route6_update_map_capture"] = capture_state
+        self.route6_write_state_artifact()
+        if final_error:
+            self.route6_update_map_status_var.set(f"Route 6 Update Map: realtime stopped with error after frames={capture_count} maps={map_count}")
+        else:
+            self.route6_update_map_status_var.set(f"Route 6 Update Map: realtime stopped frames={capture_count} maps={map_count} -> {out_path}")
+        return final_state
+
+    def on_route6_update_map_start_capture(self) -> None:
+        self.ensure_route6_state()
+        thread = getattr(self, "route6_update_map_capture_thread", None)
+        if thread is not None and thread.is_alive():
+            self.route6_update_map_status_var.set("Route 6 Update Map: capture already running.")
+            return
+        realtime_thread = getattr(self, "route6_update_map_realtime_thread", None)
+        if realtime_thread is not None and realtime_thread.is_alive():
+            self.route6_update_map_status_var.set("Route 6 Update Map: realtime update already running.")
+            return
+        session = getattr(self, "session", None)
+        if session is None:
+            self.route6_update_map_status_var.set("Route 6 Update Map: no active session for capture.")
+            return
+        output_dir = self.make_route6_update_map_output_dir()
+        self.llm_route6_state["output_dir"] = str(output_dir)
+        self.llm_route6_state["route6_update_map_capture_frame_index"] = 0
+        self.route6_update_map_capture_stop_event.clear()
+        self.route6_update_map_capture_thread = threading.Thread(
+            target=lambda: self.route6_update_map_capture_worker(session, output_dir),
+            daemon=True,
+        )
+        self.route6_update_map_capture_thread.start()
+        self.route6_update_map_status_var.set(f"Route 6 Update Map: capture started -> {output_dir}")
+
+    def on_route6_update_map_stop_capture(self) -> None:
+        self.ensure_route6_state()
+        self.route6_update_map_capture_stop_event.set()
+        self.route6_update_map_status_var.set("Route 6 Update Map: stop capture requested.")
+
+    def on_route6_update_map_start_realtime(self) -> None:
+        self.ensure_route6_state()
+        realtime_thread = getattr(self, "route6_update_map_realtime_thread", None)
+        if realtime_thread is not None and realtime_thread.is_alive():
+            self.route6_update_map_status_var.set("Route 6 Update Map: realtime update already running.")
+            return
+        capture_thread = getattr(self, "route6_update_map_capture_thread", None)
+        if capture_thread is not None and capture_thread.is_alive():
+            self.route6_update_map_status_var.set("Route 6 Update Map: capture already running; stop capture before realtime update.")
+            return
+        session = getattr(self, "session", None)
+        if session is None:
+            self.route6_update_map_status_var.set("Route 6 Update Map: no active session for realtime update.")
+            return
+        output_dir = self.make_route6_update_map_output_dir()
+        self.llm_route6_state["output_dir"] = str(output_dir)
+        self.llm_route6_state["route6_update_map_capture_frame_index"] = 0
+        self.route6_update_map_capture_stop_event.clear()
+        self.route6_update_map_realtime_stop_event.clear()
+        self.route6_update_map_realtime_thread = threading.Thread(
+            target=lambda: self.route6_update_map_realtime_worker(session, output_dir),
+            daemon=True,
+        )
+        self.route6_update_map_realtime_thread.start()
+        self.route6_update_map_status_var.set(f"Route 6 Update Map: realtime update started -> {output_dir}")
+
+    def on_route6_update_map_stop_realtime(self) -> None:
+        self.ensure_route6_state()
+        self.route6_update_map_realtime_stop_event.set()
+        self.route6_update_map_status_var.set("Route 6 Update Map: stop realtime update requested.")
+
+    def on_route6_update_map_generate_map(self) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        result = self.route6_update_map_build_from_pointcloud()
+        if result:
+            self.refresh_route6_update_map_window()
+        else:
+            root = self.route6_output_root()
+            self.route6_update_map_status_var.set(
+                f"Route 6 Update Map: no map generated. Open Capture Folders, select a run under {root}, then Generate Map or Load Map."
+            )
+        return result
+
+    def route6_update_map_collect_pointclouds(self, output_dir: Path, *, voxel_size_m: Optional[float] = None) -> Tuple[np.ndarray, List[str]]:
+        out_path = Path(output_dir)
+        paths: List[Path] = []
+        states = self.route6_house_states()
+        for _hid, state in sorted(states.items(), key=lambda item: str(item[0])):
+            item = state if isinstance(state, dict) else {}
+            pointcloud_path = Path(str(item.get("merged_pointcloud_path", "") or ""))
+            if pointcloud_path.is_file() and self.route6_path_is_under(pointcloud_path, out_path) and pointcloud_path not in paths:
+                paths.append(pointcloud_path)
+        for path in self.route6_capture_folder_pointcloud_paths(out_path):
+            if path not in paths:
+                paths.append(path)
+        clouds: List[np.ndarray] = []
+        used_paths: List[str] = []
+        raw_point_count = 0
+        per_source_voxel_point_count = 0
+        voxel_size = float(voxel_size_m if voxel_size_m is not None else route6_map_builder.DEFAULT_ROUTE6_UPDATE_MAP_VOXEL_SIZE_M)
+        for path in paths:
+            try:
+                cloud = np.asarray(np.load(path), dtype=np.float32)
+            except Exception as exc:
+                self.route6_log_event(out_path, "route6_update_map_pointcloud_warning", {"path": str(path), "error": str(exc)})
+                continue
+            if cloud.ndim != 2 or cloud.shape[0] <= 0 or cloud.shape[1] < 3:
+                continue
+            if cloud.shape[1] < 6:
+                pad = np.zeros((cloud.shape[0], 6 - cloud.shape[1]), dtype=np.float32)
+                cloud = np.hstack([cloud[:, :3], pad])
+            raw_point_count += int(cloud.shape[0])
+            reduced = route6_map_builder.voxel_downsample_point_cloud(
+                cloud[:, :6],
+                voxel_size_m=voxel_size,
+                fixed_world_bounds_cm=route6_map_builder.DEFAULT_ROUTE6_FIXED_WORLD_BOUNDS_CM,
+            )
+            if reduced.shape[0] <= 0:
+                continue
+            per_source_voxel_point_count += int(reduced.shape[0])
+            clouds.append(reduced.astype(np.float32, copy=False))
+            used_paths.append(str(path))
+        if not clouds:
+            self.llm_route6_state["route6_update_map_pointcloud_merge"] = {
+                "schema": "route6_update_map_pointcloud_merge_v1",
+                "raw_point_count": int(raw_point_count),
+                "per_source_voxel_point_count": int(per_source_voxel_point_count),
+                "pre_global_voxel_point_count": 0,
+                "merged_point_count": 0,
+                "voxel_size_m": float(voxel_size),
+                "max_points": int(route6_map_builder.DEFAULT_ROUTE6_UPDATE_MAP_MAX_POINTS),
+                "source_pointcloud_count": len(used_paths),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            return np.zeros((0, 6), dtype=np.float32), []
+        merged = np.concatenate(clouds, axis=0)
+        pre_global_voxel_point_count = int(merged.shape[0])
+        max_points = int(route6_map_builder.DEFAULT_ROUTE6_UPDATE_MAP_MAX_POINTS)
+        merged = route6_map_builder.voxel_downsample_point_cloud(
+            merged,
+            voxel_size_m=voxel_size,
+            fixed_world_bounds_cm=route6_map_builder.DEFAULT_ROUTE6_FIXED_WORLD_BOUNDS_CM,
+            max_points=max_points,
+        )
+        self.llm_route6_state["route6_update_map_pointcloud_merge"] = {
+            "schema": "route6_update_map_pointcloud_merge_v1",
+            "raw_point_count": int(raw_point_count),
+            "per_source_voxel_point_count": int(per_source_voxel_point_count),
+            "pre_global_voxel_point_count": int(pre_global_voxel_point_count),
+            "merged_point_count": int(merged.shape[0]),
+            "voxel_size_m": float(voxel_size),
+            "max_points": int(max_points),
+            "source_pointcloud_count": len(used_paths),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        return merged.astype(np.float32, copy=False), used_paths
+
+    def route6_update_map_manifest_path(self, output_dir: Optional[Path] = None) -> Path:
+        out_path = Path(output_dir) if output_dir is not None else self.route6_update_map_latest_output_dir()
+        if out_path is None:
+            return Path()
+        state_record = (self.llm_route6_state or {}).get("route6_update_map", {})
+        candidate = Path(str((state_record if isinstance(state_record, dict) else {}).get("manifest_path", "") or ""))
+        if candidate.is_file() and (output_dir is None or self.route6_path_is_under(candidate, out_path)):
+            return candidate
+        return out_path / "map" / "layered_occupancy" / "route6_layered_occupancy.json"
+
+    def route6_update_map_build_from_pointcloud(self, output_dir: Optional[Path] = None) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        out_path = Path(output_dir) if output_dir is not None else self.route6_update_map_latest_output_dir()
+        if out_path is None:
+            self.route6_update_map_status_var.set("Route 6 Update Map: no Route 6 output directory found.")
+            return {}
+        resolution_m = self.route6_float_param(self.llm_route6_occupancy_resolution_m_var, 0.25, min_value=0.05, max_value=5.0)
+        merged, source_paths = self.route6_update_map_collect_pointclouds(out_path, voxel_size_m=float(resolution_m))
+        if merged.shape[0] <= 0:
+            self.route6_update_map_status_var.set(f"Route 6 Update Map: no pointcloud found under {out_path}")
+            return {}
+        result = route6_map_builder.write_route6_layered_occupancy_artifacts(
+            out_path,
+            merged,
+            layer_z_cm=route6_map_builder.DEFAULT_ROUTE6_LAYER_Z_CM,
+            layer_band_cm=route6_map_builder.DEFAULT_ROUTE6_LAYER_BAND_CM,
+            resolution_m=float(resolution_m),
+            occupied_threshold=route6_map_builder.DEFAULT_ROUTE6_LAYER_OCCUPIED_THRESHOLD,
+        )
+        record = {
+            "schema": "route6_update_map_state_v1",
+            "source": "manual_route6_update_map",
+            "output_dir": str(out_path),
+            "manifest_path": str(result.get("manifest_path", "") or ""),
+            "layered_occupancy_dir": str(result.get("layered_occupancy_dir", "") or ""),
+            "layer_count": int(result.get("layer_count", 0) or 0),
+            "fixed_world_bounds_cm": dict(result.get("fixed_world_bounds_cm", {}) or {}),
+            "source_pointcloud_count": len(source_paths),
+            "source_pointcloud_paths": source_paths,
+            "raw_point_count": int((self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}) if isinstance(self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}), dict) else {}).get("raw_point_count", merged.shape[0]) or 0),
+            "per_source_voxel_point_count": int((self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}) if isinstance(self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}), dict) else {}).get("per_source_voxel_point_count", merged.shape[0]) or 0),
+            "pre_global_voxel_point_count": int((self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}) if isinstance(self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}), dict) else {}).get("pre_global_voxel_point_count", merged.shape[0]) or 0),
+            "merged_point_count": int(merged.shape[0]),
+            "pointcloud_voxel_size_m": float(resolution_m),
+            "pointcloud_max_points": int(route6_map_builder.DEFAULT_ROUTE6_UPDATE_MAP_MAX_POINTS),
+            "pointcloud_reduction_ratio": round(float(merged.shape[0]) / max(1.0, float((self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}) if isinstance(self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}), dict) else {}).get("raw_point_count", merged.shape[0]) or merged.shape[0])), 6),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.llm_route6_state["output_dir"] = str(out_path)
+        self.llm_route6_state["route6_update_map"] = record
+        self.route6_write_state_artifact()
+        self.route6_update_map_status_var.set(
+            f"Route 6 Update Map: layers={record['layer_count']} points={record['merged_point_count']} raw={record['raw_point_count']}"
+        )
+        return record
+
+    def route6_update_map_load_manifest(self, *, build_if_missing: bool = False, output_dir: Optional[Path] = None) -> Dict[str, Any]:
+        out_path = Path(output_dir) if output_dir is not None else self.route6_update_map_latest_output_dir()
+        if out_path is None:
+            return {}
+        manifest_path = self.route6_update_map_manifest_path(out_path)
+        if not manifest_path.is_file() and build_if_missing:
+            self.route6_update_map_build_from_pointcloud(out_path)
+            manifest_path = self.route6_update_map_manifest_path(out_path)
+        if not manifest_path.is_file():
+            return {}
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception as exc:
+            self.route6_update_map_status_var.set(f"Route 6 Update Map: failed to load manifest: {exc}")
+            return {}
+
+    def _route6_update_map_layer_key(self, layer: Dict[str, Any]) -> str:
+        try:
+            return f"z_{int(float(layer.get('z_cm', 0))):03d}"
+        except Exception:
+            return "z_000"
+
+    def route6_update_map_uav_pose_text(self) -> str:
+        pose = self.route6_current_pose()
+        text = (
+            f"UAV x={float(pose.get('x', 0.0) or 0.0):.1f}cm "
+            f"y={float(pose.get('y', 0.0) or 0.0):.1f}cm "
+            f"z={float(pose.get('z', 0.0) or 0.0):.1f}cm "
+            f"yaw={float(pose.get('yaw', 0.0) or 0.0):.1f}deg"
+        )
+        self.route6_update_map_pose_var.set(text)
+        return text
+
+    def route6_update_map_load_layer_metadata(self, layer_record: Dict[str, Any]) -> Dict[str, Any]:
+        metadata_path = Path(str((layer_record if isinstance(layer_record, dict) else {}).get("occupancy_metadata_path", "") or ""))
+        if not metadata_path.is_file():
+            return {}
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    def route6_draw_update_map_uav_overlay(self, image: Image.Image, layer_record: Dict[str, Any], *, scale: int = 1) -> Image.Image:
+        metadata = self.route6_update_map_load_layer_metadata(layer_record)
+        if not metadata:
+            return image
+        try:
+            width = int(metadata.get("width", 0) or 0)
+            height = int(metadata.get("height", 0) or 0)
+            resolution = float(metadata.get("resolution_m", 0.25) or 0.25)
+            origin_x, origin_y = [float(value) for value in metadata.get("origin_standard_m", [0.0, 0.0])]
+        except Exception:
+            return image
+        if width <= 0 or height <= 0 or resolution <= 0:
+            return image
+        pose = self.route6_current_pose()
+        standard_x_m = float(pose.get("x", 0.0) or 0.0) / 100.0
+        standard_y_m = -float(pose.get("y", 0.0) or 0.0) / 100.0
+        col = int(math.floor((standard_x_m - origin_x) / resolution))
+        row = int(math.floor((standard_y_m - origin_y) / resolution))
+        if col < 0 or col >= width or row < 0 or row >= height:
+            return image
+        draw = ImageDraw.Draw(image)
+        factor = max(1, int(scale))
+        x_px = int(col * factor + factor / 2)
+        y_px = int((height - 1 - row) * factor + factor / 2)
+        radius = max(4, factor * 2)
+        color = (220, 0, 0)
+        draw.line((x_px - radius, y_px, x_px + radius, y_px), fill=color, width=max(2, factor))
+        draw.line((x_px, y_px - radius, x_px, y_px + radius), fill=color, width=max(2, factor))
+        draw.ellipse((x_px - radius, y_px - radius, x_px + radius, y_px + radius), outline=color, width=max(2, factor))
+        return image
+
+    def refresh_route6_update_map_window(self, *, build_if_missing: bool = True) -> None:
+        self.ensure_route6_state()
+        self.route6_update_map_uav_pose_text()
+        manifest = self.route6_update_map_load_manifest(build_if_missing=build_if_missing)
+        combo = getattr(self, "route6_update_map_layer_combo", None)
+        preview = getattr(self, "route6_update_map_preview_label", None)
+        if not manifest:
+            self.route6_update_map_status_var.set("Route 6 Update Map: no layered map artifact yet.")
+            if preview is not None:
+                try:
+                    preview.configure(text="No layered occupancy map available.", image="")
+                except tk.TclError:
+                    pass
+            return
+        layers = manifest.get("layers", []) if isinstance(manifest.get("layers", []), list) else []
+        values = [self._route6_update_map_layer_key(layer) for layer in layers if isinstance(layer, dict)]
+        if combo is not None:
+            try:
+                combo.configure(values=values)
+            except tk.TclError:
+                pass
+        selected = str(self.route6_update_map_layer_var.get() or "")
+        if selected not in values and values:
+            selected = values[0]
+            self.route6_update_map_layer_var.set(selected)
+        layer_record = next((layer for layer in layers if isinstance(layer, dict) and self._route6_update_map_layer_key(layer) == selected), {})
+        preview_path = Path(str((layer_record if isinstance(layer_record, dict) else {}).get("occupancy_preview_path", "") or ""))
+        status = (
+            f"Route 6 Update Map: {selected} "
+            f"points={int((layer_record or {}).get('point_count', 0) or 0)} "
+            f"occupied={int((layer_record or {}).get('occupied_cell_count', 0) or 0)}"
+        )
+        self.route6_update_map_status_var.set(status)
+        if preview is None:
+            return
+        if not preview_path.is_file():
+            try:
+                preview.configure(text=f"Preview missing: {preview_path}", image="")
+            except tk.TclError:
+                pass
+            return
+        try:
+            image = Image.open(preview_path).convert("RGB")
+            width, height = image.size
+            scale = max(1, min(8, int(780 / max(1, max(width, height)))))
+            if scale > 1:
+                image = image.resize((width * scale, height * scale), Image.Resampling.NEAREST)
+            image = self.route6_draw_update_map_uav_overlay(image, layer_record, scale=scale)
+            photo = ImageTk.PhotoImage(image)
+            self.route6_update_map_preview_photo = photo
+            preview.configure(image=photo, text="")
+        except Exception as exc:
+            try:
+                preview.configure(text=f"Preview load failed: {exc}", image="")
+            except tk.TclError:
+                pass
+
+    def route6_update_map_schedule_pose_refresh(self) -> None:
+        self.ensure_route6_state()
+        window = getattr(self, "route6_update_map_window", None)
+        if window is None:
+            return
+        try:
+            if not window.winfo_exists():
+                return
+            self.refresh_route6_update_map_window(build_if_missing=False)
+            self.route6_update_map_pose_after_id = window.after(1000, self.route6_update_map_schedule_pose_refresh)
+        except tk.TclError:
+            self.route6_update_map_pose_after_id = None
+
+    def _on_route6_update_map_mousewheel(self, event: tk.Event):
+        canvas = getattr(self, "route6_update_map_scroll_canvas", None)
+        if canvas is None:
+            return None
+        delta = -1 if int(getattr(event, "delta", 0) or 0) > 0 else 1
+        try:
+            if int(getattr(event, "state", 0) or 0) & 0x0001:
+                canvas.xview_scroll(delta, "units")
+            else:
+                canvas.yview_scroll(delta, "units")
+            return "break"
+        except tk.TclError:
+            return None
+
+    def _on_route6_update_map_mousewheel_linux(self, event: tk.Event):
+        canvas = getattr(self, "route6_update_map_scroll_canvas", None)
+        if canvas is None:
+            return None
+        direction = -1 if int(getattr(event, "num", 0) or 0) == 4 else 1
+        try:
+            canvas.yview_scroll(direction, "units")
+            return "break"
+        except tk.TclError:
+            return None
+
+    def _bind_route6_update_map_mousewheel_tree(self, widget: tk.Widget) -> None:
+        try:
+            widget.bind("<MouseWheel>", self._on_route6_update_map_mousewheel, add="+")
+            widget.bind("<Button-4>", self._on_route6_update_map_mousewheel_linux, add="+")
+            widget.bind("<Button-5>", self._on_route6_update_map_mousewheel_linux, add="+")
+        except tk.TclError:
+            return
+        for child in widget.winfo_children():
+            self._bind_route6_update_map_mousewheel_tree(child)
+
+    def open_route6_update_map_window(self) -> None:
+        self.ensure_route6_state()
+        if self.route6_update_map_window is not None and self.route6_update_map_window.winfo_exists():
+            self.route6_update_map_window.lift()
+            self.route6_update_map_window.focus_force()
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Route 6 Update Map")
+        window.geometry("980x760")
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(0, weight=1)
+        window.protocol("WM_DELETE_WINDOW", self.close_route6_update_map_window)
+
+        route6_update_map_scroll_canvas = tk.Canvas(window, highlightthickness=0)
+        v_scrollbar = tk.Scrollbar(window, orient="vertical", command=route6_update_map_scroll_canvas.yview)
+        h_scrollbar = tk.Scrollbar(window, orient="horizontal", command=route6_update_map_scroll_canvas.xview)
+        route6_update_map_scroll_canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+        route6_update_map_scroll_canvas.grid(row=0, column=0, sticky="nsew")
+        v_scrollbar.grid(row=0, column=1, sticky="ns")
+        h_scrollbar.grid(row=1, column=0, sticky="ew")
+
+        content = tk.Frame(route6_update_map_scroll_canvas)
+        content_window = route6_update_map_scroll_canvas.create_window((0, 0), window=content, anchor="nw")
+        content.grid_columnconfigure(0, weight=1)
+
+        def _sync_scrollregion(_event: tk.Event) -> None:
+            try:
+                route6_update_map_scroll_canvas.configure(scrollregion=route6_update_map_scroll_canvas.bbox("all"))
+            except tk.TclError:
+                pass
+
+        def _sync_content_width(event: tk.Event) -> None:
+            try:
+                route6_update_map_scroll_canvas.itemconfigure(content_window, width=max(920, int(event.width)))
+            except tk.TclError:
+                pass
+
+        content.bind("<Configure>", _sync_scrollregion)
+        route6_update_map_scroll_canvas.bind("<Configure>", _sync_content_width)
+
+        toolbar = tk.LabelFrame(content, text="Route 6 Update Map")
+        toolbar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        toolbar.grid_columnconfigure(14, weight=1)
+        tk.Label(toolbar, text="Layer").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        route6_update_map_layer_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.route6_update_map_layer_var,
+            values=[f"z_{int(value):03d}" for value in route6_map_builder.DEFAULT_ROUTE6_LAYER_Z_CM],
+            state="readonly",
+            width=10,
+        )
+        route6_update_map_layer_combo.grid(row=0, column=1, sticky="w", padx=6, pady=6)
+        route6_update_map_layer_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_route6_update_map_window())
+        tk.Button(toolbar, text="Start Capture", command=self.on_route6_update_map_start_capture).grid(row=0, column=2, sticky="w", padx=6, pady=6)
+        tk.Button(toolbar, text="Stop Capture", command=self.on_route6_update_map_stop_capture).grid(row=0, column=3, sticky="w", padx=6, pady=6)
+        tk.Button(toolbar, text="Generate Map", command=self.on_route6_update_map_generate_map).grid(row=0, column=4, sticky="w", padx=6, pady=6)
+        tk.Button(toolbar, text="Start Realtime Update", command=self.on_route6_update_map_start_realtime).grid(row=0, column=5, sticky="w", padx=6, pady=6)
+        tk.Button(toolbar, text="Stop Realtime Update", command=self.on_route6_update_map_stop_realtime).grid(row=0, column=6, sticky="w", padx=6, pady=6)
+        tk.Button(toolbar, text="Open Capture Folders", command=self.open_route6_capture_folder_reader_window).grid(row=0, column=7, sticky="w", padx=6, pady=6)
+        tk.Label(toolbar, text="Interval s").grid(row=0, column=8, sticky="e", padx=(18, 2), pady=6)
+        tk.Entry(toolbar, textvariable=self.route6_update_map_capture_interval_s_var, width=6).grid(row=0, column=9, sticky="w", padx=(0, 6), pady=6)
+        tk.Label(toolbar, text="Min move cm").grid(row=0, column=10, sticky="e", padx=(12, 2), pady=6)
+        tk.Entry(toolbar, textvariable=self.route6_update_map_min_move_cm_var, width=6).grid(row=0, column=11, sticky="w", padx=(0, 6), pady=6)
+        tk.Label(toolbar, text="Min yaw deg").grid(row=0, column=12, sticky="e", padx=(12, 2), pady=6)
+        tk.Entry(toolbar, textvariable=self.route6_update_map_min_yaw_deg_var, width=6).grid(row=0, column=13, sticky="w", padx=(0, 6), pady=6)
+        tk.Label(toolbar, textvariable=self.route6_update_map_status_var, anchor="w").grid(row=1, column=0, columnspan=15, sticky="ew", padx=6, pady=6)
+        tk.Label(toolbar, textvariable=self.route6_update_map_pose_var, anchor="w").grid(row=2, column=0, columnspan=15, sticky="ew", padx=6, pady=(0, 6))
+
+        preview_frame = tk.LabelFrame(content, text="Layer Preview")
+        preview_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        preview_frame.grid_columnconfigure(0, weight=1)
+        route6_update_map_preview_label = tk.Label(preview_frame, text="Loading layered map...", anchor="center", justify="center")
+        route6_update_map_preview_label.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+
+        self.route6_update_map_window = window
+        self.route6_update_map_scroll_canvas = route6_update_map_scroll_canvas
+        self.route6_update_map_content_frame = content
+        self.route6_update_map_layer_combo = route6_update_map_layer_combo
+        self.route6_update_map_preview_label = route6_update_map_preview_label
+        self._bind_route6_update_map_mousewheel_tree(window)
+        self.refresh_route6_update_map_window()
+        self.route6_update_map_schedule_pose_refresh()
+
+    def open_route6_capture_folder_reader_window(self) -> None:
+        self.ensure_route6_state()
+        if self.route6_capture_folder_reader_window is not None and self.route6_capture_folder_reader_window.winfo_exists():
+            self.route6_capture_folder_reader_window.lift()
+            self.route6_capture_folder_reader_window.focus_force()
+            self.refresh_route6_capture_folder_list()
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Route 6 Capture Folder Reader")
+        window.geometry("980x700")
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(1, weight=1)
+        window.grid_rowconfigure(3, weight=1)
+        window.protocol("WM_DELETE_WINDOW", self.close_route6_capture_folder_reader_window)
+
+        header = tk.Frame(window)
+        header.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        header.grid_columnconfigure(1, weight=1)
+        tk.Label(header, text="Root").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        tk.Label(header, text=str(self.route6_output_root()), anchor="w").grid(row=0, column=1, sticky="ew")
+
+        list_frame = tk.LabelFrame(window, text="Capture Folders")
+        list_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        list_frame.grid_columnconfigure(0, weight=1)
+        list_frame.grid_rowconfigure(0, weight=1)
+        listbox = tk.Listbox(list_frame, exportselection=False, height=14)
+        list_scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=list_scrollbar.set)
+        listbox.grid(row=0, column=0, sticky="nsew")
+        list_scrollbar.grid(row=0, column=1, sticky="ns")
+        listbox.bind("<<ListboxSelect>>", self.on_route6_capture_folder_select)
+
+        actions = tk.Frame(window)
+        actions.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
+        actions.grid_columnconfigure(4, weight=1)
+        tk.Button(actions, text="Refresh", command=self.refresh_route6_capture_folder_list).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        tk.Button(actions, text="Process Pointcloud Data", command=self.on_route6_capture_folder_process_pointcloud).grid(row=0, column=1, sticky="w", padx=6)
+        tk.Button(actions, text="Generate Map", command=self.on_route6_capture_folder_generate_map).grid(row=0, column=2, sticky="w", padx=6)
+        tk.Button(actions, text="Load Map", command=self.on_route6_capture_folder_load_map).grid(row=0, column=3, sticky="w", padx=6)
+        tk.Label(actions, textvariable=self.route6_selected_capture_folder_var, anchor="w").grid(row=0, column=4, sticky="ew", padx=10)
+
+        report_frame = tk.LabelFrame(window, text="Pointcloud Report")
+        report_frame.grid(row=3, column=0, sticky="nsew", padx=8, pady=4)
+        report_frame.grid_columnconfigure(0, weight=1)
+        report_frame.grid_rowconfigure(0, weight=1)
+        report_text = tk.Text(report_frame, height=10, wrap="none", font=("Consolas", 9))
+        report_y = tk.Scrollbar(report_frame, orient="vertical", command=report_text.yview)
+        report_x = tk.Scrollbar(report_frame, orient="horizontal", command=report_text.xview)
+        report_text.configure(yscrollcommand=report_y.set, xscrollcommand=report_x.set, state="disabled")
+        report_text.grid(row=0, column=0, sticky="nsew")
+        report_y.grid(row=0, column=1, sticky="ns")
+        report_x.grid(row=1, column=0, sticky="ew")
+
+        tk.Label(window, textvariable=self.route6_capture_folder_status_var, anchor="w").grid(row=4, column=0, sticky="ew", padx=8, pady=(4, 8))
+
+        self.route6_capture_folder_reader_window = window
+        self.route6_capture_folder_listbox = listbox
+        self.route6_pointcloud_report_text = report_text
+        self.refresh_route6_capture_folder_list()
+
+    def close_route6_capture_folder_reader_window(self) -> None:
+        self.ensure_route6_state()
+        if self.route6_capture_folder_reader_window is not None:
+            try:
+                self.route6_capture_folder_reader_window.destroy()
+            except Exception:
+                pass
+        self.route6_capture_folder_reader_window = None
+        self.route6_capture_folder_listbox = None
+        self.route6_pointcloud_report_text = None
+
+    def close_route6_update_map_window(self) -> None:
+        self.ensure_route6_state()
+        self.route6_update_map_capture_stop_event.set()
+        self.route6_update_map_realtime_stop_event.set()
+        after_id = getattr(self, "route6_update_map_pose_after_id", None)
+        if after_id is not None and self.route6_update_map_window is not None:
+            try:
+                self.route6_update_map_window.after_cancel(after_id)
+            except Exception:
+                pass
+        self.route6_update_map_pose_after_id = None
+        if self.route6_update_map_window is not None:
+            try:
+                self.route6_update_map_window.destroy()
+            except Exception:
+                pass
+        self.route6_update_map_window = None
+        self.route6_update_map_scroll_canvas = None
+        self.route6_update_map_content_frame = None
+        self.route6_update_map_layer_combo = None
+        self.route6_update_map_preview_label = None
+        self.route6_update_map_preview_photo = None
+
+    def route6_run_entrance_search(
+        self,
+        output_dir: Path,
+        house_id: str,
+        house_state: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        out_path = Path(output_dir)
+        hid = str(house_id or "").strip()
+        house_dir = self.route6_house_output_dir(out_path, hid)
+        entrance_dir = house_dir / "entrance"
+        entrance_dir.mkdir(parents=True, exist_ok=True)
+        self.route6_set_stage("SEARCH_ENTRANCE", f"preparing Route 6 entrance evidence for house={hid}")
+        state = house_state if isinstance(house_state, dict) else {}
+        scan_points = self.llm_route6_state.get("scan_points", []) if isinstance(self.llm_route6_state.get("scan_points"), list) else []
+        manifest = self.route6_build_entrance_capture_manifest(out_path, hid, scan_points)
+        analysis = self.route6_run_route5_capture_analysis_for_house(out_path, hid, manifest)
+        analysis_ran = bool(analysis.get("ran", False))
+        analysis_error = str(analysis.get("error", "") or "")
+        route5_candidates = analysis.get("candidates", []) if isinstance(analysis.get("candidates", []), list) else []
+        route5_candidate_count = int(analysis.get("candidate_count", len(route5_candidates)) or len(route5_candidates))
+        close_confirm_plan = (
+            self.route6_build_close_confirm_scan_plan(out_path, hid, route5_candidates, state)
+            if route5_candidate_count > 0
+            else {}
+        )
+        close_confirm_plan_path = str(entrance_dir / "close_confirm_scan_plan.json") if close_confirm_plan else ""
+        yolo_manifest = {
+            "schema": "route6_entrance_yolo_manifest_v1",
+            "house_id": hid,
+            "source": "route5_capture_analysis" if analysis_ran else "route6_capture_manifest",
+            "included_count": int(manifest.get("included_count", 0) or 0),
+            "excluded_count": int(manifest.get("excluded_count", 0) or 0),
+            "included_captures": manifest.get("included_captures", []),
+            "excluded_captures": manifest.get("excluded_captures", []),
+            "recommended_next_tool": "route5_run_capture_analysis",
+            "route5_analysis": analysis,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        candidates_payload = {
+            "schema": "route6_entrance_candidates_v1",
+            "house_id": hid,
+            "candidate_count": route5_candidate_count,
+            "candidates": route5_candidates,
+            "source": "route5_capture_analysis" if analysis_ran else "pending_yolo_or_pointcloud_validation",
+            "route5_entrance_candidates_path": str(analysis.get("entrance_candidates_path", "") or ""),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(entrance_dir / "yolo_manifest.json", yolo_manifest)
+        self.route6_write_json_artifact(entrance_dir / "entrance_candidates.json", candidates_payload)
+        self.route6_write_json_artifact(entrance_dir / "capture_manifest.json", manifest)
+        corrected_config_path = str((state.get("map_artifacts", {}) if isinstance(state.get("map_artifacts", {}), dict) else {}).get("corrected_config_path", ""))
+        polygons_path = str((state.get("map_artifacts", {}) if isinstance(state.get("map_artifacts", {}), dict) else {}).get("polygons_path", ""))
+        coverage_report_path = str(state.get("coverage_report_path", "") or "")
+        map_ready = str(state.get("status", "")) in {"mapped_complete", "mapped_partial"}
+        included_count = int(manifest.get("included_count", 0) or 0)
+        if not map_ready:
+            status = "not_ready_for_entrance_search"
+            recommended = "finish_route6_pointcloud_mapping"
+            entry_search_complete = False
+        elif analysis_error:
+            status = "route5_capture_analysis_failed"
+            recommended = "inspect_route5_capture_analysis_error"
+            entry_search_complete = False
+        elif analysis_ran and route5_candidate_count > 0:
+            status = "entrance_candidates_need_close_confirm"
+            recommended = "run_close_confirm_scan_and_obstacle_validation"
+            entry_search_complete = False
+        elif analysis_ran:
+            status = "no_entry_candidate_after_full_coverage"
+            recommended = "select_next_house_or_rescan_if_coverage_is_low"
+            entry_search_complete = True
+        elif included_count > 0:
+            status = "ready_for_route5_capture_analysis"
+            recommended = "run_route5_capture_analysis_on_route6_output"
+            entry_search_complete = False
+        else:
+            status = "map_ready_waiting_for_rgb_depth_analysis"
+            recommended = "capture_rgb_depth_pointcloud_with_route5_guard"
+            entry_search_complete = False
+        report = {
+            "schema": "route6_entrance_validation_report_v1",
+            "house_id": hid,
+            "status": status,
+            "entry_search_complete": entry_search_complete,
+            "recommended_next_action": recommended,
+            "corrected_config_path": corrected_config_path,
+            "polygons_path": polygons_path,
+            "coverage_report_path": coverage_report_path,
+            "yolo_manifest_path": str(entrance_dir / "yolo_manifest.json"),
+            "entrance_candidates_path": str(entrance_dir / "entrance_candidates.json"),
+            "capture_manifest_path": str(entrance_dir / "capture_manifest.json"),
+            "close_confirm_scan_plan_path": close_confirm_plan_path,
+            "route5_analysis_summary_path": str(analysis.get("summary_path", "") or ""),
+            "route5_analysis_status": str(analysis.get("status", "") or ""),
+            "route5_analysis_error": analysis_error,
+            "included_capture_count": included_count,
+            "excluded_capture_count": int(manifest.get("excluded_count", 0) or 0),
+            "candidate_count": route5_candidate_count,
+            "close_confirm_planned_scan_count": int(close_confirm_plan.get("planned_scan_count", 0) or 0) if close_confirm_plan else 0,
+            "notes": [
+                "Route 6 keeps entrance search open until close-confirm scan and obstacle validation finish.",
+            ],
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(entrance_dir / "entrance_validation_report.json", report)
+        house_states = self.llm_route6_state.setdefault("house_states", {})
+        current = dict(house_states.get(hid, state) if isinstance(house_states.get(hid, state), dict) else state)
+        current["entrance_status"] = status
+        if route5_candidate_count > 0:
+            current["search_status"] = "pending_close_confirm_scan"
+            current["entrance_status"] = "candidates_need_close_confirm"
+            current["close_confirm_scan_plan_path"] = close_confirm_plan_path
+        elif entry_search_complete:
+            current["status"] = "searched_no_entry"
+            current["search_status"] = "searched_no_entry"
+            current["entrance_status"] = "no_entry_candidate_after_full_coverage"
+        else:
+            current["search_status"] = "pending_capture_analysis" if included_count > 0 else "pending_entrance_capture_evidence"
+        current["entrance_report_path"] = str(entrance_dir / "entrance_validation_report.json")
+        current["route5_analysis_summary_path"] = str(analysis.get("summary_path", "") or "")
+        current["entrance_candidate_count"] = route5_candidate_count
+        current["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        house_states[hid] = current
+        self.llm_route6_state["last_entrance_report"] = report
+        self.route6_write_json_artifact(house_dir / "house_state.json", current)
+        self.route6_write_run_artifacts(out_path)
+        self.route6_write_state_artifact()
+        self.route6_log_event(out_path, "entrance_search_prepared", {"house_id": hid, "status": status, "included_capture_count": included_count})
+        return report
+
+    def route6_execute_close_confirm_scan(
+        self,
+        session: Optional[flight.DroneFlightSession],
+        output_dir: Path,
+        house_id: str,
+        entrance_report: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        out_path = Path(output_dir)
+        hid = str(house_id or "").strip()
+        house_dir = self.route6_house_output_dir(out_path, hid)
+        entrance_dir = house_dir / "entrance"
+        report_path = entrance_dir / "close_confirm_execution_report.json"
+        plan_path = Path(str((entrance_report or {}).get("close_confirm_scan_plan_path", "") or ""))
+        plan = self.route6_load_json_artifact(plan_path, {}) if plan_path else {}
+        points = plan.get("scan_points", []) if isinstance(plan.get("scan_points", []), list) else []
+        runner = getattr(self, "active_nbv_execute_scan_points", None)
+        if session is None or not points or not callable(runner):
+            execution = {
+                "schema": "route6_close_confirm_execution_report_v1",
+                "house_id": hid,
+                "status": "pending",
+                "reason": "session_or_executor_unavailable" if session is None or not callable(runner) else "no_confirm_scan_points",
+                "plan_path": str(plan_path),
+                "planned_scan_count": len(points),
+                "executed_scan_count": 0,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            self.route6_write_json_artifact(report_path, execution)
+            return execution
+        self.route6_set_stage("VALIDATE_HOUSE", f"executing Route 6 close-confirm scan for house={hid}")
+        status = "executed"
+        error = ""
+        try:
+            if callable(getattr(self, "ensure_active_nbv_state", None)):
+                self.ensure_active_nbv_state()
+            if hasattr(self, "active_nbv_output_dir"):
+                self.active_nbv_output_dir = out_path
+            if hasattr(self, "active_nbv_state"):
+                self.active_nbv_state = {
+                    "schema": "route6_close_confirm_active_nbv_state_v1",
+                    "target_house_id": hid,
+                    "output_dir": str(out_path),
+                    "scan_points": points,
+                }
+            runner(session, out_path, hid, points, round_index=90, all_points=points)
+        except Exception as exc:
+            status = "failed"
+            error = str(exc)
+            self.route6_log_event(out_path, "close_confirm_scan_failed", {"house_id": hid, "error": error})
+        executed_count = len(points) if status == "executed" else 0
+        execution = {
+            "schema": "route6_close_confirm_execution_report_v1",
+            "house_id": hid,
+            "status": status,
+            "error": error,
+            "plan_path": str(plan_path),
+            "planned_scan_count": len(points),
+            "executed_scan_count": executed_count,
+            "scan_points": self.route6_json_safe(points),
+            "recommended_next_action": "run_route5_capture_analysis_on_close_confirm_captures" if status == "executed" else "inspect_close_confirm_scan_failure",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(report_path, execution)
+        validation_path = entrance_dir / "entrance_validation_report.json"
+        validation = self.route6_load_json_artifact(validation_path, {})
+        if validation:
+            validation["close_confirm_execution_report_path"] = str(report_path)
+            validation["close_confirm_status"] = status
+            validation["close_confirm_executed_scan_count"] = executed_count
+            validation["entry_search_complete"] = False
+            validation["recommended_next_action"] = execution["recommended_next_action"]
+            validation["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            self.route6_write_json_artifact(validation_path, validation)
+            self.llm_route6_state["last_entrance_report"] = validation
+        house_states = self.llm_route6_state.setdefault("house_states", {})
+        current = dict(house_states.get(hid, {}) if isinstance(house_states.get(hid, {}), dict) else {})
+        current["close_confirm_status"] = status
+        current["close_confirm_execution_report_path"] = str(report_path)
+        if status == "executed":
+            current["search_status"] = "pending_close_confirm_analysis"
+            current["entrance_status"] = "close_confirm_scan_executed"
+        elif status == "failed":
+            current["search_status"] = "close_confirm_scan_failed"
+            current["entrance_status"] = "close_confirm_scan_failed"
+        current["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        house_states[hid] = current
+        self.route6_write_json_artifact(house_dir / "house_state.json", current)
+        self.route6_write_run_artifacts(out_path)
+        self.route6_write_state_artifact()
+        self.route6_log_event(out_path, "close_confirm_scan_execution", {"house_id": hid, "status": status, "executed_scan_count": executed_count})
+        return execution
+
+    def route6_write_close_confirm_obstacle_validation(
+        self,
+        output_dir: Path,
+        house_id: str,
+        included_captures: List[Dict[str, Any]],
+        excluded_captures: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        out_path = Path(output_dir)
+        hid = str(house_id or "").strip()
+        house_dir = self.route6_house_output_dir(out_path, hid)
+        entrance_dir = house_dir / "entrance"
+        blockers: List[Dict[str, Any]] = []
+        warnings: List[str] = []
+        for row in included_captures:
+            if not isinstance(row, dict):
+                continue
+            safety_state = str(row.get("safety_state", row.get("front_risk_state", row.get("risk_state", ""))) or "").lower()
+            obstacle_status = str(row.get("obstacle_validation_status", row.get("obstacle_status", "")) or "").lower()
+            collision = bool(row.get("collision_state", False))
+            avoidance_failed = bool(row.get("avoidance_failed", False))
+            terminal = any(token in safety_state for token in ("terminal", "blocked", "collision", "must_stop"))
+            blocked = collision or avoidance_failed or terminal or obstacle_status in {"blocked", "terminal_blocked", "collision"}
+            if blocked:
+                blockers.append({
+                    "scan_id": str(row.get("scan_id", "") or ""),
+                    "collision_state": collision,
+                    "avoidance_failed": avoidance_failed,
+                    "safety_state": safety_state,
+                    "obstacle_validation_status": obstacle_status,
+                    "front_min_depth_cm": row.get("front_min_depth_cm", row.get("min_depth_cm", "")),
+                    "reason": "collision_or_terminal_obstacle_risk",
+                })
+        for row in excluded_captures:
+            if isinstance(row, dict) and str(row.get("reason", "") or "") in {"capture_guard_failed_or_missing", "point_count_not_positive"}:
+                warnings.append(f"{row.get('scan_id', 'unknown')}: {row.get('reason')}")
+        passable = len(included_captures) > 0 and not blockers
+        if blockers:
+            status = "blocked"
+            recommended = "run_avoidance_or_rescan_candidate_from_safer_standoff"
+        elif passable:
+            status = "clear"
+            recommended = "accept_confirmed_entrance"
+        else:
+            status = "insufficient_evidence"
+            recommended = "capture_more_close_confirm_frames"
+        report = {
+            "schema": "route6_obstacle_validation_report_v1",
+            "house_id": hid,
+            "status": status,
+            "passable_space_confirmed": passable,
+            "included_confirm_capture_count": len(included_captures),
+            "excluded_confirm_capture_count": len(excluded_captures),
+            "blocking_capture_count": len(blockers),
+            "blocking_captures": blockers,
+            "warnings": warnings,
+            "recommended_next_action": recommended,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(entrance_dir / "obstacle_validation_report.json", report)
+        return report
+
+    def route6_run_close_confirm_analysis(
+        self,
+        output_dir: Path,
+        house_id: str,
+        execution_report: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        out_path = Path(output_dir)
+        hid = str(house_id or "").strip()
+        house_dir = self.route6_house_output_dir(out_path, hid)
+        entrance_dir = house_dir / "entrance"
+        analysis_report_path = entrance_dir / "close_confirm_analysis_report.json"
+        plan_path = Path(str((execution_report or {}).get("plan_path", "") or ""))
+        plan = self.route6_load_json_artifact(plan_path, {}) if plan_path else {}
+        plan_points = plan.get("scan_points", []) if isinstance(plan.get("scan_points", []), list) else []
+        confirm_scan_ids = {
+            str(point.get("scan_id", "") or "").strip()
+            for point in plan_points
+            if isinstance(point, dict) and str(point.get("scan_id", "") or "").strip()
+        }
+        manifest = self.route6_build_entrance_capture_manifest(out_path, hid, plan_points)
+        included = [
+            row for row in manifest.get("included_captures", [])
+            if isinstance(row, dict)
+            and (
+                str(row.get("scan_id", "") or "").strip() in confirm_scan_ids
+                or str(row.get("view_type", "") or "") == "route6_close_confirm_scan"
+            )
+        ]
+        excluded = [
+            row for row in manifest.get("excluded_captures", [])
+            if isinstance(row, dict)
+            and (
+                str(row.get("scan_id", "") or "").strip() in confirm_scan_ids
+                or str(row.get("view_type", "") or "") == "route6_close_confirm_scan"
+            )
+        ]
+        confirm_manifest = {
+            "schema": "route6_close_confirm_capture_manifest_v1",
+            "run_dir": str(out_path),
+            "house_id": hid,
+            "plan_path": str(plan_path),
+            "confirm_scan_ids": sorted(confirm_scan_ids),
+            "included_count": len(included),
+            "excluded_count": len(excluded),
+            "included_captures": included,
+            "excluded_captures": excluded,
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        manifest_path = entrance_dir / "close_confirm_capture_manifest.json"
+        self.route6_write_json_artifact(manifest_path, confirm_manifest)
+        analysis = self.route6_run_route5_capture_analysis_for_house(out_path, hid, confirm_manifest)
+        analysis_ran = bool(analysis.get("ran", False))
+        analysis_error = str(analysis.get("error", "") or "")
+        candidate_count = int(analysis.get("candidate_count", 0) or 0)
+        obstacle_validation = self.route6_write_close_confirm_obstacle_validation(out_path, hid, included, excluded)
+        obstacle_status = str(obstacle_validation.get("status", "") or "")
+        passable_space_confirmed = bool(obstacle_validation.get("passable_space_confirmed", False))
+        if analysis_error:
+            status = "analysis_failed"
+            recommended = "inspect_close_confirm_analysis_error"
+        elif analysis_ran and candidate_count > 0 and passable_space_confirmed:
+            status = "confirmed"
+            recommended = "navigate_to_confirmed_entrance_or_finish_house"
+        elif analysis_ran and candidate_count > 0:
+            status = "blocked_by_obstacle"
+            recommended = "run_avoidance_or_rescan_candidate_from_safer_standoff"
+        elif analysis_ran:
+            status = "not_confirmed"
+            recommended = "rescan_candidate_facade_or_select_next_house"
+        else:
+            status = "pending"
+            recommended = "run_route5_capture_analysis_on_close_confirm_captures"
+        report = {
+            "schema": "route6_close_confirm_analysis_report_v1",
+            "house_id": hid,
+            "status": status,
+            "recommended_next_action": recommended,
+            "capture_manifest_path": str(manifest_path),
+            "execution_report_path": str(entrance_dir / "close_confirm_execution_report.json"),
+            "route5_analysis_summary_path": str(analysis.get("summary_path", "") or ""),
+            "route5_analysis_status": str(analysis.get("status", "") or ""),
+            "route5_analysis_error": analysis_error,
+            "obstacle_validation_report_path": str(entrance_dir / "obstacle_validation_report.json"),
+            "obstacle_validation_status": obstacle_status,
+            "passable_space_confirmed": passable_space_confirmed,
+            "included_confirm_capture_count": len(included),
+            "excluded_confirm_capture_count": len(excluded),
+            "candidate_count": candidate_count,
+            "candidates": analysis.get("candidates", []) if isinstance(analysis.get("candidates", []), list) else [],
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(analysis_report_path, report)
+        validation_path = entrance_dir / "entrance_validation_report.json"
+        validation = self.route6_load_json_artifact(validation_path, {})
+        if validation:
+            validation["close_confirm_analysis_report_path"] = str(analysis_report_path)
+            validation["close_confirm_analysis_status"] = status
+            validation["close_confirm_candidate_count"] = candidate_count
+            validation["obstacle_validation_report_path"] = str(entrance_dir / "obstacle_validation_report.json")
+            validation["obstacle_validation_status"] = obstacle_status
+            validation["passable_space_confirmed"] = passable_space_confirmed
+            validation["entry_search_complete"] = status == "confirmed"
+            validation["status"] = "entrance_confirmed" if status == "confirmed" else f"close_confirm_{status}"
+            validation["recommended_next_action"] = recommended
+            validation["updated_at"] = datetime.now().isoformat(timespec="seconds")
+            self.route6_write_json_artifact(validation_path, validation)
+            self.llm_route6_state["last_entrance_report"] = validation
+        house_states = self.llm_route6_state.setdefault("house_states", {})
+        current = dict(house_states.get(hid, {}) if isinstance(house_states.get(hid, {}), dict) else {})
+        current["close_confirm_status"] = status
+        current["close_confirm_analysis_report_path"] = str(analysis_report_path)
+        current["close_confirm_candidate_count"] = candidate_count
+        current["obstacle_validation_report_path"] = str(entrance_dir / "obstacle_validation_report.json")
+        current["obstacle_validation_status"] = obstacle_status
+        if status == "confirmed":
+            current["status"] = "searched"
+            current["search_status"] = "entrance_confirmed"
+            current["entrance_status"] = "confirmed_by_close_confirm_scan"
+        elif status == "blocked_by_obstacle":
+            current["status"] = "blocked"
+            current["search_status"] = "entrance_candidate_blocked_by_obstacle"
+            current["entrance_status"] = "blocked_by_obstacle"
+            current["blocked_reason"] = "close_confirm_obstacle_validation_blocked"
+        elif status == "not_confirmed":
+            current["search_status"] = "close_confirm_not_confirmed"
+            current["entrance_status"] = "needs_rescan_or_next_candidate"
+        elif status == "analysis_failed":
+            current["search_status"] = "close_confirm_analysis_failed"
+            current["entrance_status"] = "close_confirm_analysis_failed"
+        current["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        house_states[hid] = current
+        self.route6_write_json_artifact(house_dir / "house_state.json", current)
+        self.route6_write_run_artifacts(out_path)
+        self.route6_write_state_artifact()
+        self.route6_log_event(out_path, "close_confirm_analysis", {"house_id": hid, "status": status, "candidate_count": candidate_count})
+        return report
+
+    def route6_write_house_coverage_report(
+        self,
+        output_dir: Path,
+        house_id: str,
+        scan_points: List[Dict[str, Any]],
+        valid_rows: List[Dict[str, Any]],
+        merged_cloud: np.ndarray,
+    ) -> Dict[str, Any]:
+        coverage: Dict[str, Any] = {}
+        if callable(getattr(self, "active_nbv_build_coverage_report", None)):
+            try:
+                coverage = self.active_nbv_build_coverage_report(house_id, scan_points, output_dir=Path(output_dir))
+            except Exception:
+                coverage = {}
+        if not coverage:
+            captured_ids = {str(row.get("scan_id", "") or "") for row in valid_rows}
+            facades: Dict[str, Dict[str, Any]] = {}
+            for facade in route6_map_builder.ROUTE6_FACADES:
+                planned = [point for point in scan_points if str(point.get("facade", "") or "") == facade]
+                captured = [point for point in planned if str(point.get("scan_id", "") or "") in captured_ids]
+                facades[facade] = {
+                    "facade": facade,
+                    "planned_scan_count": len(planned),
+                    "captured_scan_count": len(captured),
+                    "scan_completion_ratio": round(float(len(captured)) / float(max(1, len(planned))), 4),
+                    "point_cloud_coverage": round(float(len(captured)) / float(max(1, len(planned))), 4),
+                    "needs_rescan": bool(len(captured) < len(planned)),
+                }
+            values = [float(item["point_cloud_coverage"]) for item in facades.values()]
+            coverage = {
+                "schema": "route6_house_coverage_report_v1",
+                "target_house_id": str(house_id),
+                "facades": facades,
+                "valid_scan_capture_count": len(valid_rows),
+                "merged_point_count": int(merged_cloud.shape[0]),
+                "mean_facade_coverage": round(float(sum(values)) / float(max(1, len(values))), 4),
+                "complete": bool(valid_rows and merged_cloud.shape[0] > 0),
+                "coverage_mode": "route6_valid_scan_completion",
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        coverage["valid_scan_capture_count"] = int(coverage.get("valid_scan_capture_count", len(valid_rows)) or len(valid_rows))
+        coverage["merged_point_count"] = int(coverage.get("merged_point_count", merged_cloud.shape[0]) or merged_cloud.shape[0])
+        house_dir = self.route6_house_output_dir(Path(output_dir), house_id)
+        self.route6_write_json_artifact(house_dir / "coverage_report.json", coverage)
+        return coverage
+
+    def route6_postprocess_selected_house(self, output_dir: Path, house_id: str) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        out_path = Path(output_dir)
+        hid = str(house_id or self.llm_route6_state.get("selected_house_id", "") or "").strip()
+        house_dir = self.route6_house_output_dir(out_path, hid)
+        self.route6_set_stage("POSTPROCESS_POINTCLOUD", f"postprocessing Route 6 pointcloud for house={hid}")
+        rows = self.route6_read_lidar_rows(out_path)
+        scan_points = self.llm_route6_state.get("scan_points", []) if isinstance(self.llm_route6_state.get("scan_points"), list) else []
+        house_rows = self.route6_filter_rows_for_house(rows, hid, scan_points)
+        valid_rows = route6_map_builder.filter_valid_pointcloud_rows(house_rows)
+        if not valid_rows:
+            result = {
+                "schema": "route6_house_state_v1",
+                "house_id": hid,
+                "status": "needs_capture",
+                "reason": "no_valid_pointcloud_rows",
+                "valid_scan_capture_count": 0,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            self.route6_write_json_artifact(house_dir / "house_state.json", result)
+            self.llm_route6_state.setdefault("house_states", {})[hid] = result
+            self.route6_write_run_artifacts(out_path)
+            self.route6_write_state_artifact()
+            self.route6_set_stage("SCAN_HOUSE_FACADES", f"house={hid} needs live scan captures before map build.")
+            return result
+        merged = route6_map_builder.merge_pointcloud_rows(valid_rows)
+        map_config = getattr(self, "map_config", {}) if isinstance(getattr(self, "map_config", {}), dict) else {}
+        house = next(
+            (item for item in map_config.get("houses", []) if isinstance(item, dict) and str(item.get("id", "")) == hid),
+            None,
+        ) if isinstance(map_config.get("houses", []), list) else None
+        bbox = route6_map_builder.house_world_bbox(map_config, house) if isinstance(house, dict) else None
+        filtered = route6_map_builder.filter_pointcloud_for_mapping(merged, bbox_unreal_cm=bbox)
+        if filtered.shape[0] <= 0:
+            filtered = merged
+        pointcloud_dir = house_dir / "pointcloud"
+        pointcloud_dir.mkdir(parents=True, exist_ok=True)
+        merged_path = pointcloud_dir / "merged_point_cloud_world_standard_m.npy"
+        np.save(merged_path, filtered.astype(np.float32, copy=False))
+        merged_ply_path = pointcloud_dir / "merged_point_cloud_world_standard_m.ply"
+        route6_map_builder.write_pointcloud_ply(merged_ply_path, filtered)
+        coverage = self.route6_write_house_coverage_report(out_path, hid, scan_points, valid_rows, filtered)
+        self.route6_set_stage("BUILD_OCCUPANCY", f"building Route 6 occupancy map for house={hid}")
+        self.route6_set_stage("EXTRACT_POLYGONS", f"extracting Route 6 building polygon for house={hid}")
+        artifacts = route6_map_builder.write_route6_map_artifacts(
+            out_path,
+            map_config,
+            hid,
+            filtered,
+            resolution_m=float(self.llm_route6_occupancy_resolution_m_var.get() or 0.25),
+        )
+        map_dir = house_dir / "map"
+        map_dir.mkdir(parents=True, exist_ok=True)
+        for source_key, target_name in (
+            ("occupancy_grid_path", "occupancy_grid.npy"),
+            ("occupancy_metadata_path", "occupancy_grid.json"),
+            ("occupancy_preview_path", "occupancy_grid.png"),
+        ):
+            source = Path(str(artifacts.get(source_key, "") or ""))
+            if source.is_file():
+                target = map_dir / target_name
+                target.write_bytes(source.read_bytes())
+                artifacts[f"house_{source_key}"] = str(target)
+        building_polygon_path = map_dir / "building_polygon.json"
+        polygon_payload = artifacts.get("polygon", {}) if isinstance(artifacts.get("polygon", {}), dict) else {}
+        self.route6_write_json_artifact(building_polygon_path, polygon_payload)
+        artifacts["building_polygon_path"] = str(building_polygon_path)
+        corrected_house: Dict[str, Any] = {}
+        corrected_config_path = Path(str(artifacts.get("corrected_config_path", "") or ""))
+        if corrected_config_path.is_file():
+            try:
+                corrected_config = json.loads(corrected_config_path.read_text(encoding="utf-8"))
+                if isinstance(corrected_config, dict):
+                    self.route6_runtime_map_config = corrected_config
+                corrected_houses = corrected_config.get("houses", []) if isinstance(corrected_config.get("houses"), list) else []
+                corrected_house = next(
+                    (
+                        item for item in corrected_houses
+                        if isinstance(item, dict) and str(item.get("id", item.get("house_id", ""))) == hid
+                    ),
+                    {},
+                )
+            except Exception as exc:
+                corrected_house = {"route6_corrected_config_read_error": str(exc)}
+        if corrected_house:
+            corrected_config_path = self.route6_write_cumulative_corrected_config(out_path, hid, corrected_house)
+            artifacts["corrected_config_path"] = str(corrected_config_path)
+        corrected_bbox_path = map_dir / "corrected_bbox.json"
+        corrected_record = {
+            "schema": "route6_corrected_bbox_record_v1",
+            "house_id": hid,
+            "rough_bbox_world": bbox or {},
+            "candidate_bbox_world": corrected_house.get("route6_candidate_bbox_world", polygon_payload.get("bbox", {})),
+            "corrected_bbox_world": corrected_house.get("route6_corrected_bbox_world", {}),
+            "route6_map_status": str(corrected_house.get("route6_map_status", "candidate_only") or "candidate_only"),
+            "route6_correction_rejected_reason": str(corrected_house.get("route6_correction_rejected_reason", "") or ""),
+            "route6_map_confidence": corrected_house.get("route6_map_confidence", (polygon_payload.get("quality", {}) if isinstance(polygon_payload.get("quality", {}), dict) else {}).get("confidence", 0.0)),
+            "route6_center_shift_cm": corrected_house.get("route6_center_shift_cm", ""),
+            "route6_quality_gates": corrected_house.get("route6_quality_gates", {}),
+            "map_bbox_image": corrected_house.get("map_bbox_image", {}),
+            "corrected_config_path": str(corrected_config_path) if corrected_config_path else "",
+            "building_polygon_path": str(building_polygon_path),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(corrected_bbox_path, corrected_record)
+        artifacts["corrected_bbox_path"] = str(corrected_bbox_path)
+        cumulative_polygons_path = self.route6_write_cumulative_polygon_artifact(out_path, hid, polygon_payload)
+        artifacts["polygons_path"] = str(cumulative_polygons_path)
+        status = "mapped_complete" if bool(coverage.get("complete", False)) else "mapped_partial"
+        polygon_quality = polygon_payload.get("quality", {}) if isinstance(polygon_payload.get("quality", {}), dict) else {}
+        map_confidence = corrected_record.get("route6_map_confidence", polygon_quality.get("confidence", 0.0))
+        house_state = {
+            "schema": "route6_house_state_v1",
+            "house_id": hid,
+            "status": status,
+            "search_status": "pending_entrance_search",
+            "map_status": str(corrected_record.get("route6_map_status", "candidate_only") or "candidate_only"),
+            "facades": coverage.get("facades", {}) if isinstance(coverage.get("facades", {}), dict) else {},
+            "valid_scan_capture_count": len(valid_rows),
+            "merged_point_count": int(filtered.shape[0]),
+            "map_confidence": map_confidence,
+            "entrance_status": "not_started",
+            "blocked_reason": "",
+            "coverage_report_path": str(house_dir / "coverage_report.json"),
+            "merged_pointcloud_path": str(merged_path),
+            "merged_pointcloud_ply_path": str(merged_ply_path),
+            "map_artifacts": artifacts,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(house_dir / "house_state.json", house_state)
+        house_states = self.llm_route6_state.setdefault("house_states", {})
+        house_states[hid] = house_state
+        self.llm_route6_state["last_house_state"] = house_state
+        self.llm_route6_state["map_artifacts"] = artifacts
+        self.route6_write_run_artifacts(out_path)
+        self.route6_write_state_artifact()
+        self.route6_set_stage("CORRECT_MAP_CONFIG", f"Route 6 corrected map artifact written for house={hid}")
+        self.llm_route6_map_status_var.set(f"Map: {status}, points={int(filtered.shape[0])}")
+        return house_state
+
+    def route6_full_explore_worker(self, session: Optional[flight.DroneFlightSession] = None, *, force_new: bool = False) -> None:
+        self.ensure_route6_state()
+        output_dir = self.route6_initialize_run(force_new=force_new)
+        max_houses = self.route6_int_param(self.llm_route6_max_houses_var, 3, min_value=1, max_value=100)
+        max_runtime_minutes = self.route6_float_param(self.llm_route6_runtime_min_var, 30.0, min_value=0.0, max_value=1440.0)
+        max_runtime_s = float(max_runtime_minutes) * 60.0
+        started_monotonic = time.monotonic()
+        processed = list(self.llm_route6_state.get("processed_house_ids", [])) if isinstance(self.llm_route6_state.get("processed_house_ids", []), list) else []
+        terminal_message = ""
+        runtime_exhausted = False
+        while len(processed) < max_houses:
+            if max_runtime_s <= 0.0 or (time.monotonic() - started_monotonic) >= max_runtime_s:
+                runtime_exhausted = True
+                terminal_message = f"max_runtime_minutes={max_runtime_minutes:g} exhausted."
+                break
+            if self.llm_route6_stop_event.is_set():
+                terminal_message = "stop requested."
+                break
+            if not self.route6_wait_if_paused(output_dir):
+                terminal_message = "stop requested while paused."
+                break
+            selected_candidate = self.route6_select_next_house_for_mapping(output_dir)
+            selected = str(selected_candidate.get("house_id", "") or "")
+            if not selected:
+                terminal_message = "no more reachable Route 6 house candidates."
+                break
+            if self.llm_route6_force_next_event.is_set():
+                self.llm_route6_force_next_event.clear()
+                house_states = self.llm_route6_state.setdefault("house_states", {})
+                house_states[selected] = {
+                    "schema": "route6_house_state_v1",
+                    "house_id": selected,
+                    "status": "needs_rescan",
+                    "search_status": "force_next_requested",
+                    "cooldown_active": True,
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                self.route6_write_state_artifact()
+                self.route6_log_event(output_dir, "force_next_house", {"house_id": selected})
+                continue
+            self.route6_set_stage("PLAN_TO_HOUSE", f"planning Route 6 scan points for house={selected}")
+            points = self.route6_plan_selected_house_scan_points(output_dir, selected)
+            if session is not None and points and callable(getattr(self, "active_nbv_execute_scan_points", None)):
+                self.route6_set_stage("SCAN_HOUSE_FACADES", f"executing Route 6 live scan for house={selected}")
+                try:
+                    if callable(getattr(self, "ensure_active_nbv_state", None)):
+                        self.ensure_active_nbv_state()
+                    if hasattr(self, "active_nbv_output_dir"):
+                        self.active_nbv_output_dir = output_dir
+                    if hasattr(self, "active_nbv_state"):
+                        self.active_nbv_state = {
+                            "schema": "route6_active_nbv_bridge_state_v1",
+                            "target_house_id": selected,
+                            "output_dir": str(output_dir),
+                            "scan_points": points,
+                        }
+                    self.active_nbv_execute_scan_points(session, output_dir, selected, points, round_index=0, all_points=points)
+                except Exception as exc:
+                    self.route6_log_event(output_dir, "live_scan_failed", {"house_id": selected, "error": str(exc)})
+                    self.route6_set_stage("SCAN_HOUSE_FACADES", f"live scan failed for house={selected}: {exc}")
+            if self.llm_route6_force_next_event.is_set():
+                self.llm_route6_force_next_event.clear()
+                house_states = self.llm_route6_state.setdefault("house_states", {})
+                house_states[selected] = {
+                    "schema": "route6_house_state_v1",
+                    "house_id": selected,
+                    "status": "needs_rescan",
+                    "search_status": "force_next_requested",
+                    "cooldown_active": True,
+                    "updated_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                self.route6_write_state_artifact()
+                self.route6_log_event(output_dir, "force_next_house", {"house_id": selected})
+                continue
+            result = self.route6_postprocess_selected_house(output_dir, selected)
+            status = str(result.get("status", ""))
+            if selected not in processed:
+                processed.append(selected)
+                self.llm_route6_state["processed_house_ids"] = processed
+                self.route6_write_state_artifact()
+            if status in {"mapped_complete", "mapped_partial"}:
+                entrance_report = self.route6_run_entrance_search(output_dir, selected, result)
+                if entrance_report.get("close_confirm_scan_plan_path"):
+                    confirm_execution = self.route6_execute_close_confirm_scan(session, output_dir, selected, entrance_report)
+                    if str(confirm_execution.get("status", "") or "") == "executed":
+                        self.route6_run_close_confirm_analysis(output_dir, selected, confirm_execution)
+                self.route6_set_stage("SELECT_NEXT_HOUSE", f"Route 6 finished map artifacts for house={selected}; selecting next house.")
+                continue
+            if status == "needs_capture":
+                self.route6_set_stage("SCAN_HOUSE_FACADES", f"Route 6 waiting for captures, house={selected}")
+                if session is None:
+                    terminal_message = f"house={selected} needs live scan captures before continuing."
+                    break
+                continue
+            self.route6_set_stage("FAILED", f"Route 6 house processing failed, house={selected}")
+            return
+        if self.llm_route6_stop_event.is_set() or runtime_exhausted:
+            self.route6_set_stage("STOPPED", terminal_message or "stop requested.")
+        else:
+            self.llm_route6_state["processed_house_ids"] = processed
+            self.route6_write_run_artifacts(output_dir)
+            self.route6_write_state_artifact()
+            self.route6_set_stage("DONE", terminal_message or f"processed max_houses={len(processed)}.")
 
     def route6_update_summary_text(self) -> None:
         text_widget = getattr(self, "llm_route6_summary_text", None)
@@ -65,7 +3311,7 @@ class Route6ExploreControlMixin:
                 "write route6 corrected map artifact",
                 "run entrance search after local map confidence is sufficient",
             ],
-            "implementation_status": "button_and_window_ready; worker/map-builder implementation pending",
+            "implementation_status": "phase1/2 core ready: nearest-house queue, Active NBV bridge, pointcloud map artifacts, entrance readiness reports, and multi-house loop are wired",
         }
         try:
             text_widget.configure(state="normal")
@@ -75,6 +3321,48 @@ class Route6ExploreControlMixin:
         except tk.TclError:
             pass
 
+    def route6_update_runtime_metrics(self) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        states = self.route6_house_states()
+        statuses = [str(item.get("status", "") or "") for item in states.values() if isinstance(item, dict)]
+        mapped = len([status for status in statuses if status in {"mapped_complete", "mapped_partial", "searched", "searched_no_entry"}])
+        searched = len([status for status in statuses if status in {"searched", "searched_no_entry"}])
+        blocked = len([status for status in statuses if status in {"blocked", "terminal_blocked"}])
+        last_house = self.llm_route6_state.get("last_house_state", {}) if isinstance(self.llm_route6_state.get("last_house_state", {}), dict) else {}
+        artifacts = last_house.get("map_artifacts", {}) if isinstance(last_house.get("map_artifacts", {}), dict) else {}
+        confidence = last_house.get("map_confidence", "")
+        if confidence == "":
+            quality = artifacts.get("polygon", {}).get("quality", {}) if isinstance(artifacts.get("polygon", {}), dict) else {}
+            confidence = quality.get("confidence", "")
+        corrected_path = str(artifacts.get("corrected_config_path", "") or "")
+        selected = self.llm_route6_state.get("selected_candidate", {}) if isinstance(self.llm_route6_state.get("selected_candidate", {}), dict) else {}
+        current_facade = str(selected.get("nearest_facade", "") or "")
+        scan_points = self.llm_route6_state.get("scan_points", []) if isinstance(self.llm_route6_state.get("scan_points", []), list) else []
+        for point in scan_points:
+            if isinstance(point, dict) and str(point.get("status", "") or "") in {"planned", "captured", "active"}:
+                current_facade = str(point.get("facade", current_facade) or current_facade)
+                break
+        confidence_text = "n/a"
+        try:
+            confidence_text = f"{float(confidence):.3f}"
+        except Exception:
+            pass
+        corrected_text = Path(corrected_path).name if corrected_path else "n/a"
+        metrics = {
+            "mapped_count": mapped,
+            "searched_count": searched,
+            "blocked_count": blocked,
+            "current_facade": current_facade or "n/a",
+            "map_confidence": confidence_text,
+            "latest_corrected_config_path": corrected_path,
+        }
+        self.llm_route6_metrics_var.set(
+            f"Metrics: facade={metrics['current_facade']} mapped={mapped} searched={searched} "
+            f"blocked={blocked} confidence={confidence_text} corrected={corrected_text}"
+        )
+        self.llm_route6_state["runtime_metrics"] = metrics
+        return metrics
+
     def route6_set_stage(self, stage: str, message: str = "") -> None:
         self.ensure_route6_state()
         self.llm_route6_stage_var.set(f"Stage: {stage}")
@@ -82,7 +3370,18 @@ class Route6ExploreControlMixin:
             self.llm_route6_status_var.set(f"LLM Route V6: {message}")
         self.llm_route6_state["stage"] = str(stage)
         self.llm_route6_state["message"] = str(message or "")
+        self.llm_route6_state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        output_dir = self.llm_route6_state.get("output_dir") if isinstance(self.llm_route6_state, dict) else ""
+        if output_dir:
+            out_path = Path(str(output_dir))
+            self.route6_write_state_artifact()
+            self.route6_log_event(out_path, "stage", {"stage": str(stage), "message": str(message or "")})
+        self.route6_update_runtime_metrics()
+        if output_dir:
+            self.route6_write_state_artifact()
         self.route6_update_summary_text()
+        if getattr(self, "llm_route6_map_widget", None) is not None:
+            self.refresh_llm_route6_map()
 
     def open_llm_route_window6(self) -> None:
         self.ensure_route6_state()
@@ -95,7 +3394,8 @@ class Route6ExploreControlMixin:
         window.title("LLM House Entrance Route 6")
         window.geometry("1120x760")
         window.grid_columnconfigure(0, weight=1)
-        window.grid_rowconfigure(3, weight=1)
+        window.grid_rowconfigure(3, weight=2)
+        window.grid_rowconfigure(4, weight=1)
         window.protocol("WM_DELETE_WINDOW", self.close_llm_route_window6)
 
         header = tk.LabelFrame(window, text="Route 6 Nearest House Pointcloud Map")
@@ -125,9 +3425,14 @@ class Route6ExploreControlMixin:
         actions = tk.Frame(window)
         actions.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
         tk.Button(actions, text="Start Nearest House Map Search", command=self.on_route6_start_nearest_map_search).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Pause", command=self.on_route6_pause).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Resume", command=self.on_route6_resume).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Stop", command=self.on_route6_stop).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Force Next House", command=self.on_route6_force_next_house).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Clear", command=self.on_route6_clear).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Save Corrected Map Config", command=self.on_route6_save_corrected_map_config).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Open Latest Route 6 Output", command=self.on_route6_open_latest_output).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Route 6 Update Map", command=self.open_route6_update_map_window).pack(side="left", padx=6, pady=4)
 
         status = tk.LabelFrame(window, text="Status")
         status.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
@@ -138,10 +3443,30 @@ class Route6ExploreControlMixin:
         tk.Label(status, textvariable=self.llm_route6_queue_var, anchor="w").grid(row=1, column=0, sticky="ew", padx=6, pady=3)
         tk.Label(status, textvariable=self.llm_route6_map_status_var, anchor="w").grid(row=1, column=1, sticky="ew", padx=6, pady=3)
         tk.Label(status, textvariable=self.llm_route6_output_dir_var, anchor="w").grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=3)
-        tk.Label(status, textvariable=self.llm_route6_status_var, anchor="w", wraplength=1040, justify="left").grid(row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=3)
+        tk.Label(status, textvariable=self.llm_route6_metrics_var, anchor="w").grid(row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=3)
+        tk.Label(status, textvariable=self.llm_route6_status_var, anchor="w", wraplength=1040, justify="left").grid(row=4, column=0, columnspan=2, sticky="ew", padx=6, pady=3)
+
+        map_section = tk.LabelFrame(window, text="Route 6 Map Overlay")
+        map_section.grid(row=3, column=0, sticky="nsew", padx=8, pady=4)
+        map_section.grid_columnconfigure(0, weight=1)
+        map_section.grid_rowconfigure(1, weight=1)
+        map_toolbar = tk.Frame(map_section)
+        map_toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
+        tk.Label(map_toolbar, textvariable=self.llm_route6_map_status_var, anchor="w").pack(side="left", fill="x", expand=True)
+        tk.Button(map_toolbar, text="Refresh Map", command=self.refresh_llm_route6_map).pack(side="right", padx=6)
+        initial_map_size = self.route5_map_canvas_size_for_width(1040, image_size=self.map_image_size()) if callable(getattr(self, "route5_map_canvas_size_for_width", None)) else {"width": 1040, "height": 300}
+        map_widget = OverheadMapWidget(
+            map_section,
+            world_bounds=self.map_world_bounds,
+            canvas_w=initial_map_size["width"],
+            canvas_h=initial_map_size["height"],
+        )
+        map_widget.canvas.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+        self.llm_route6_map_widget = map_widget
+        self.llm_route6_map_frame = map_section
 
         summary = tk.LabelFrame(window, text="Route 6 Implementation Contract")
-        summary.grid(row=3, column=0, sticky="nsew", padx=8, pady=(4, 8))
+        summary.grid(row=4, column=0, sticky="nsew", padx=8, pady=(4, 8))
         summary.grid_columnconfigure(0, weight=1)
         summary.grid_rowconfigure(0, weight=1)
         text = tk.Text(summary, height=18, wrap="none", font=("Consolas", 9))
@@ -153,6 +3478,7 @@ class Route6ExploreControlMixin:
         self.llm_route6_window = window
         self.llm_route6_summary_text = text
         self.route6_update_summary_text()
+        self.refresh_llm_route6_map()
 
     def close_llm_route_window6(self) -> None:
         self.ensure_route6_state()
@@ -163,48 +3489,84 @@ class Route6ExploreControlMixin:
                 pass
         self.llm_route6_window = None
         self.llm_route6_summary_text = None
+        self.llm_route6_map_widget = None
+        self.llm_route6_map_frame = None
 
     def on_route6_start_nearest_map_search(self) -> None:
         self.ensure_route6_state()
+        if self.llm_route6_thread is not None and self.llm_route6_thread.is_alive():
+            self.llm_route6_status_var.set("LLM Route V6: already running.")
+            return
         self.llm_route6_stop_event.clear()
-        target = ""
-        try:
-            target = self.selected_route_target_house_id()
-        except Exception:
-            target = ""
-        self.llm_route6_state = {
-            "mode": "route6_nearest_house_pointcloud_map",
-            "stage": "DESIGN_READY",
-            "selected_target_hint": str(target or ""),
-            "design_doc": str(self.route6_design_doc_path()),
-            "max_houses": self.llm_route6_max_houses_var.get(),
-            "runtime_minutes": self.llm_route6_runtime_min_var.get(),
-            "standoff_cm": self.llm_route6_standoff_cm_var.get(),
-            "scan_z_cm": self.llm_route6_scan_z_cm_var.get(),
-            "occupancy_resolution_m": self.llm_route6_occupancy_resolution_m_var.get(),
-            "coverage_threshold": self.llm_route6_coverage_threshold_var.get(),
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        }
-        self.llm_route6_current_house_var.set(f"Current house: {target or 'nearest reachable pending'}")
-        self.llm_route6_queue_var.set("House queue: pending ranking")
-        self.llm_route6_map_status_var.set("Map: waiting for route6 map builder")
-        self.llm_route6_output_dir_var.set("Output: route6_explore_runs/<next run>")
-        self.route6_set_stage("DESIGN_READY", "button ready; Route 6 worker/map builder will be implemented next.")
+        session = getattr(self, "session", None)
+        self.llm_route6_thread = threading.Thread(
+            target=lambda: self.route6_full_explore_worker(session, force_new=True),
+            daemon=True,
+        )
+        self.llm_route6_thread.start()
+        self.llm_route6_status_var.set("LLM Route V6: worker started.")
+
+    def on_route6_pause(self) -> None:
+        self.ensure_route6_state()
+        self.llm_route6_pause_event.set()
+        if hasattr(self, "active_nbv_pause_event"):
+            try:
+                self.active_nbv_pause_event.set()
+            except Exception:
+                pass
+        self.route6_set_stage("PAUSED", "pause requested.")
+
+    def on_route6_resume(self) -> None:
+        self.ensure_route6_state()
+        self.llm_route6_pause_event.clear()
+        if hasattr(self, "active_nbv_pause_event"):
+            try:
+                self.active_nbv_pause_event.clear()
+            except Exception:
+                pass
+        self.route6_set_stage("SELECT_NEXT_HOUSE", "resume requested.")
 
     def on_route6_stop(self) -> None:
         self.ensure_route6_state()
         self.llm_route6_stop_event.set()
+        self.llm_route6_pause_event.clear()
+        if hasattr(self, "active_nbv_stop_event"):
+            try:
+                self.active_nbv_stop_event.set()
+            except Exception:
+                pass
         self.route6_set_stage("STOPPED", "stop requested.")
+
+    def on_route6_force_next_house(self) -> None:
+        self.ensure_route6_state()
+        selected = str((self.llm_route6_state or {}).get("selected_house_id", "") or "")
+        if selected:
+            house_states = self.llm_route6_state.setdefault("house_states", {})
+            house_states[selected] = {
+                "schema": "route6_house_state_v1",
+                "house_id": selected,
+                "status": "needs_rescan",
+                "search_status": "force_next_requested",
+                "cooldown_active": True,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            self.route6_write_state_artifact()
+        self.llm_route6_force_next_event.set()
+        self.route6_set_stage("SELECT_NEXT_HOUSE", f"force next requested; skipped house={selected or 'n/a'}.")
 
     def on_route6_clear(self) -> None:
         self.ensure_route6_state()
         self.llm_route6_stop_event.clear()
+        self.llm_route6_pause_event.clear()
+        self.llm_route6_force_next_event.clear()
+        self.llm_route6_thread = None
         self.llm_route6_state = {}
         self.llm_route6_stage_var.set("Stage: idle")
         self.llm_route6_current_house_var.set("Current house: n/a")
         self.llm_route6_queue_var.set("House queue: n/a")
         self.llm_route6_map_status_var.set("Map: idle")
         self.llm_route6_output_dir_var.set("Output: n/a")
+        self.llm_route6_metrics_var.set("Metrics: mapped=0 searched=0 blocked=0 confidence=n/a corrected=n/a")
         self.llm_route6_status_var.set("LLM Route V6: cleared.")
         self.route6_update_summary_text()
 
@@ -213,4 +3575,27 @@ class Route6ExploreControlMixin:
         if not bool(self.llm_route6_allow_save_corrected_var.get()):
             self.llm_route6_status_var.set("LLM Route V6: enable corrected-config save before writing global map config.")
             return
-        self.llm_route6_status_var.set("LLM Route V6: no Route 6 corrected config artifact is available yet.")
+        output_dir = str((self.llm_route6_state or {}).get("output_dir", "") or "")
+        candidate = Path(output_dir) / "map" / "route6_corrected_houses_config.json" if output_dir else Path()
+        if not candidate.is_file():
+            self.llm_route6_status_var.set("LLM Route V6: no Route 6 corrected config artifact is available yet.")
+            return
+        target = PROJECT_ROOT / "assets" / "overhead_map" / DEFAULT_CORRECTED_MAP_CONFIG_NAME
+        try:
+            target.write_text(candidate.read_text(encoding="utf-8"), encoding="utf-8")
+            self.llm_route6_status_var.set(f"LLM Route V6: saved corrected config -> {target}")
+        except Exception as exc:
+            self.llm_route6_status_var.set(f"LLM Route V6: save corrected config failed: {exc}")
+
+    def on_route6_open_latest_output(self) -> None:
+        self.ensure_route6_state()
+        output_dir = str((self.llm_route6_state or {}).get("output_dir", "") or "")
+        path = Path(output_dir) if output_dir else self.route6_output_root()
+        if not path.exists():
+            self.llm_route6_status_var.set(f"LLM Route V6: output path not found: {path}")
+            return
+        try:
+            os.startfile(str(path))
+            self.llm_route6_status_var.set(f"LLM Route V6: opened output -> {path}")
+        except Exception as exc:
+            self.llm_route6_status_var.set(f"LLM Route V6: open output failed: {exc}; path={path}")

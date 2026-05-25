@@ -1011,7 +1011,7 @@ class Route4FusionControlMixin:
                         "Return strict compact JSON only. Do not output low-level movement commands."
                     ),
                     user_prompt=(
-                        "Plan ordered target houses and facade priority for the fused route + obstacle-avoidance run.\n"
+                        "Plan ordered target houses and facade priority for the fused Route6_entrance_search + obstacle-avoidance run.\n"
                         f"Context:\n{json.dumps(context, indent=2, ensure_ascii=False)}\n"
                         f"Expected JSON:\n{json.dumps(LLM_ROUTE3_TASK_PLAN_SCHEMA, indent=2, ensure_ascii=False)}"
                     ),
@@ -1640,7 +1640,7 @@ class Route4FusionControlMixin:
             }
             response = self.call_configured_llm_text(
                 system_prompt=(
-                    "You are a high-level UAV house facade search supervisor for a fused route and obstacle-avoidance run. "
+                    "You are a high-level UAV house facade search supervisor for a fused Route6_entrance_search and obstacle-avoidance run. "
                     "Choose the next facade only; do not output low-level movement commands. Return compact JSON."
                 ),
                 user_prompt=(
@@ -2171,7 +2171,7 @@ class Route4FusionControlMixin:
             method=LLM_STRATEGY_METHOD_ID,
             run_id="route4",
             geometry_label="auto",
-            note="Route4 fused route and obstacle avoidance.",
+            note="Route4 fused Route6_entrance_search and obstacle avoidance.",
             reach_tol_cm=float(config.get("reach_tol_cm", 60.0)),
             route_step_cm=float(config.get("nav_step_cm", 20.0)),
             side_correction_cm=max(float(DEFAULT_ROUTE_SIDE_CORRECTION_CM), float(config.get("nav_step_cm", 20.0))),
@@ -3117,7 +3117,7 @@ class Route4FusionControlMixin:
             self.route2_draw_rgb_preview_photo(widget, photo)
             self.llm_route4_rgb_photo = photo
         except Exception as exc:
-            LOGGER.warning("Refresh route v4 facade RGB failed: %s", exc)
+            LOGGER.warning("Refresh Route6_entrance_search v4 facade RGB failed: %s", exc)
             try:
                 self.route2_draw_rgb_preview_message(widget, f"RGB preview failed: {exc}")
                 self.llm_route4_rgb_photo = None
@@ -3178,7 +3178,7 @@ class Route4FusionControlMixin:
         except tk.TclError:
             pass
         except Exception as exc:
-            LOGGER.warning("Refresh LLM route v4 map failed: %s", exc)
+            LOGGER.warning("Refresh LLM Route6_entrance_search v4 map failed: %s", exc)
             self.llm_route4_map_status_var.set(f"Route V4 Map: failed: {exc}")
 
     def schedule_route4_auto_refresh(self) -> None:

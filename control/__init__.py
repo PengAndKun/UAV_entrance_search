@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .panel import RunDroneFlightPanel
+from .route6_explore_control import Route6ExploreControlMixin
 from .map_utils import (
     affine_rmse_px,
     build_corrected_map_config,
@@ -14,6 +15,7 @@ from .utils import default_llm_api_style, extract_json_object, normalize_llm_api
 
 __all__ = [
     'RunDroneFlightPanel',
+    'Route6ExploreControlMixin',
     'affine_rmse_px',
     'build_corrected_map_config',
     'corrected_anchors_from_touch_state',

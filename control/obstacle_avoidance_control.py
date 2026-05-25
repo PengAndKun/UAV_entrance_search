@@ -83,7 +83,7 @@ class ObstacleAvoidanceControlMixin:
         if not hasattr(self, "obstacle_plan_project_var"):
             self.obstacle_plan_project_var = tk.StringVar(value=DEFAULT_PROJECT_ID)
         if not hasattr(self, "obstacle_plan_project_name_var"):
-            self.obstacle_plan_project_name_var = tk.StringVar(value="Default 10 route episodes")
+            self.obstacle_plan_project_name_var = tk.StringVar(value="Default 10 Route6_entrance_search episodes")
         if not hasattr(self, "obstacle_plan_environment_var"):
             self.obstacle_plan_environment_var = tk.StringVar(value=DEFAULT_ENVIRONMENT_ID)
         if not hasattr(self, "obstacle_plan_method_var"):
@@ -194,9 +194,9 @@ class ObstacleAvoidanceControlMixin:
         intro.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
         intro.grid_columnconfigure(0, weight=1)
         text = (
-            "1. Start Unreal/session, then fly manually or run route movement while this window captures RGB + depth + point cloud.\n"
+            "1. Start Unreal/session, then fly manually or run Route6_entrance_search movement while this window captures RGB + depth + point cloud.\n"
             "2. Pick collection stage, scenario, method, risk_state, geometry label, and expert_action before capture.\n"
-            "3. v0 geometry summary and candidate_action_scores are logged for each tick, but this panel does not auto-control route movement.\n"
+            "3. v0 geometry summary and candidate_action_scores are logged for each tick, but this panel does not auto-control Route6_entrance_search movement.\n"
             "4. If the UAV is hit/collided, enable Collision or click Mark Collision before collecting the failed sample.\n"
             "5. Build Dataset -> Train Baseline -> Validate Model creates npz/json artifacts under obstacle_avoidance_data."
         )
@@ -528,7 +528,7 @@ class ObstacleAvoidanceControlMixin:
 
     def reset_default_obstacle_plans(self) -> None:
         self.ensure_obstacle_avoidance_state()
-        if not messagebox.askyesno("Reset Plans", "Reset the plan JSON to the default 10 route episodes?"):
+        if not messagebox.askyesno("Reset Plans", "Reset the plan JSON to the default 10 Route6_entrance_search episodes?"):
             return
         self.obstacle_plan_data = make_default_plans()
         save_plans(self.obstacle_plan_path(), self.obstacle_plan_data)
@@ -876,7 +876,7 @@ class ObstacleAvoidanceControlMixin:
                     "status": "blocked",
                     "method": method,
                     "reason": "runner_not_implemented",
-                    "hint": "Use geometry_rule_v0 for the current executable route-episode baseline.",
+                    "hint": "Use geometry_rule_v0 for the current executable Route6_entrance_search-episode baseline.",
                 }
             )
             return

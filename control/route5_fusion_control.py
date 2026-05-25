@@ -1201,7 +1201,7 @@ class Route5FusionControlMixin:
                         "Return strict compact JSON only. Do not output low-level movement commands."
                     ),
                     user_prompt=(
-                        "Plan ordered target houses and facade priority for the fused route + obstacle-avoidance run.\n"
+                        "Plan ordered target houses and facade priority for the fused Route6_entrance_search + obstacle-avoidance run.\n"
                         f"Context:\n{json.dumps(context, indent=2, ensure_ascii=False)}\n"
                         f"Expected JSON:\n{json.dumps(LLM_ROUTE3_TASK_PLAN_SCHEMA, indent=2, ensure_ascii=False)}"
                     ),
@@ -1866,7 +1866,7 @@ class Route5FusionControlMixin:
             }
             response = self.call_configured_llm_text(
                 system_prompt=(
-                    "You are a high-level UAV house facade search supervisor for a fused route and obstacle-avoidance run. "
+                    "You are a high-level UAV house facade search supervisor for a fused Route6_entrance_search and obstacle-avoidance run. "
                     "Choose the next facade only; do not output low-level movement commands. Return compact JSON."
                 ),
                 user_prompt=(
@@ -3239,7 +3239,7 @@ class Route5FusionControlMixin:
             method=LLM_STRATEGY_METHOD_ID,
             run_id="route5",
             geometry_label="auto",
-            note="Route5 fused route and obstacle avoidance.",
+            note="Route5 fused Route6_entrance_search and obstacle avoidance.",
             reach_tol_cm=float(config.get("reach_tol_cm", 60.0)),
             route_step_cm=float(config.get("nav_step_cm", 20.0)),
             side_correction_cm=max(float(DEFAULT_ROUTE_SIDE_CORRECTION_CM), float(config.get("nav_step_cm", 20.0))),
@@ -3926,7 +3926,7 @@ class Route5FusionControlMixin:
             }
             try:
                 response = self.call_configured_llm_text(
-                    system_prompt="Return compact JSON only for UAV route repair. Choose one allowed action and explain briefly.",
+                    system_prompt="Return compact JSON only for UAV Route6_entrance_search repair. Choose one allowed action and explain briefly.",
                     user_prompt=json.dumps(
                         {
                             "allowed_actions": sorted(allowed),
@@ -5619,7 +5619,7 @@ class Route5FusionControlMixin:
             self.route2_draw_rgb_preview_photo(widget, photo)
             self.llm_route5_rgb_photo = photo
         except Exception as exc:
-            LOGGER.warning("Refresh route v5 facade RGB failed: %s", exc)
+            LOGGER.warning("Refresh Route6_entrance_search v5 facade RGB failed: %s", exc)
             try:
                 self.route2_draw_rgb_preview_message(widget, f"RGB preview failed: {exc}")
                 self.llm_route5_rgb_photo = None
@@ -5859,7 +5859,7 @@ class Route5FusionControlMixin:
         tk.Entry(dialog, textvariable=self.llm_route5_capture_analysis_run_dir_var).grid(row=0, column=1, sticky="ew", padx=4, pady=(10, 4))
 
         def browse() -> None:
-            selected = filedialog.askdirectory(title="Select V5 route run folder", initialdir=str(initial_dir))
+            selected = filedialog.askdirectory(title="Select V5 Route6_entrance_search run folder", initialdir=str(initial_dir))
             if selected:
                 self.llm_route5_capture_analysis_run_dir_var.set(str(Path(selected)))
 
@@ -6202,7 +6202,7 @@ class Route5FusionControlMixin:
         except tk.TclError:
             pass
         except Exception as exc:
-            LOGGER.warning("Refresh LLM route v5 map failed: %s", exc)
+            LOGGER.warning("Refresh LLM Route6_entrance_search v5 map failed: %s", exc)
             self.llm_route5_map_status_var.set(f"Route V5 Map: failed: {exc}")
 
     def schedule_route5_auto_refresh(self) -> None:

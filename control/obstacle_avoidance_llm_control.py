@@ -69,7 +69,7 @@ class ObstacleAvoidanceLLMControlMixin:
         if not hasattr(self, "obstacle_avoidance_llm_project_var"):
             self.obstacle_avoidance_llm_project_var = tk.StringVar(value=LLM_DEFAULT_PROJECT_ID)
         if not hasattr(self, "obstacle_avoidance_llm_project_name_var"):
-            self.obstacle_avoidance_llm_project_name_var = tk.StringVar(value="OA-LLM default route obstacle collection")
+            self.obstacle_avoidance_llm_project_name_var = tk.StringVar(value="OA-LLM default Route6_entrance_search obstacle collection")
         if not hasattr(self, "obstacle_avoidance_llm_environment_var"):
             self.obstacle_avoidance_llm_environment_var = tk.StringVar(value=LLM_DEFAULT_ENVIRONMENT_ID)
         if not hasattr(self, "obstacle_avoidance_llm_method_var"):

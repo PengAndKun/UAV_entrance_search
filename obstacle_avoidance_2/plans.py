@@ -40,7 +40,7 @@ DEFAULT_ENVIRONMENTS: List[Dict[str, Any]] = [
     },
     {"environment_id": "tree_or_pole", "name": "Tree / pole (legacy)", "description": "Legacy label; runner splits it by observed width."},
     {"environment_id": "fence_or_rail", "name": "Fence / rail", "description": "Crossing obstacle; likely climb-over behavior."},
-    {"environment_id": "building_or_roof", "name": "Building / roof", "description": "Large obstacle; likely overflight or route change."},
+    {"environment_id": "building_or_roof", "name": "Building / roof", "description": "Large obstacle; likely overflight or Route6_entrance_search change."},
     {"environment_id": "mixed_obstacles", "name": "Mixed obstacles", "description": "Mixed hard cases."},
 ]
 
@@ -50,7 +50,7 @@ DEFAULT_METHODS: List[Dict[str, Any]] = [
         "method_id": "geometry_rule_v0",
         "name": "Point-cloud geometry rule v0",
         "runnable": True,
-        "description": "Implemented collector: straight route following plus v0 point-cloud safety shield.",
+        "description": "Implemented collector: straight Route6_entrance_search following plus v0 point-cloud safety shield.",
     },
     {
         "method_id": "pointcloud_direction_rule",
@@ -68,13 +68,13 @@ DEFAULT_METHODS: List[Dict[str, Any]] = [
         "method_id": "no_avoidance",
         "name": "No avoidance",
         "runnable": True,
-        "description": "Executable ablation: straight start-goal route following without obstacle recovery.",
+        "description": "Executable ablation: straight start-goal Route6_entrance_search following without obstacle recovery.",
     },
     {
         "method_id": "route_follow",
         "name": "Route follow only",
         "runnable": True,
-        "description": "Executable baseline: straight route following with a hard safety hold when front is blocked.",
+        "description": "Executable baseline: straight Route6_entrance_search following with a hard safety hold when front is blocked.",
     },
     {
         "method_id": "vlm_pointcloud_semantic_v1",
@@ -147,7 +147,7 @@ def make_default_plans() -> Dict[str, Any]:
         "projects": [
             {
                 "project_id": DEFAULT_PROJECT_ID,
-                "name": "OA2 default route obstacle collection",
+                "name": "OA2 default Route6_entrance_search obstacle collection",
                 "environment_id": DEFAULT_ENVIRONMENT_ID,
                 "default_method": DEFAULT_METHOD_ID,
                 "episodes": make_default_episodes(),

@@ -34,7 +34,7 @@ DEFAULT_METHODS: List[Dict[str, Any]] = [
         "method_id": LLM_STRATEGY_METHOD_ID,
         "name": "LLM strategy + point-cloud rule v1",
         "runnable": True,
-        "description": "LLM classifies environment and strategy once at start, then existing pointcloud_direction_rule executes the route.",
+        "description": "LLM classifies environment and strategy once at start, then existing pointcloud_direction_rule executes the Route6_entrance_search.",
     },
     {
         "method_id": "pointcloud_direction_rule",
@@ -105,7 +105,7 @@ def make_default_plans() -> Dict[str, Any]:
         "projects": [
             {
                 "project_id": DEFAULT_PROJECT_ID,
-                "name": "OA-LLM default route obstacle collection",
+                "name": "OA-LLM default Route6_entrance_search obstacle collection",
                 "environment_id": DEFAULT_ENVIRONMENT_ID,
                 "default_method": DEFAULT_METHOD_ID,
                 "episodes": make_default_episodes(),

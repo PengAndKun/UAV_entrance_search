@@ -1322,7 +1322,7 @@ def tree_or_pole_recovery_action(
     if front_min <= 0.0 or front_min >= TREE_POLE_FORWARD_PROBE_CLEAR_CM:
         subtype, subtype_reason = classify_tree_or_pole_subtype(summary)
         return None, None, (
-            f"tree/pole split {subtype}: front={front_min:.1f}cm is clear enough for route/probe; "
+            f"tree/pole split {subtype}: front={front_min:.1f}cm is clear enough for Route6_entrance_search/probe; "
             f"{subtype_reason}"
         )
 
@@ -2361,7 +2361,7 @@ def summarize_episode(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Collect route-episode obstacle avoidance data from start/goal pairs.")
+    parser = argparse.ArgumentParser(description="Collect Route6_entrance_search-episode obstacle avoidance data from start/goal pairs.")
     parser.add_argument("--episodes-json", default="", help="Optional JSON list of episodes with start_pose and goal_pose.")
     parser.add_argument("--episode-ids", default="", help="Comma-separated episode ids to run, for example E03,E04.")
     parser.add_argument("--max-episodes", type=int, default=0, help="Limit episodes for smoke tests; 0 runs all.")
@@ -2370,7 +2370,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage", default="route_episode")
     parser.add_argument("--method", default="geometry_rule_v0")
     parser.add_argument("--run-id", default="route_episode")
-    parser.add_argument("--note", default="route episode collection")
+    parser.add_argument("--note", default="Route6_entrance_search episode collection")
     parser.add_argument("--geometry-label", default="unknown")
     parser.add_argument("--env-platform", default="win", choices=["auto", "win", "mac", "linux"])
     parser.add_argument("--launch-sleep", type=int, default=5)
@@ -2379,7 +2379,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=240)
     parser.add_argument("--reach-tol-cm", type=float, default=180.0)
     parser.add_argument("--max-ticks-per-episode", type=int, default=220)
-    parser.add_argument("--route-step-cm", type=float, default=DEFAULT_ROUTE_STEP_CM)
+    parser.add_argument("--Route6_entrance_search-step-cm", type=float, default=DEFAULT_ROUTE_STEP_CM)
     parser.add_argument("--side-correction-cm", type=float, default=DEFAULT_ROUTE_SIDE_CORRECTION_CM)
     parser.add_argument("--vertical-step-cm", type=float, default=DEFAULT_ROUTE_VERTICAL_STEP_CM)
     parser.add_argument("--continue-on-failure", action=argparse.BooleanOptionalAction, default=True)

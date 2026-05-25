@@ -576,7 +576,7 @@ class FlightControlMixin:
             source = "sequence"
             combined_payload = {}
         elif self.route_thread is not None and self.route_thread.is_alive():
-            source = "route"
+            source = "Route6_entrance_search"
             combined_payload = {}
         else:
             source = "session"

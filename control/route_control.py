@@ -1053,7 +1053,7 @@ class RouteControlMixin:
                 cv2.putText(image, f"F{idx}", (point[0] + 8, point[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(
             image,
-            "Plan route through open street/yard space. Avoid non-target house boxes.",
+            "Plan Route6_entrance_search through open street/yard space. Avoid non-target house boxes.",
             (20, 34),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.8,
@@ -1129,14 +1129,14 @@ class RouteControlMixin:
                 "Plan 3-10 high-level world-coordinate waypoints to reach a standoff point outside the target house.",
                 "Do not enter or cross forbidden_non_target_house_bboxes.",
                 "Prefer open streets, yards, and simple axis-aligned or gently bending paths.",
-                "Because the entrance is unknown, after arrival include route points that scan the target front, side, back, and other side when safe.",
+                "Because the entrance is unknown, after arrival include Route6_entrance_search points that scan the target front, side, back, and other side when safe.",
                 "Return strict JSON only.",
             ],
         }
 
     def build_llm_route_system_prompt(self) -> str:
         return (
-            "You are an overhead-map VLM route planner for a UAV searching for a house entrance. "
+            "You are an overhead-map VLM Route6_entrance_search planner for a UAV searching for a house entrance. "
             "Use the annotated map image and structured world-coordinate data. "
             "Plan only high-level map waypoints, not keyboard controls. "
             "Never enter or cross non-target house boxes. Return strict JSON only."
@@ -1308,7 +1308,7 @@ class RouteControlMixin:
         if len(points) < 2:
             fallback_plan = dict(fallback)
             fallback_plan["planner_source"] = "deterministic_fallback_after_invalid_llm_route"
-            fallback_plan["llm_route_error"] = "LLM route had fewer than two valid numeric waypoints"
+            fallback_plan["llm_route_error"] = "LLM Route6_entrance_search had fewer than two valid numeric waypoints"
             return fallback_plan
         current_house_id = str(context.get("current_house_id", "") or "")
         safety_report = self.route_house_violation_report(
@@ -1320,7 +1320,7 @@ class RouteControlMixin:
             fallback_plan = dict(fallback)
             fallback_plan["planner_source"] = "deterministic_fallback_after_llm_route_crossed_house"
             fallback_plan["llm_route_safety_report"] = safety_report
-            fallback_plan["llm_route_error"] = "LLM route violated forbidden non-target house bbox clearance"
+            fallback_plan["llm_route_error"] = "LLM Route6_entrance_search violated forbidden non-target house bbox clearance"
             return fallback_plan
         plan = {
             "available": True,
@@ -1352,7 +1352,7 @@ class RouteControlMixin:
                 for item in (parsed.get("replan_triggers", []) if isinstance(parsed.get("replan_triggers"), list) else [])
                 if str(item or "").strip()
             ][:16],
-            "reason": str(parsed.get("reason", "") or "LLM-generated overhead-map route."),
+            "reason": str(parsed.get("reason", "") or "LLM-generated overhead-map Route6_entrance_search."),
             "route_safety_report": safety_report,
             "forbidden_house_bboxes": context.get("forbidden_non_target_house_bboxes", []),
             "deterministic_fallback_route": fallback,
@@ -2193,7 +2193,7 @@ class RouteControlMixin:
             "replan_triggers": route_plan.get("replan_triggers", []),
             "planner_source": str(route_plan.get("planner_source", "") or "unknown"),
             "scan_point_count": len(scan_points),
-            "reason": str(route_plan.get("reason", "") or "Rule-generated facade scan route from target house bbox."),
+            "reason": str(route_plan.get("reason", "") or "Rule-generated facade scan Route6_entrance_search from target house bbox."),
         }
 
     def prepare_route_plan_with_scan_points(self, route_plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -2304,7 +2304,7 @@ class RouteControlMixin:
         except tk.TclError:
             pass
         except Exception as exc:
-            LOGGER.warning("Refresh LLM route map failed: %s", exc)
+            LOGGER.warning("Refresh LLM Route6_entrance_search map failed: %s", exc)
             self.llm_route_map_status_var.set(f"Route Map: failed: {exc}")
 
     def apply_route_plan(self, route_plan: Dict[str, Any], *, status_prefix: str = "LLM Route") -> None:
@@ -2317,7 +2317,7 @@ class RouteControlMixin:
         point_count = len(self.llm_route_plan.get("route_points", [])) if isinstance(self.llm_route_plan.get("route_points"), list) else 0
         source = str(self.llm_route_plan.get("planner_source", "") or "unknown")
         if self.llm_route_plan.get("route_blocked_by_safety"):
-            message = "route blocked by safety validation"
+            message = "Route6_entrance_search blocked by safety validation"
         else:
             message = str(self.llm_route_plan.get("llm_route_error", "") or self.llm_route_plan.get("reason", "") or "")
         suffix = f" | {message}" if message else ""
@@ -2481,7 +2481,7 @@ class RouteControlMixin:
             suffix = " (panorama used)" if image_path.name == "coarse_rgb_panorama.png" else ""
             self.llm_route2_rgb_status_var.set(f"Facade RGB: {image_path.name}{suffix}")
         except Exception as exc:
-            LOGGER.warning("Refresh route v2 facade RGB failed: %s", exc)
+            LOGGER.warning("Refresh Route6_entrance_search v2 facade RGB failed: %s", exc)
             try:
                 self.route2_draw_rgb_preview_message(widget, f"RGB load failed:\n{exc}")
                 self.llm_route2_rgb_photo = None
@@ -2686,7 +2686,7 @@ class RouteControlMixin:
         except tk.TclError:
             pass
         except Exception as exc:
-            LOGGER.warning("Refresh LLM route v2 map failed: %s", exc)
+            LOGGER.warning("Refresh LLM Route6_entrance_search v2 map failed: %s", exc)
             self.llm_route2_map_status_var.set(f"Route V2 Map: failed: {exc}")
 
     def route2_facade_axis_range(self, bbox: Dict[str, Any], facade: str) -> Tuple[float, float]:
@@ -7786,7 +7786,7 @@ class RouteControlMixin:
             suffix = " (panorama used)" if image_path.name == "coarse_rgb_panorama.png" else ""
             self.llm_route2_rgb_status_var.set(f"Facade RGB: {image_path.name}{suffix}")
         except Exception as exc:
-            LOGGER.warning("Refresh route v3 facade RGB failed: %s", exc)
+            LOGGER.warning("Refresh Route6_entrance_search v3 facade RGB failed: %s", exc)
             try:
                 self.route2_draw_rgb_preview_message(widget, f"RGB load failed:\n{exc}")
                 self.llm_route3_rgb_photo = None
@@ -7849,7 +7849,7 @@ class RouteControlMixin:
         except tk.TclError:
             pass
         except Exception as exc:
-            LOGGER.warning("Refresh LLM route v3 map failed: %s", exc)
+            LOGGER.warning("Refresh LLM Route6_entrance_search v3 map failed: %s", exc)
             self.llm_route3_map_status_var.set(f"Route V3 Map: failed: {exc}")
 
     def refresh_route3_support_views(self) -> None:
@@ -8036,7 +8036,7 @@ class RouteControlMixin:
 
     def on_llm_task_analyze(self) -> None:
         if self.route_thread is not None and self.route_thread.is_alive():
-            self.llm_route_status_var.set("LLM Route: wait for current route worker.")
+            self.llm_route_status_var.set("LLM Route: wait for current Route6_entrance_search worker.")
             return
         task_text = self.llm_task_text_var.get().strip()
         if not task_text:
@@ -8085,7 +8085,7 @@ class RouteControlMixin:
                 plan = self.generate_llm_route_plan(target_house_id)
                 self.root.after(0, lambda p=plan: self.apply_route_plan(p, status_prefix="LLM Route"))
             except Exception as exc:
-                LOGGER.warning("LLM route plan failed: %s", exc)
+                LOGGER.warning("LLM Route6_entrance_search plan failed: %s", exc)
                 try:
                     fallback = self.fallback_route_plan(target_house_id)
                     fallback["llm_route_generation_error"] = str(exc)
@@ -8591,13 +8591,13 @@ class RouteControlMixin:
             self.llm_route_status_var.set("LLM Route: follow already running.")
             return
         if isinstance(self.llm_route_plan, dict) and self.llm_route_plan.get("route_blocked_by_safety"):
-            self.llm_route_status_var.set("LLM Route: blocked by route/scan safety validation.")
+            self.llm_route_status_var.set("LLM Route: blocked by Route6_entrance_search/scan safety validation.")
             self.refresh_route_preview()
             return
         self.sync_capture_options_to_session(session)
         points = self.route_points_to_follow(auto=auto)
         if not points:
-            self.llm_route_status_var.set("LLM Route: no route point to follow.")
+            self.llm_route_status_var.set("LLM Route: no Route6_entrance_search point to follow.")
             return
         self.route_stop_event.clear()
         self.route_thread = threading.Thread(

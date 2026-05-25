@@ -234,14 +234,14 @@ class OverheadMapWidget:
 
         The background image, saved house boxes, and calibration anchors move
         by this offset. World-space objects such as the UAV marker, trajectory,
-        route plan, and world house circles do not move.
+        Route6_entrance_search plan, and world house circles do not move.
         """
         self._image_layer_offset_px = (float(dx_px), float(dy_px))
         self._redraw()
 
     def set_route_target(self, world_xy: Optional[Tuple[float, float]]) -> None:
         """
-        Set an optional route target in world coordinates.
+        Set an optional Route6_entrance_search target in world coordinates.
 
         When present, a dashed line is drawn from the UAV to the target house.
         """
@@ -250,7 +250,7 @@ class OverheadMapWidget:
 
     def set_route_plan(self, route_plan: Optional[Any]) -> None:
         """
-        Set an optional multi-waypoint route plan in world coordinates.
+        Set an optional multi-waypoint Route6_entrance_search plan in world coordinates.
 
         The accepted shape is either a list of point dictionaries or a dict
         containing route_points / waypoints. Each point may use x/y or
@@ -697,7 +697,7 @@ class OverheadMapWidget:
         self._house_canvas_circles[hid] = (cx, cy, r_px)
 
     def _draw_route_line(self, wx: float, wy: float) -> None:
-        """Draw a dashed route line from the UAV to the current target."""
+        """Draw a dashed Route6_entrance_search line from the UAV to the current target."""
         if not self._canvas_alive():
             return
         ux, uy = self.world_to_canvas(self._uav_x, self._uav_y)
@@ -719,7 +719,7 @@ class OverheadMapWidget:
         )
 
     def _draw_route_plan(self) -> None:
-        """Draw a multi-waypoint route plan from the UAV/map planner."""
+        """Draw a multi-waypoint Route6_entrance_search plan from the UAV/map planner."""
         if not self._canvas_alive() or not self._route_plan:
             return
         canvas_points: List[Tuple[float, float, dict]] = []
@@ -846,7 +846,7 @@ class OverheadMapWidget:
             )
 
     def _draw_point_overlays(self) -> None:
-        """Draw unconnected point overlays without affecting route lines."""
+        """Draw unconnected point overlays without affecting Route6_entrance_search lines."""
         if not self._canvas_alive() or not self._point_overlay_points:
             return
         for idx, point in enumerate(self._point_overlay_points):

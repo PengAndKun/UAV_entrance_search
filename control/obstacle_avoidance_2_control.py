@@ -54,7 +54,7 @@ class ObstacleAvoidance2ControlMixin:
         if not hasattr(self, "obstacle_avoidance_2_project_var"):
             self.obstacle_avoidance_2_project_var = tk.StringVar(value=DEFAULT_PROJECT_ID)
         if not hasattr(self, "obstacle_avoidance_2_project_name_var"):
-            self.obstacle_avoidance_2_project_name_var = tk.StringVar(value="OA2 default route obstacle collection")
+            self.obstacle_avoidance_2_project_name_var = tk.StringVar(value="OA2 default Route6_entrance_search obstacle collection")
         if not hasattr(self, "obstacle_avoidance_2_environment_var"):
             self.obstacle_avoidance_2_environment_var = tk.StringVar(value=DEFAULT_ENVIRONMENT_ID)
         if not hasattr(self, "obstacle_avoidance_2_method_var"):

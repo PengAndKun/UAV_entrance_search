@@ -59,7 +59,7 @@ DEFAULT_ENVIRONMENTS: List[Dict[str, Any]] = [
     {
         "environment_id": "building_or_roof",
         "name": "Building / roof obstacle",
-        "description": "Semantic plan label for large structures that require route changes or overflight.",
+        "description": "Semantic plan label for large structures that require Route6_entrance_search changes or overflight.",
     },
     {
         "environment_id": "mixed_obstacles",
@@ -74,25 +74,25 @@ DEFAULT_METHODS: List[Dict[str, Any]] = [
         "method_id": "geometry_rule_v0",
         "name": "Point-cloud geometry rule v0",
         "runnable": True,
-        "description": "Implemented route episode baseline using point-cloud geometry and safety scoring.",
+        "description": "Implemented Route6_entrance_search episode baseline using point-cloud geometry and safety scoring.",
     },
     {
         "method_id": "distance_rule",
         "name": "Distance threshold rule",
         "runnable": False,
-        "description": "Experiment label only until a route-episode runner branch is implemented.",
+        "description": "Experiment label only until a Route6_entrance_search-episode runner branch is implemented.",
     },
     {
         "method_id": "no_avoidance",
         "name": "No avoidance",
         "runnable": False,
-        "description": "Experiment label only; the current route runner does not expose this behavior switch.",
+        "description": "Experiment label only; the current Route6_entrance_search runner does not expose this behavior switch.",
     },
     {
         "method_id": "route_follow",
         "name": "Route follow only",
         "runnable": False,
-        "description": "Experiment label only; the current route runner still applies the v0 safety shield.",
+        "description": "Experiment label only; the current Route6_entrance_search runner still applies the v0 safety shield.",
     },
     {
         "method_id": "vlm_pointcloud_semantic_v1",
@@ -169,7 +169,7 @@ def make_default_plans() -> Dict[str, Any]:
         "projects": [
             {
                 "project_id": DEFAULT_PROJECT_ID,
-                "name": "Default 10 route episodes",
+                "name": "Default 10 Route6_entrance_search episodes",
                 "environment_id": DEFAULT_ENVIRONMENT_ID,
                 "default_method": DEFAULT_METHOD_ID,
                 "episodes": make_default_episodes(),

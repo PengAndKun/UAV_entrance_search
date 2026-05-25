@@ -267,7 +267,7 @@ def main() -> None:
         "avoidance_gate": {"avoidance_active": False, "reason": "front_clear_depth_250cm"},
         "llm_strategy": {"strategy_source": "representation_prediction_cached", "strategy_cache_key": "north|fence|wall", "strategy_cache_hit": True},
         "selected_action": "route3_nav",
-        "selected_action_reason": "clear route",
+        "selected_action_reason": "clear Route6_entrance_search",
         "risk_state": "CLEAR",
         "nominal_action": {"forward_cm": 20.0},
         "selected_action_payload": {"forward_cm": 20.0},
@@ -280,7 +280,7 @@ def main() -> None:
     decision_path = output_dir / "frames" / "frame_000042" / "decision.json"
     assert decision_path.is_file(), decision_doc
     saved_decision = json.loads(decision_path.read_text(encoding="utf-8"))
-    assert saved_decision["decision_reason"] == "clear route", saved_decision
+    assert saved_decision["decision_reason"] == "clear Route6_entrance_search", saved_decision
     assert saved_decision["llm_calls"][0]["call_id"] == llm_ref["call_id"], saved_decision
     assert saved_decision["strategy_cache"]["hit"] is True, saved_decision
     assert (output_dir / "route4_frame_decisions.jsonl").read_text(encoding="utf-8").strip(), "missing frame decision jsonl"

@@ -204,7 +204,7 @@ class RunDroneFlightPanel(
             value=str(PROJECT_ROOT / "obstacle_avoidance_data" / "plans" / "obstacle_avoidance_plans.json")
         )
         self.obstacle_plan_project_var = tk.StringVar(value="default_route_episodes")
-        self.obstacle_plan_project_name_var = tk.StringVar(value="Default 10 route episodes")
+        self.obstacle_plan_project_name_var = tk.StringVar(value="Default 10 Route6_entrance_search episodes")
         self.obstacle_plan_environment_var = tk.StringVar(value="default_unreal_scene")
         self.obstacle_plan_method_var = tk.StringVar(value="geometry_rule_v0")
         self.obstacle_plan_selected_episode_var = tk.StringVar(value="")
@@ -220,7 +220,7 @@ class RunDroneFlightPanel(
             value=str(PROJECT_ROOT / "obstacle_avoidance_2_data" / "plans" / "obstacle_avoidance_2_plans.json")
         )
         self.obstacle_avoidance_2_project_var = tk.StringVar(value="route_obstacle_collection_v2")
-        self.obstacle_avoidance_2_project_name_var = tk.StringVar(value="OA2 default route obstacle collection")
+        self.obstacle_avoidance_2_project_name_var = tk.StringVar(value="OA2 default Route6_entrance_search obstacle collection")
         self.obstacle_avoidance_2_environment_var = tk.StringVar(value="default_unreal_scene")
         self.obstacle_avoidance_2_method_var = tk.StringVar(value="geometry_rule_v0")
         self.obstacle_avoidance_2_status_var = tk.StringVar(value="Obstacle Avoidance 2: idle")
@@ -922,6 +922,7 @@ class RunDroneFlightPanel(
             tk.Button(scan, text="Open LLM Route Window 4", command=self.open_llm_route_window4).pack(side="left", padx=6, pady=4)
             tk.Button(scan, text="Open LLM Route Window 5", command=self.open_llm_route_window5).pack(side="left", padx=6, pady=4)
             tk.Button(scan, text="Open LLM Route Window 6", command=self.open_llm_route_window6).pack(side="left", padx=6, pady=4)
+            tk.Button(scan, text="Route 6 Update Map", command=self.open_route6_update_map_window).pack(side="left", padx=6, pady=4)
 
         actions = tk.Frame(route)
         actions.grid(row=4, column=0, columnspan=6, sticky="ew", padx=0, pady=(0, 4))
@@ -1854,6 +1855,48 @@ class RunDroneFlightPanel(
                 pass
             self.llm_route6_window = None
             self.llm_route6_summary_text = None
+            self.llm_route6_map_widget = None
+            self.llm_route6_map_frame = None
+        if getattr(self, "route6_update_map_window", None) is not None:
+            stop_event = getattr(self, "route6_update_map_capture_stop_event", None)
+            if stop_event is not None:
+                try:
+                    stop_event.set()
+                except Exception:
+                    pass
+            realtime_stop_event = getattr(self, "route6_update_map_realtime_stop_event", None)
+            if realtime_stop_event is not None:
+                try:
+                    realtime_stop_event.set()
+                except Exception:
+                    pass
+            after_id = getattr(self, "route6_update_map_pose_after_id", None)
+            if after_id is not None:
+                try:
+                    self.route6_update_map_window.after_cancel(after_id)
+                except Exception:
+                    pass
+            self.route6_update_map_pose_after_id = None
+            try:
+                self.route6_update_map_window.destroy()
+            except Exception:
+                pass
+            self.route6_update_map_window = None
+            self.route6_update_map_scroll_canvas = None
+            self.route6_update_map_content_frame = None
+            self.route6_update_map_preview_label = None
+            self.route6_update_map_preview_photo = None
+            self.route6_update_map_layer_combo = None
+            self.route6_update_map_capture_thread = None
+            self.route6_update_map_realtime_thread = None
+        if getattr(self, "route6_capture_folder_reader_window", None) is not None:
+            try:
+                self.route6_capture_folder_reader_window.destroy()
+            except Exception:
+                pass
+            self.route6_capture_folder_reader_window = None
+            self.route6_capture_folder_listbox = None
+            self.route6_pointcloud_report_text = None
         self.stop_stream_player()
         self.stop_stream_analysis()
         self.close_lidar_analysis_window()
@@ -1897,4 +1940,3 @@ class RunDroneFlightPanel(
 
     def run(self) -> None:
         self.root.mainloop()
-
