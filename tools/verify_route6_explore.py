@@ -5,6 +5,7 @@ import importlib
 import json
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List
@@ -210,6 +211,11 @@ class Harness:
         self.llm_route6_occupancy_resolution_m_var = ValueVar("0.25")
         self.llm_route6_coverage_threshold_var = ValueVar("0.75")
         self.llm_route6_allow_save_corrected_var = ValueVar(False)
+        self.llm_route6_task_prompt_var = ValueVar("Explore the first house north of current UAV.")
+        self.llm_route6_selected_target_var = ValueVar("Selected target: n/a")
+        self.llm_route6_realtime_map_status_var = ValueVar("Realtime map: idle")
+        self.llm_route6_or_status_var = ValueVar("OR Avoidance: idle")
+        self.llm_route6_or_detail_var = ValueVar("OR detail: n/a")
         self.llm_route6_window = None
         self.llm_route6_summary_text = None
         self.llm_route6_output_root_override = tmp_dir / "route6_explore_runs"
@@ -238,6 +244,14 @@ class Harness:
         return "002"
 
     def route3_current_pose(self, _session: Any = None) -> Dict[str, float]:
+        raw_pose = self.latest_state.get("pose", [0.0, 0.0, 450.0, 0.0])
+        if isinstance(raw_pose, (list, tuple)) and len(raw_pose) >= 3:
+            return {
+                "x": float(raw_pose[0] or 0.0),
+                "y": float(raw_pose[1] or 0.0),
+                "z": float(raw_pose[2] or 0.0),
+                "yaw": float(raw_pose[3] if len(raw_pose) > 3 else 0.0),
+            }
         return {"x": 0.0, "y": 0.0, "z": 450.0, "yaw": 0.0}
 
     def write_json_artifact(self, path: Path, payload: Dict[str, Any]) -> None:
@@ -384,6 +398,145 @@ class AnalysisHarness(Harness):
         return summary
 
 
+class FakeMotionSession:
+    def __init__(self) -> None:
+        self.moves: List[Dict[str, Any]] = []
+        self.enabled_calls: List[bool] = []
+        self.mode_calls: List[str] = []
+
+    def move_relative(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self.moves.append(dict(payload if isinstance(payload, dict) else {}))
+        return {"status": "ok", "last_action": self.moves[-1]}
+
+    def set_movement_enabled(self, enabled: bool) -> Dict[str, Any]:
+        self.enabled_calls.append(bool(enabled))
+        return {"status": "ok", "movement_enabled": bool(enabled)}
+
+    def set_movement_mode(self, mode: str) -> Dict[str, Any]:
+        self.mode_calls.append(str(mode))
+        return {"status": "ok", "movement_mode": str(mode)}
+
+
+def test_route6_full_stop_uav_disables_motion(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = Harness(tmp_dir)
+    harness.llm_route5_stop_event = threading.Event()
+    harness.llm_route4_stop_event = threading.Event()
+    harness.llm_route3_stop_event = threading.Event()
+    session = FakeMotionSession()
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    run_dir = module.Route6ExploreControlMixin.route6_initialize_run(harness, force_new=True)
+
+    result = module.Route6ExploreControlMixin.route6_apply_full_stop(harness, session, run_dir)
+
+    assert_true(result["status"] == "full_stopped", f"full stop should report terminal status: {result}")
+    assert_true(harness.llm_route6_stop_event.is_set(), "full stop should set Route 6 stop event")
+    assert_true(harness.route6_full_stop_event.is_set(), "full stop should set hard-stop event")
+    assert_true(harness.route6_update_map_realtime_stop_event.is_set(), "full stop should stop realtime map update")
+    assert_true(harness.route6_update_map_capture_stop_event.is_set(), "full stop should stop map capture")
+    assert_true(harness.llm_route5_stop_event.is_set() and harness.llm_route4_stop_event.is_set() and harness.llm_route3_stop_event.is_set(), "full stop should set lower route stop events when present")
+    assert_true(session.moves and session.moves[-1].get("action_name") == "hold", f"full stop should send hold: {session.moves}")
+    assert_true(session.enabled_calls == [False], f"full stop should disable movement: {session.enabled_calls}")
+    artifact = json.loads((run_dir / "route6_full_stop.json").read_text(encoding="utf-8"))
+    assert_true(artifact["schema"] == "route6_full_stop_v1", f"full stop artifact should be auditable: {artifact}")
+    assert_true(harness.llm_route6_stage_var.get() == "Stage: FULL_STOPPED", f"UI stage should be FULL_STOPPED: {harness.llm_route6_stage_var.get()}")
+    events = harness.read_jsonl_artifact(run_dir / "route6_events.jsonl")
+    assert_true(any(item.get("event_type") == "full_stop_requested" for item in events), f"full stop request should be logged: {events}")
+    assert_true(any(item.get("event_type") == "full_stop_applied" for item in events), f"full stop should be logged: {events}")
+
+
+def test_route6_full_stop_blocks_future_movement_ticks(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = Harness(tmp_dir)
+    session = FakeMotionSession()
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    run_dir = module.Route6ExploreControlMixin.route6_initialize_run(harness, force_new=True)
+    module.Route6ExploreControlMixin.route6_apply_full_stop(harness, session, run_dir)
+
+    blocked = module.Route6ExploreControlMixin.route6_movement_allowed(harness)
+
+    assert_true(blocked is False, "Route 6 movement guard should reject future movement ticks after full stop")
+
+
+def test_route6_semantic_map_skips_fence_for_north_first_house(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = Harness(tmp_dir)
+    harness.latest_state = {"pose": [0.0, 0.0, 300.0, 0.0]}
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    run_dir = module.Route6ExploreControlMixin.route6_initialize_run(harness, force_new=True)
+    context = {
+        "schema": "route6_semantic_map_context_v1",
+        "mission_prompt": "Explore the first house north of current UAV.",
+        "requested_direction": "north",
+        "current_pose": {"x": 0.0, "y": 0.0, "z": 300.0, "yaw": 0.0},
+        "object_candidates": [
+            {
+                "object_id": "obj_fence",
+                "semantic_label": "fence_or_rail",
+                "house_id": "",
+                "center_cm": {"x": 0.0, "y": -100.0},
+                "direction_from_uav": ["north"],
+                "north_distance_cm": 100.0,
+                "height_persistence_score": 0.2,
+                "linearity_score": 0.95,
+                "area_score": 0.1,
+                "map_config_house_overlap": {"house_id": "", "iou": 0.0},
+            },
+            {
+                "object_id": "obj_house",
+                "semantic_label": "house",
+                "house_id": "101",
+                "center_cm": {"x": 0.0, "y": -450.0},
+                "direction_from_uav": ["north"],
+                "north_distance_cm": 450.0,
+                "height_persistence_score": 0.9,
+                "linearity_score": 0.25,
+                "area_score": 0.8,
+                "map_config_house_overlap": {"house_id": "101", "iou": 0.82},
+            },
+        ],
+    }
+
+    selection = module.Route6ExploreControlMixin.route6_select_llm_semantic_target(harness, context, output_dir=run_dir)
+
+    assert_true(selection["schema"] == "route6_llm_semantic_target_selection_v1", f"unexpected schema: {selection}")
+    assert_true(selection["selected_object_id"] == "obj_house", f"north-first-house should skip the nearer fence: {selection}")
+    assert_true(selection["house_id"] == "101", f"semantic target should keep selected house id: {selection}")
+    assert_true(selection["rejected_objects"][0]["object_id"] == "obj_fence", f"rejected fence should be explained: {selection}")
+    assert_true((run_dir / "route6_llm_semantic_target_selection.json").is_file(), "semantic target selection should be written")
+
+
+def test_route6_llm_navigation_target_uses_13_layer_open_corridor(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = Harness(tmp_dir)
+    harness.latest_state = {"pose": [0.0, 0.0, 300.0, 0.0]}
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    run_dir = module.Route6ExploreControlMixin.route6_initialize_run(harness, force_new=True)
+    context = {
+        "schema": "route6_semantic_map_context_v1",
+        "current_pose": {"x": 0.0, "y": 0.0, "z": 300.0, "yaw": 0.0},
+        "available_layer_keys": [f"z_{value:03d}" for value in range(50, 651, 50)],
+        "open_corridor_layers": [f"z_{value:03d}" for value in range(250, 451, 50)],
+    }
+    selection = {
+        "selected_object_id": "obj_house",
+        "house_id": "101",
+        "semantic_label": "house",
+        "selected_candidate": {
+            "nearest_facade": "south",
+            "nearest_scan_pose": {"x": 0.0, "y": -800.0, "z": 300.0, "yaw_deg": 90.0, "facade": "south"},
+        },
+    }
+
+    target = module.Route6ExploreControlMixin.route6_plan_llm_navigation_target(harness, run_dir, selection, context)
+
+    assert_true(target["schema"] == "route6_llm_navigation_target_v1", f"unexpected navigation target schema: {target}")
+    assert_true(target["house_id"] == "101", f"navigation target should keep house id: {target}")
+    assert_true(target["approach_layer_key"] in context["available_layer_keys"], f"target should pick a known layer: {target}")
+    assert_true(target["path_summary"]["status"] in {"candidate_clear", "candidate_unknown"}, f"target should summarize path status: {target}")
+    assert_true((run_dir / "route6_llm_navigation_target.json").is_file(), "navigation target artifact should be written")
+
+
 def test_route6_initialize_run_writes_state_and_queue(tmp_dir: Path) -> None:
     module = importlib.import_module("control.route6_explore_control")
     harness = Harness(tmp_dir)
@@ -396,6 +549,110 @@ def test_route6_initialize_run_writes_state_and_queue(tmp_dir: Path) -> None:
     assert_true(state["stage"] == "SELECT_HOUSE", f"unexpected Route 6 stage: {state}")
     queue = json.loads((run_dir / "route6_house_queue.json").read_text(encoding="utf-8"))
     assert_true(queue["selected_house_id"] == "002", f"nearest reachable house should be selected: {queue}")
+
+
+def test_route6_llm_target_selection_prefers_first_house_north_and_writes_artifact(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = Harness(tmp_dir)
+    harness.latest_state = {"pose": [0.0, 500.0, 450.0, 0.0]}
+    harness.map_config = {
+        "houses": [
+            {"id": "101", "name": "NorthNear", "center_x": 0.0, "center_y": 200.0, "radius_cm": 100.0},
+            {"id": "102", "name": "NorthFar", "center_x": 0.0, "center_y": -1100.0, "radius_cm": 100.0},
+            {"id": "201", "name": "SouthNear", "center_x": 0.0, "center_y": 850.0, "radius_cm": 100.0},
+        ],
+    }
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+
+    run_dir = module.Route6ExploreControlMixin.route6_initialize_run(harness, force_new=True)
+
+    selection_path = run_dir / "route6_llm_target_selection.json"
+    assert_true(selection_path.is_file(), "Route 6 should write the LLM target selection artifact")
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    assert_true(selection["house_id"] == "101", f"north prompt should select the first north house: {selection}")
+    assert_true(selection["requested_direction"] == "north", f"prompt direction should be parsed: {selection}")
+    assert_true(selection["fallback_used"] is False, f"north candidate should not use fallback: {selection}")
+    assert_true("north" in selection["direction_relation"], f"selection should record direction relation: {selection}")
+    assert_true(harness.llm_route6_state["selected_house_id"] == "101", f"state should use selected target: {harness.llm_route6_state}")
+    points = module.Route6ExploreControlMixin.route6_plan_selected_house_scan_points(harness, run_dir, "101")
+    assert_true(points[0]["house_id"] == "101", f"scan plan should begin at selected target scout: {points}")
+    assert_true(points[0]["view_type"] == "route6_nearest_facade_scout", f"selected target should keep scout-first scan behavior: {points}")
+
+
+def test_route6_llm_target_selection_skips_blocked_direction_candidate(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = Harness(tmp_dir)
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    context = {
+        "task_prompt": "Explore the first house north of current UAV.",
+        "requested_direction": "north",
+        "current_pose": {"x": 0.0, "y": 0.0, "z": 450.0, "yaw": 0.0},
+        "selected_layer_key": "z_450",
+        "selected_layer_z_cm": 450,
+        "candidates": [
+            {
+                "house_id": "blocked",
+                "center_x": 0.0,
+                "center_y": -100.0,
+                "nearest_facade": "south",
+                "nearest_scan_pose": {"x": 0.0, "y": -250.0, "z": 450.0, "facade": "south"},
+                "reachable": True,
+                "score": 1.0,
+                "realtime_map_blocked": True,
+                "obstacle_risk": "blocked",
+            },
+            {
+                "house_id": "open",
+                "center_x": 0.0,
+                "center_y": -300.0,
+                "nearest_facade": "south",
+                "nearest_scan_pose": {"x": 0.0, "y": -450.0, "z": 450.0, "facade": "south"},
+                "reachable": True,
+                "score": 20.0,
+            },
+        ],
+    }
+
+    selection = module.Route6ExploreControlMixin.route6_select_llm_target_from_context(harness, context)
+
+    assert_true(selection["house_id"] == "open", f"blocked north candidate should be skipped: {selection}")
+    assert_true(selection["skipped_blocked_candidate_count"] == 1, f"selection should record skipped blocked candidates: {selection}")
+    assert_true(selection["recommended_facade"] == "south", f"selection should preserve candidate approach facade: {selection}")
+
+
+def test_route6_or_avoidance_display_reads_state_and_summary(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = Harness(tmp_dir)
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    run_dir = module.Route6ExploreControlMixin.route6_initialize_run(harness, force_new=True)
+    event = {
+        "front_risk_state": "must_stop",
+        "or2_selected_direction": "left",
+        "front_min_depth_cm": 83.5,
+        "avoidance_active": True,
+        "collision_state": False,
+        "frame_id": "frame_000021",
+    }
+    harness.llm_route6_state["last_or2_event"] = event
+    harness.write_json_artifact(
+        run_dir / "avoidance_session_summary.json",
+        {
+            "schema": "avoidance_session_summary_v1",
+            "event_count": 4,
+            "collision_count": 1,
+            "avoidance_failed_count": 1,
+            "status": "running",
+        },
+    )
+
+    payload = module.Route6ExploreControlMixin.route6_or_avoidance_display_payload(harness)
+    module.Route6ExploreControlMixin.refresh_llm_route6_or_avoidance_display(harness)
+
+    assert_true(payload["risk_state"] == "must_stop", f"OR display should read current risk: {payload}")
+    assert_true(payload["selected_direction"] == "left", f"OR display should read selected direction: {payload}")
+    assert_true(payload["event_count"] == 4 and payload["collision_count"] == 1, f"OR display should read summary counts: {payload}")
+    assert_true("must_stop" in harness.llm_route6_or_status_var.get(), f"OR status var should show risk: {harness.llm_route6_or_status_var.get()}")
+    assert_true("events=4" in harness.llm_route6_or_detail_var.get(), f"OR detail var should show counts: {harness.llm_route6_or_detail_var.get()}")
 
 
 def test_route6_cli_builds_artifacts_from_lidar_log(tmp_dir: Path) -> None:
@@ -852,7 +1109,14 @@ def main() -> None:
         lambda: run_with_tmp(test_polygon_component_selection_prefers_target_bbox_over_largest_component),
         lambda: test_corrected_config_rejects_low_point_quality_even_with_high_confidence(),
         lambda: test_corrected_config_marks_large_shift_as_map_conflict(),
+        lambda: run_with_tmp(test_route6_full_stop_uav_disables_motion),
+        lambda: run_with_tmp(test_route6_full_stop_blocks_future_movement_ticks),
+        lambda: run_with_tmp(test_route6_semantic_map_skips_fence_for_north_first_house),
+        lambda: run_with_tmp(test_route6_llm_navigation_target_uses_13_layer_open_corridor),
         lambda: run_with_tmp(test_route6_initialize_run_writes_state_and_queue),
+        lambda: run_with_tmp(test_route6_llm_target_selection_prefers_first_house_north_and_writes_artifact),
+        lambda: run_with_tmp(test_route6_llm_target_selection_skips_blocked_direction_candidate),
+        lambda: run_with_tmp(test_route6_or_avoidance_display_reads_state_and_summary),
         lambda: run_with_tmp(test_route6_cli_builds_artifacts_from_lidar_log),
         lambda: run_with_tmp(test_route6_worker_postprocesses_existing_valid_lidar_log),
         lambda: run_with_tmp(test_route6_scan_plan_prepends_nearest_scout_before_active_nbv_points),

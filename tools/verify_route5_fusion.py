@@ -864,6 +864,37 @@ def main() -> None:
         local_safety_rows = harness.read_jsonl_artifact(output_dir / "local_3d_safety_events.jsonl")
         assert local_safety_rows and local_safety_rows[-1]["local_3d_safety"]["checked"] is True, local_safety_rows
 
+        synthetic_sector_map = LocalObstacleMap(LocalObstacleMapConfig(voxel_cm=25.0, radius_cm=1200.0, ttl_frames=150, ttl_seconds=60.0))
+        synthetic_sector_map.update_from_event(
+            {
+                "frame_id": 10,
+                "pointcloud_summary": {
+                    "available": True,
+                    "front_min_depth_cm": 108.0,
+                    "forward_swept_clear": False,
+                    "right_min_depth_cm": 108.0,
+                    "right_swept_clear": False,
+                    "left_min_depth_cm": 108.0,
+                    "left_swept_clear": False,
+                    "down_min_depth_cm": 20.0,
+                    "down_swept_clear": False,
+                    "up_swept_clear": True,
+                },
+                "or2_prediction": {"front_risk_state": "obstacle_warning"},
+            },
+            {"x": 0.0, "y": 0.0, "z": 100.0, "yaw": 0.0},
+        )
+        synthetic_up_safety = synthetic_sector_map.query_safety(
+            {"x": 0.0, "y": 0.0, "z": 100.0, "yaw": 0.0},
+            {"forward_cm": 0.0, "right_cm": 0.0, "up_cm": 20.0, "yaw_delta_deg": 0.0},
+        )
+        assert synthetic_up_safety["safe"] is True, synthetic_up_safety
+        synthetic_forward_safety = synthetic_sector_map.query_safety(
+            {"x": 0.0, "y": 0.0, "z": 100.0, "yaw": 0.0},
+            {"forward_cm": 20.0, "right_cm": 0.0, "up_cm": 0.0, "yaw_delta_deg": 0.0},
+        )
+        assert synthetic_forward_safety["safe"] is False, synthetic_forward_safety
+
         nav_config = {
             "nav_step_cm": 20.0,
             "reach_tol_cm": 60.0,

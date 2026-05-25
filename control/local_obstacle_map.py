@@ -117,6 +117,8 @@ class LocalObstacleMap:
         radius = float(safety_radius_cm if safety_radius_cm is not None else self.config.swept_radius_cm)
         blocked: List[Dict[str, Any]] = []
         for key, item in self._voxels.items():
+            if not self._voxel_source_relevant_to_labels(item, labels):
+                continue
             center = item.get("center", {}) if isinstance(item.get("center"), dict) else {}
             point = (
                 self._as_float(center.get("x"), 0.0),
@@ -147,6 +149,26 @@ class LocalObstacleMap:
             "current_pose": self._json_safe(pose),
             "predicted_xyz": {"x": round(end[0], 3), "y": round(end[1], 3), "z": round(end[2], 3)},
         }
+
+    def _voxel_source_relevant_to_labels(self, item: Dict[str, Any], labels: List[str]) -> bool:
+        source = str((item if isinstance(item, dict) else {}).get("source", "") or "").strip().lower()
+        if not source.startswith("depth_sector_"):
+            return True
+        sector = source.replace("depth_sector_", "", 1)
+        payload_labels = {str(label or "").strip().lower() for label in labels}
+        if sector == "forward":
+            return "forward" in payload_labels
+        if sector == "right":
+            return "right" in payload_labels
+        if sector == "left":
+            return "left" in payload_labels
+        if sector == "up":
+            return "up" in payload_labels
+        if sector == "down":
+            return "down" in payload_labels
+        if sector == "backoff":
+            return "backoff" in payload_labels
+        return True
 
     def blocked_directions(self, current_pose: Dict[str, Any], candidate_payloads: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         result: Dict[str, Dict[str, Any]] = {}

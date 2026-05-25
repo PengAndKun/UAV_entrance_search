@@ -52,6 +52,21 @@ def test_route6_mixin_contract() -> None:
         "on_route6_save_corrected_map_config",
         "on_route6_open_latest_output",
         "refresh_llm_route6_map",
+        "refresh_llm_route6_realtime_map",
+        "route6_build_realtime_map_planning_context",
+        "route6_select_llm_target_from_context",
+        "route6_apply_selected_target_to_scan_plan",
+        "route6_start_realtime_map_for_target_search",
+        "on_route6_full_stop_uav",
+        "route6_apply_full_stop",
+        "route6_build_semantic_map_context",
+        "route6_extract_layered_object_candidates",
+        "route6_select_llm_semantic_target",
+        "route6_plan_llm_navigation_target",
+        "refresh_llm_route6_map_analysis_panel",
+        "refresh_llm_route6_or_avoidance_display",
+        "route6_or_avoidance_display_payload",
+        "_on_llm_route6_mousewheel",
         "route6_map_overlay_points",
         "route6_update_runtime_metrics",
     ):
@@ -72,29 +87,68 @@ def test_control_package_exports_route6_mixin() -> None:
 def test_route6_window_declares_design_doc_and_core_controls() -> None:
     source = (PROJECT_ROOT / "control" / "route6_explore_control.py").read_text(encoding="utf-8")
     assert_true(
-        "route6_nearest_house_pointcloud_map_design.md" in source,
-        "Route 6 window should link the design document that drives implementation",
+        "route6_window6_realtime_map_llm_targeting.md" in source,
+        "Route 6 window should link the v002 realtime-map LLM targeting document",
     )
     for label in (
-        "Start Nearest House Map Search",
+        "Start LLM Target Map Search",
         "Pause",
         "Resume",
         "Stop",
+        "Full Stop UAV",
         "Force Next House",
         "Clear",
         "Save Corrected Map Config",
         "Open Latest Route 6 Output",
-        "Refresh Map",
+        "Select LLM Target",
+        "Realtime Layered Map",
+        "Load Latest Map",
+        "Start Realtime Update",
+        "Stop Realtime Update",
+        "OR Avoidance",
+        "Refresh OR",
+        "LLM Map Analysis",
     ):
         assert_true(label in source, f"Route 6 window should expose control: {label}")
+    start_handler_source = source[source.find("def on_route6_start_nearest_map_search"):source.find("def on_route6_pause")]
     assert_true(
-        "llm_route6_map_widget" in source and "OverheadMapWidget" in source,
-        "Route 6 window should embed an overhead map widget for map overlay",
+        "route6_start_realtime_map_for_target_search" in start_handler_source,
+        "Start LLM Target Map Search should also start Route 6 realtime map updates",
+    )
+    stop_handler_source = source[source.find("def on_route6_stop"):source.find("def on_route6_force_next_house")]
+    assert_true(
+        "route6_update_map_realtime_stop_event" in stop_handler_source,
+        "Route 6 Stop should request realtime map update shutdown too",
+    )
+    for text in (
+        "llm_route6_scroll_canvas",
+        "llm_route6_content_frame",
+        "llm_route6_or_status_var",
+        "llm_route6_or_detail_var",
+        "<MouseWheel>",
+        "<Button-4>",
+        "<Button-5>",
+        "_bind_llm_route6_mousewheel_tree",
+    ):
+        assert_true(text in source, f"Route 6 window should declare scroll/OR display support: {text}")
+    assert_true(
+        "bind_all" not in source[source.find("def open_llm_route_window6"):source.find("def close_llm_route_window6")],
+        "Window 6 wheel handling should stay local and must not bind globally to the main window",
+    )
+    assert_true(
+        "Route 6 Map Overlay" not in source[source.find("def open_llm_route_window6"):source.find("def close_llm_route_window6")],
+        "Window 6 should no longer use the old overhead map overlay as its primary map",
+    )
+    assert_true(
+        "llm_route6_realtime_map_preview_label" in source and "refresh_llm_route6_realtime_map" in source,
+        "Route 6 window should consume the realtime layered occupancy preview",
     )
     assert_true(
         "llm_route6_metrics_var" in source and "Metrics:" in source,
         "Route 6 window should expose mapped/searched/blocked counts, map confidence, and latest corrected config path",
     )
+    doc_path = PROJECT_ROOT / "overleaf" / "Route6_entrance_search" / "v002" / "route6_window6_realtime_map_llm_targeting.md"
+    assert_true(doc_path.is_file(), f"Route 6 v002 document should exist: {doc_path}")
 
 
 def main() -> None:

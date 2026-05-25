@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
+from PIL import Image
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -129,14 +130,21 @@ class CaptureHarness:
         self.llm_route6_occupancy_resolution_m_var = ValueVar("0.25")
         self.llm_route6_coverage_threshold_var = ValueVar("0.75")
         self.llm_route6_allow_save_corrected_var = ValueVar(False)
+        self.llm_route6_task_prompt_var = ValueVar("Explore the first house north of current UAV.")
+        self.llm_route6_selected_target_var = ValueVar("Selected target: n/a")
+        self.llm_route6_realtime_map_status_var = ValueVar("Realtime map: idle")
         self.route6_update_map_layer_var = ValueVar("z_050")
         self.route6_update_map_status_var = ValueVar("Route 6 Update Map: idle")
+        self.route6_update_map_pose_var = ValueVar("UAV x=n/a y=n/a z=n/a yaw=n/a")
         self.route6_update_map_window = None
         self.route6_update_map_scroll_canvas = None
         self.route6_update_map_content_frame = None
         self.route6_update_map_preview_label = None
         self.route6_update_map_preview_photo = None
         self.route6_update_map_layer_combo = None
+        self.llm_route6_realtime_map_preview_label = None
+        self.llm_route6_realtime_map_preview_photo = None
+        self.llm_route6_realtime_map_layer_combo = None
         self.route6_update_map_capture_thread = None
         self.route6_update_map_realtime_thread = None
         self.route6_update_map_min_move_cm_var = ValueVar("0")
@@ -328,6 +336,40 @@ def test_route6_update_map_window_contract() -> None:
     assert_true("bind_all" not in source[source.find("open_route6_update_map_window"):source.find("def close_route6_update_map_window")], "Route 6 Update Map wheel handling should not bind globally to the main window")
 
 
+def test_route6_uav_overlay_draws_heading_arrow_and_compass(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = CaptureHarness(tmp_dir)
+    harness.latest_state = {"pose": [0.0, 0.0, 300.0, -90.0]}
+    metadata_path = tmp_dir / "occupancy_grid.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "width": 100,
+                "height": 100,
+                "resolution_m": 1.0,
+                "origin_standard_m": [-50.0, -50.0],
+            }
+        ),
+        encoding="utf-8",
+    )
+    image = Image.new("RGB", (100, 100), "white")
+    layer_record = {"occupancy_metadata_path": str(metadata_path)}
+
+    overlay = module.Route6ExploreControlMixin.route6_draw_update_map_uav_overlay(harness, image, layer_record, scale=1)
+    arr = np.asarray(overlay)
+    center_x = 50
+    center_y = 49
+    red_pixels_above = np.sum(
+        (arr[: center_y - 8, center_x - 3 : center_x + 4, 0] > 180)
+        & (arr[: center_y - 8, center_x - 3 : center_x + 4, 1] < 80)
+        & (arr[: center_y - 8, center_x - 3 : center_x + 4, 2] < 80)
+    )
+    compass_nonwhite = np.sum(np.any(arr[4:44, 4:44] < 245, axis=2))
+
+    assert_true(red_pixels_above > 0, "UAV overlay should draw a yaw direction arrow beyond the old crosshair radius")
+    assert_true(compass_nonwhite > 0, "UAV overlay should draw a compass/heading marker in the top-left corner")
+
+
 def test_route6_update_map_capture_buttons_and_handlers_contract() -> None:
     source = (PROJECT_ROOT / "control" / "route6_explore_control.py").read_text(encoding="utf-8")
     for text in (
@@ -392,6 +434,42 @@ def test_route6_update_map_realtime_worker_captures_and_rebuilds(tmp_dir: Path) 
     realtime_state = harness.llm_route6_state.get("route6_update_map_realtime", {})
     assert_true(realtime_state.get("running") is False, f"realtime state should stop cleanly: {realtime_state}")
     assert_true(realtime_state.get("map_count") == 2, f"realtime state should record map count: {realtime_state}")
+
+
+def test_route6_update_map_realtime_preserves_active_search_output_dir(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = CaptureHarness(tmp_dir)
+    harness.llm_route6_output_root_override = tmp_dir / "route6_explore_runs"
+    harness.route6_update_map_capture_interval_s_var = ValueVar("0.01")
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    root = harness.route6_output_root()
+    search_dir = root / "route6_nearest_map_20260525-210527-423"
+    search_dir.mkdir(parents=True, exist_ok=True)
+    harness.llm_route6_state["output_dir"] = str(search_dir)
+    update_dir = module.Route6ExploreControlMixin.make_route6_update_map_output_dir(harness)
+
+    result = module.Route6ExploreControlMixin.route6_update_map_realtime_worker(
+        harness,
+        harness.session,
+        update_dir,
+        max_iterations=1,
+    )
+
+    assert_true(result["capture_count"] == 1, f"realtime worker should still capture map data: {result}")
+    assert_true(
+        harness.llm_route6_state.get("output_dir") == str(search_dir),
+        f"active LLM search output_dir must stay on the movement run: {harness.llm_route6_state}",
+    )
+    assert_true(
+        harness.llm_route6_state.get("route6_update_map_output_dir") == str(update_dir),
+        f"update-map output should be tracked separately: {harness.llm_route6_state}",
+    )
+    realtime_state = harness.llm_route6_state.get("route6_update_map_realtime", {})
+    update_state = harness.llm_route6_state.get("route6_update_map", {})
+    assert_true(realtime_state.get("output_dir") == str(update_dir), f"realtime state should keep update-map dir: {realtime_state}")
+    assert_true(update_state.get("output_dir") == str(update_dir), f"map state should keep update-map dir: {update_state}")
+    latest = module.Route6ExploreControlMixin.route6_update_map_latest_output_dir(harness)
+    assert_true(latest == update_dir, f"latest update-map lookup should prefer realtime map dir, not search dir: {latest}")
 
 
 def test_route6_update_map_realtime_worker_postprocesses_raw_depth_before_rebuild(tmp_dir: Path) -> None:
@@ -650,6 +728,56 @@ def test_route6_capture_folder_reader_selects_generates_and_loads_map(tmp_dir: P
     assert_true("loaded" in str(harness.route6_update_map_status_var.get()).lower(), f"load should update status: {harness.route6_update_map_status_var.get()}")
 
 
+def test_route6_window6_realtime_refresh_reads_manifest_without_rebuild(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = CaptureHarness(tmp_dir)
+    harness.llm_route6_output_root_override = tmp_dir / "route6_explore_runs"
+    run_dir = harness.route6_output_root() / "route6_update_map_20260525-210000-000"
+    frame_dir = run_dir / "frames" / "frame_000001"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    np.save(frame_dir / "point_cloud_world_standard_m.npy", sample_layered_cloud())
+
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    build = module.Route6ExploreControlMixin.route6_update_map_build_from_pointcloud(harness, run_dir)
+    assert_true(build and Path(build["manifest_path"]).is_file(), f"test setup should create a manifest: {build}")
+    harness.llm_route6_state["output_dir"] = str(run_dir)
+
+    def fail_build(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise AssertionError("Window 6 realtime refresh must not rebuild the map")
+
+    harness.route6_update_map_build_from_pointcloud = fail_build
+    manifest = module.Route6ExploreControlMixin.refresh_llm_route6_realtime_map(harness)
+
+    assert_true(manifest.get("schema") == "route6_layered_occupancy_manifest_v1", f"refresh should read manifest: {manifest}")
+    assert_true("loaded" in str(harness.llm_route6_realtime_map_status_var.get()).lower(), f"status should report loaded map: {harness.llm_route6_realtime_map_status_var.get()}")
+    assert_true(str(harness.route6_update_map_layer_var.get()).startswith("z_"), f"refresh should keep/select a layer: {harness.route6_update_map_layer_var.get()}")
+
+
+def test_route6_llm_analysis_reads_manifest_without_rebuild(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = CaptureHarness(tmp_dir)
+    harness.llm_route6_output_root_override = tmp_dir / "route6_explore_runs"
+    run_dir = harness.route6_output_root() / "route6_update_map_20260525-230000-000"
+    frame_dir = run_dir / "frames" / "frame_000001"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    np.save(frame_dir / "point_cloud_world_standard_m.npy", sample_layered_cloud())
+
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    build = module.Route6ExploreControlMixin.route6_update_map_build_from_pointcloud(harness, run_dir)
+    assert_true(build and Path(build["manifest_path"]).is_file(), f"test setup should create a manifest: {build}")
+    harness.llm_route6_state["route6_update_map_output_dir"] = str(run_dir)
+
+    def fail_build(*_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+        raise AssertionError("LLM map analysis must read the existing manifest without rebuilding")
+
+    harness.route6_update_map_build_from_pointcloud = fail_build
+    context = module.Route6ExploreControlMixin.route6_build_semantic_map_context(harness)
+
+    assert_true(context.get("schema") == "route6_semantic_map_context_v1", f"semantic context should be built: {context}")
+    assert_true(context.get("manifest_path") == str(build["manifest_path"]), f"semantic context should use existing manifest: {context}")
+    assert_true(context.get("layer_count") == 13, f"semantic analysis should see all 13 layers: {context}")
+
+
 def run_with_tmp(test_fn) -> None:
     with tempfile.TemporaryDirectory(prefix="route6_update_map_") as raw:
         test_fn(Path(raw))
@@ -664,9 +792,11 @@ def main() -> None:
         lambda: run_with_tmp(test_layered_occupancy_artifacts_are_written),
         test_route6_layered_map_uses_fixed_bounds_and_black_obstacle_preview,
         test_route6_update_map_window_contract,
+        lambda: run_with_tmp(test_route6_uav_overlay_draws_heading_arrow_and_compass),
         test_route6_update_map_capture_buttons_and_handlers_contract,
         lambda: run_with_tmp(test_route6_update_map_capture_once_writes_lidar_log_and_generates_map),
         lambda: run_with_tmp(test_route6_update_map_realtime_worker_captures_and_rebuilds),
+        lambda: run_with_tmp(test_route6_update_map_realtime_preserves_active_search_output_dir),
         lambda: run_with_tmp(test_route6_update_map_realtime_worker_postprocesses_raw_depth_before_rebuild),
         lambda: run_with_tmp(test_route6_update_map_ignores_generated_frame_pointcloud_artifacts),
         lambda: run_with_tmp(test_route6_update_map_realtime_skips_stationary_pose),
@@ -677,6 +807,8 @@ def main() -> None:
         lambda: run_with_tmp(test_route6_pointcloud_processing_standardizes_raw_npy_and_generates_map),
         lambda: run_with_tmp(test_route6_pointcloud_processing_postprocesses_raw_depth_frames),
         lambda: run_with_tmp(test_route6_capture_folder_reader_selects_generates_and_loads_map),
+        lambda: run_with_tmp(test_route6_window6_realtime_refresh_reads_manifest_without_rebuild),
+        lambda: run_with_tmp(test_route6_llm_analysis_reads_manifest_without_rebuild),
     ]
     for test in tests:
         test()

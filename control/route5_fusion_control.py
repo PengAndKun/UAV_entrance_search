@@ -2762,6 +2762,10 @@ class Route5FusionControlMixin:
         self.route5_log_event(output_dir, "hold", {"reason": reason, "payload": payload})
         return result if isinstance(result, dict) else {}
 
+    def route5_route6_full_stop_requested(self) -> bool:
+        event = getattr(self, "route6_full_stop_event", None)
+        return bool(hasattr(event, "is_set") and event.is_set())
+
     def route5_wait_if_paused(self, session: flight.DroneFlightSession, output_dir: Optional[Path]) -> bool:
         self.ensure_route5_state()
         held = False
@@ -4326,6 +4330,21 @@ class Route5FusionControlMixin:
             self.route5_hold(session, output_dir=output_dir, reason="unsafe_waypoint")
             return {"status": "blocked", "reason": "unsafe_waypoint", "safety": target_safety}
         while not self.llm_route5_stop_event.is_set():
+            if self.route5_route6_full_stop_requested():
+                self.llm_route5_stop_event.set()
+                self.route5_hold(session, output_dir=output_dir, reason="route6_full_stop")
+                return {
+                    "status": "stopped",
+                    "reason": "route6_full_stop",
+                    "stage": stage,
+                    "facade": facade,
+                    "target_id": target_id,
+                    "final_target_id": target_id,
+                    "final_target_pose": target_pose,
+                    "target_reset_count": reset_count,
+                    "pose_error": last_error,
+                    "current_pose": current,
+                }
             if self.route5_wait_if_paused(session, output_dir):
                 break
             error = self.route3_pose_error(current, target_pose, config)
@@ -4882,6 +4901,20 @@ class Route5FusionControlMixin:
         started_at = time.time()
         last_result: Dict[str, Any] = {}
         while replan_count <= max_replans and not self.llm_route5_stop_event.is_set():
+            if self.route5_route6_full_stop_requested():
+                self.llm_route5_stop_event.set()
+                self.route5_hold(session, output_dir=output_dir, reason="route6_full_stop")
+                return {
+                    "status": "stopped",
+                    "reason": "route6_full_stop",
+                    "stage": stage,
+                    "facade": facade,
+                    "target_id": target_id,
+                    "final_target_pose": target_pose,
+                    "current_pose": current,
+                    "replan_count": replan_count,
+                    "elapsed_s": round(time.time() - started_at, 3),
+                }
             plan = self.route3_plan_navigation_waypoints(current, target_pose, target_house_id, grid_cm=float(LLM_ROUTE3_ASTAR_GRID_CM))
             plan_log = {
                 "stage": stage,
@@ -4912,6 +4945,21 @@ class Route5FusionControlMixin:
             waypoint_count = len(waypoints)
             blocked_for_replan = False
             for idx, waypoint in enumerate(waypoints, start=1):
+                if self.route5_route6_full_stop_requested():
+                    self.llm_route5_stop_event.set()
+                    self.route5_hold(session, output_dir=output_dir, reason="route6_full_stop")
+                    return {
+                        "status": "stopped",
+                        "reason": "route6_full_stop",
+                        "stage": stage,
+                        "facade": facade,
+                        "target_id": target_id,
+                        "final_target_pose": target_pose,
+                        "current_pose": current,
+                        "navigation_plan": plan,
+                        "replan_count": replan_count,
+                        "elapsed_s": round(time.time() - started_at, 3),
+                    }
                 waypoint_pose = {
                     "x": float(waypoint.get("x", target_pose["x"])),
                     "y": float(waypoint.get("y", target_pose["y"])),
@@ -6954,4 +7002,3 @@ class Route5FusionControlMixin:
         summary = self.route5_run_summary(output_dir, status=str(self.llm_route5_state.get("stage", "manual_validate") or "manual_validate"))
         self.llm_route5_status_var.set(f"LLM Route V5: run summary -> {output_dir / 'route5_fusion_summary.json'}")
         self.route5_log_event(output_dir, "manual_validate_run", summary)
-
