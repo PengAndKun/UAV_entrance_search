@@ -13,6 +13,8 @@ from .obstacle_representation_control import ObstacleRepresentationControlMixin
 from .route_control import RouteControlMixin
 from .route4_fusion_control import Route4FusionControlMixin
 from .route5_fusion_control import Route5FusionControlMixin
+from .route6_explore_control import Route6ExploreControlMixin
+from .active_nbv_scan_control import ActiveNBVScanControlMixin
 
 
 class RunDroneFlightPanel(
@@ -21,6 +23,8 @@ class RunDroneFlightPanel(
     RouteControlMixin,
     Route4FusionControlMixin,
     Route5FusionControlMixin,
+    Route6ExploreControlMixin,
+    ActiveNBVScanControlMixin,
     AnalysisControlMixin,
     LidarAnalysisControlMixin,
     ObstacleAvoidanceControlMixin,
@@ -917,6 +921,7 @@ class RunDroneFlightPanel(
             tk.Button(scan, text="Open LLM Route Window 3", command=self.open_llm_route_window3).pack(side="left", padx=6, pady=4)
             tk.Button(scan, text="Open LLM Route Window 4", command=self.open_llm_route_window4).pack(side="left", padx=6, pady=4)
             tk.Button(scan, text="Open LLM Route Window 5", command=self.open_llm_route_window5).pack(side="left", padx=6, pady=4)
+            tk.Button(scan, text="Open LLM Route Window 6", command=self.open_llm_route_window6).pack(side="left", padx=6, pady=4)
 
         actions = tk.Frame(route)
         actions.grid(row=4, column=0, columnspan=6, sticky="ew", padx=0, pady=(0, 4))
@@ -932,6 +937,7 @@ class RunDroneFlightPanel(
         tk.Button(actions, text="Clear Route", command=self.on_clear_route_plan).pack(side="left", padx=6, pady=4)
         tk.Label(actions, text="Delay ms").pack(side="left", padx=(18, 2), pady=4)
         tk.Entry(actions, textvariable=self.route_delay_ms_var, width=7).pack(side="left", padx=(0, 6), pady=4)
+        tk.Button(actions, text="Open Active NBV Scan", command=self.open_active_nbv_scan_window).pack(side="left", padx=6, pady=4)
         tk.Label(route, textvariable=self.llm_route_status_var, anchor="w").grid(row=5, column=0, columnspan=6, sticky="ew", padx=6, pady=(0, 4))
         preview_text = tk.Text(route, height=8, wrap="none", font=("Consolas", 9))
         preview_text.grid(row=6, column=0, columnspan=6, sticky="ew", padx=6, pady=(0, 6))
@@ -1765,6 +1771,9 @@ class RunDroneFlightPanel(
         route5_or2_stop_event = getattr(self, "route5_or2_monitor_stop_event", None)
         if route5_or2_stop_event is not None:
             route5_or2_stop_event.set()
+        route6_stop_event = getattr(self, "llm_route6_stop_event", None)
+        if route6_stop_event is not None:
+            route6_stop_event.set()
         if self.llm_route_window is not None:
             try:
                 self.llm_route_window.destroy()
@@ -1838,6 +1847,13 @@ class RunDroneFlightPanel(
             self.route5_or2_rgb_photo = None
             self.route5_or2_mask_photo = None
             self.route5_or2_report_text = None
+        if getattr(self, "llm_route6_window", None) is not None:
+            try:
+                self.llm_route6_window.destroy()
+            except Exception:
+                pass
+            self.llm_route6_window = None
+            self.llm_route6_summary_text = None
         self.stop_stream_player()
         self.stop_stream_analysis()
         self.close_lidar_analysis_window()

@@ -15,6 +15,7 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 from control.common import PROJECT_ROOT
+from control.local_obstacle_map import LocalObstacleMap, LocalObstacleMapConfig
 import control.route5_fusion_control as route5_module
 from control.route5_fusion_control import Route5FusionControlMixin
 
@@ -97,6 +98,8 @@ class _Route5Harness(Route5FusionControlMixin):
         self.llm_route5_capture_analysis_thread = None
         self.llm_route5_capture_analysis_stop_event = threading.Event()
         self.llm_route5_state: Dict[str, Any] = {}
+        self.route5_local_obstacle_map = None
+        self.route5_local_obstacle_output_dir = None
         self.llm_route5_completed_facades = set()
         self.llm_route5_blocked_facades = set()
         self.llm_route5_thread = None
@@ -768,12 +771,106 @@ def main() -> None:
         assert safe_alternative["event_updates"]["candidate_safety_scores"], safe_alternative
         harness.force_negative_y_unsafe = False
 
+        depth_blocked_alternative = harness.route5_apply_or2_safe_alternative(
+            event={
+                "target_house_id": "001",
+                "pointcloud_summary": {
+                    "available": True,
+                    "forward_swept_clear": False,
+                    "left_swept_clear": False,
+                    "right_swept_clear": False,
+                    "up_swept_clear": False,
+                    "backoff_swept_clear": True,
+                },
+            },
+            gate={"front_risk_state": "must_stop", "must_stop": True, "can_forward": False},
+            rule={"selected_direction": "right", "candidate_action_scores": {"right": 0.8, "left": 0.7, "backoff": 0.55, "hold": 0.05}},
+            selected_direction="right",
+            selected_payload={"forward_cm": 0.0, "right_cm": 20.0, "up_cm": 0.0, "yaw_delta_deg": 0.0, "action_name": "route5_or2_side_step_right"},
+            nominal_payload={"forward_cm": 25.0, "right_cm": 0.0, "up_cm": 0.0, "yaw_delta_deg": 0.0, "action_name": "route5_nav"},
+            config={"nav_step_cm": 20.0, "reach_tol_cm": 70.0},
+            current_pose={"x": 0.0, "y": 0.0, "z": 100.0, "yaw": 0.0},
+            target_pose={"x": 400.0, "y": 0.0, "z": 100.0, "yaw": 0.0},
+        )
+        assert depth_blocked_alternative["direction"] in {"backoff", "hold"}, depth_blocked_alternative
+        assert depth_blocked_alternative["or2_selected_action_rejected_reason"].startswith("depth_swept_direction_blocked"), depth_blocked_alternative
+        assert depth_blocked_alternative["candidate_safety_scores"]["right"]["depth_swept_clear"] is False, depth_blocked_alternative
+
+        local_map = LocalObstacleMap(LocalObstacleMapConfig(voxel_cm=25.0, radius_cm=1200.0, ttl_frames=150, ttl_seconds=60.0))
+        pointcloud_path = output_dir / "synthetic_obstacle_standard_m.npy"
+        np.save(
+            pointcloud_path,
+            np.asarray(
+                [
+                    [0.0, -1.0, 1.0, 255.0, 0.0, 0.0],
+                    [0.0, -1.2, 1.0, 255.0, 0.0, 0.0],
+                    [0.1, -1.0, 1.1, 255.0, 0.0, 0.0],
+                ],
+                dtype=np.float32,
+            ),
+        )
+        update = local_map.update_from_event(
+            {
+                "frame_id": 1,
+                "point_cloud_world_standard_m_npy_path": str(pointcloud_path),
+                "pointcloud_summary": {"available": True, "forward_swept_clear": False, "front_min_depth_cm": 110.0},
+                "or2_prediction": {"front_risk_state": "must_stop"},
+            },
+            {"x": 0.0, "y": 0.0, "z": 100.0, "yaw": 90.0},
+        )
+        assert update["added_voxel_count"] > 0, update
+        safety = local_map.query_safety(
+            {"x": 0.0, "y": 0.0, "z": 100.0, "yaw": 90.0},
+            {"forward_cm": 140.0, "right_cm": 0.0, "up_cm": 0.0, "yaw_delta_deg": 0.0},
+        )
+        assert safety["checked"] is True, safety
+        assert safety["safe"] is False, safety
+        assert "forward" in safety["blocked_directions"], safety
+
+        harness.route5_ensure_local_obstacle_map(output_dir)
+        harness.update_local_obstacle_map_from_event(
+            {
+                "frame_id": 2,
+                "point_cloud_world_standard_m_npy_path": str(pointcloud_path),
+                "pointcloud_summary": {"available": True, "right_swept_clear": False, "right_min_depth_cm": 95.0},
+                "or2_prediction": {"front_risk_state": "must_stop"},
+            },
+            {"x": 0.0, "y": 0.0, "z": 100.0, "yaw": 0.0},
+            output_dir,
+        )
+        local_blocked_alternative = harness.route5_apply_or2_safe_alternative(
+            event={
+                "target_house_id": "001",
+                "pointcloud_summary": {
+                    "available": True,
+                    "forward_swept_clear": True,
+                    "left_swept_clear": True,
+                    "right_swept_clear": True,
+                    "up_swept_clear": True,
+                    "backoff_swept_clear": True,
+                },
+            },
+            gate={"front_risk_state": "must_stop", "must_stop": True, "can_forward": False},
+            rule={"selected_direction": "right", "candidate_action_scores": {"right": 0.9, "left": 0.4, "backoff": 0.2, "hold": 0.1}},
+            selected_direction="right",
+            selected_payload={"forward_cm": 0.0, "right_cm": 20.0, "up_cm": 0.0, "yaw_delta_deg": 0.0, "action_name": "route5_or2_side_step_right"},
+            nominal_payload={"forward_cm": 25.0, "right_cm": 0.0, "up_cm": 0.0, "yaw_delta_deg": 0.0, "action_name": "route5_nav"},
+            config={"nav_step_cm": 20.0, "reach_tol_cm": 70.0},
+            current_pose={"x": 0.0, "y": 0.0, "z": 100.0, "yaw": 0.0},
+            target_pose={"x": 400.0, "y": 0.0, "z": 100.0, "yaw": 0.0},
+        )
+        assert local_blocked_alternative["candidate_safety_scores"]["right"]["local_3d_clear"] is False, local_blocked_alternative
+        assert local_blocked_alternative["or2_selected_action_rejected_reason"].startswith("local_3d_occupancy_blocked"), local_blocked_alternative
+        local_safety_rows = harness.read_jsonl_artifact(output_dir / "local_3d_safety_events.jsonl")
+        assert local_safety_rows and local_safety_rows[-1]["local_3d_safety"]["checked"] is True, local_safety_rows
+
         nav_config = {
             "nav_step_cm": 20.0,
             "reach_tol_cm": 60.0,
             "z_tol_cm": 40.0,
             "yaw_tol_deg": 10.0,
         }
+        assert "ACTIVE_NBV_NAV_TO_SCAN_POINT" in harness.route5_depth_lookahead_stages()
         yaw_first = harness.route5_movement_payload_for_target_with_lookahead(
             {"x": 0.0, "y": 0.0, "z": 100.0, "yaw": 0.0},
             {"x": 0.0, "y": 1000.0, "z": 100.0, "yaw": 90.0},
@@ -794,6 +891,15 @@ def main() -> None:
         assert forward_after_yaw["forward_cm"] == 20.0, forward_after_yaw
         assert forward_after_yaw["right_cm"] == 0.0, forward_after_yaw
         assert forward_after_yaw["yaw_delta_deg"] == 0.0, forward_after_yaw
+        active_nbv_yaw_first = harness.route5_movement_payload_for_target_with_lookahead(
+            {"x": 0.0, "y": 0.0, "z": 100.0, "yaw": 0.0},
+            {"x": 0.0, "y": 1000.0, "z": 100.0, "yaw": 90.0},
+            nav_config,
+            stage="ACTIVE_NBV_NAV_TO_SCAN_POINT",
+        )
+        assert active_nbv_yaw_first["yaw_policy"] == "face_waypoint_then_forward", active_nbv_yaw_first
+        assert active_nbv_yaw_first["forward_cm"] == 0.0, active_nbv_yaw_first
+        assert active_nbv_yaw_first["yaw_delta_deg"] == 30.0, active_nbv_yaw_first
 
         tracker = harness.route5_new_target_reset_tracker("001_scan_0012_west_single_300cm", {"x": 0.0, "y": 400.0, "z": 100.0, "yaw": 0.0})
         reset_event = {

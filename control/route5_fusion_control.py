@@ -3,6 +3,7 @@
 from copy import deepcopy
 
 from .common import *
+from .local_obstacle_map import LocalObstacleMap, LocalObstacleMapConfig
 from . import lidar_yolo_analysis
 
 from obstacle_avoidance.collect_route_episodes import (
@@ -141,6 +142,10 @@ class Route5FusionControlMixin:
             self.llm_route5_map_widget = None
         if not hasattr(self, "llm_route5_map_frame"):
             self.llm_route5_map_frame = None
+        if not hasattr(self, "route5_local_obstacle_map"):
+            self.route5_local_obstacle_map = None
+        if not hasattr(self, "route5_local_obstacle_output_dir"):
+            self.route5_local_obstacle_output_dir = None
         if not hasattr(self, "llm_route5_preview_text"):
             self.llm_route5_preview_text = None
         if not hasattr(self, "llm_route5_analysis_text"):
@@ -1094,6 +1099,8 @@ class Route5FusionControlMixin:
         if force_new or output_dir is None or current_target != str(target_house_id):
             created_new_run = True
             output_dir = self.make_route5_fused_output_dir(target_house_id)
+            self.route5_local_obstacle_map = LocalObstacleMap(self.route5_local_obstacle_config())
+            self.route5_local_obstacle_output_dir = output_dir
             self.llm_route5_completed_facades = set()
             self.llm_route5_blocked_facades = set()
             self.llm_route5_state = {
@@ -1136,6 +1143,8 @@ class Route5FusionControlMixin:
             "route5_llm_calls.jsonl",
             "house_exploration_memory_events.jsonl",
             "avoidance_events.jsonl",
+            "local_obstacle_map.jsonl",
+            "local_3d_safety_events.jsonl",
         ):
                 (output_dir / artifact_name).touch(exist_ok=True)
             self.write_json_artifact(
@@ -2637,6 +2646,92 @@ class Route5FusionControlMixin:
         self.route5_log_event(output_dir, "scan_pointcloud_postprocess", record)
         return record
 
+    def route5_local_obstacle_config(self) -> LocalObstacleMapConfig:
+        return LocalObstacleMapConfig(voxel_cm=25.0, radius_cm=1200.0, ttl_frames=150, ttl_seconds=60.0)
+
+    def route5_ensure_local_obstacle_map(self, output_dir: Optional[Path] = None) -> LocalObstacleMap:
+        self.ensure_route5_state()
+        target_dir = Path(output_dir) if output_dir is not None else self.route5_state_output_dir()
+        current_dir = getattr(self, "route5_local_obstacle_output_dir", None)
+        if (
+            getattr(self, "route5_local_obstacle_map", None) is None
+            or (target_dir is not None and current_dir is not None and Path(current_dir) != target_dir)
+        ):
+            self.route5_local_obstacle_map = LocalObstacleMap(self.route5_local_obstacle_config())
+        if target_dir is not None:
+            self.route5_local_obstacle_output_dir = target_dir
+        return self.route5_local_obstacle_map
+
+    def write_local_obstacle_artifacts(self, output_dir: Path) -> Dict[str, Any]:
+        obstacle_map = self.route5_ensure_local_obstacle_map(output_dir)
+        return obstacle_map.write_artifacts(Path(output_dir))
+
+    def update_local_obstacle_map_from_event(
+        self,
+        event: Dict[str, Any],
+        current_pose: Dict[str, Any],
+        output_dir: Path,
+    ) -> Dict[str, Any]:
+        obstacle_map = self.route5_ensure_local_obstacle_map(output_dir)
+        update = obstacle_map.update_from_event(event if isinstance(event, dict) else {}, current_pose if isinstance(current_pose, dict) else {})
+        record = {
+            "event_type": "local_obstacle_map_update",
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+            **self.route5_json_safe(update),
+        }
+        self.append_jsonl(Path(output_dir) / "local_obstacle_map.jsonl", record)
+        self.write_local_obstacle_artifacts(Path(output_dir))
+        return record
+
+    def query_local_3d_safety(
+        self,
+        current_pose: Dict[str, Any],
+        payload: Dict[str, Any],
+        config: Optional[Dict[str, Any]] = None,
+        *,
+        output_dir: Optional[Path] = None,
+        stage: str = "",
+        target_id: str = "",
+        candidate_direction: str = "",
+    ) -> Dict[str, Any]:
+        obstacle_map = self.route5_ensure_local_obstacle_map(output_dir)
+        safety_radius = None
+        if isinstance(config, dict) and config.get("local_3d_safety_radius_cm") is not None:
+            try:
+                safety_radius = float(config.get("local_3d_safety_radius_cm"))
+            except Exception:
+                safety_radius = None
+        safety = obstacle_map.query_safety(current_pose if isinstance(current_pose, dict) else {}, payload if isinstance(payload, dict) else {}, safety_radius_cm=safety_radius)
+        safety.update(
+            {
+                "stage": str(stage or ""),
+                "target_id": str(target_id or ""),
+                "candidate_direction": str(candidate_direction or ""),
+            }
+        )
+        target_dir = Path(output_dir) if output_dir is not None else getattr(self, "route5_local_obstacle_output_dir", None)
+        if target_dir is not None:
+            self.append_jsonl(
+                Path(target_dir) / "local_3d_safety_events.jsonl",
+                {
+                    "event_type": "local_3d_safety_check",
+                    "created_at": datetime.now().isoformat(timespec="milliseconds"),
+                    "stage": str(stage or ""),
+                    "target_id": str(target_id or ""),
+                    "candidate_direction": str(candidate_direction or ""),
+                    "local_3d_safety": self.route5_json_safe(safety),
+                },
+            )
+        return self.route5_json_safe(safety)
+
+    def local_3d_blocked_directions(
+        self,
+        current_pose: Dict[str, Any],
+        candidate_payloads: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        obstacle_map = self.route5_ensure_local_obstacle_map()
+        return self.route5_json_safe(obstacle_map.blocked_directions(current_pose, candidate_payloads))
+
     def route5_set_control_lock(self, locked: bool) -> None:
         self.ensure_route5_state()
         self.llm_route5_control_locked = bool(locked)
@@ -2760,7 +2855,7 @@ class Route5FusionControlMixin:
         }
 
     def route5_depth_lookahead_stages(self) -> set:
-        return {"NAV_TO_OBS", "NAV_TO_SCAN_POINT"}
+        return {"NAV_TO_OBS", "NAV_TO_SCAN_POINT", "ACTIVE_NBV_NAV_TO_SCAN_POINT"}
 
     def route5_payload_blocked_directions_from_depth(
         self,
@@ -2776,6 +2871,8 @@ class Route5FusionControlMixin:
         up_cm = self.route5_event_float(nominal_payload.get("up_cm"), default=0.0)
         if forward_cm > deadband_cm and summary.get("forward_swept_clear") is False:
             blocked.append("forward")
+        if forward_cm < -deadband_cm and summary.get("backoff_swept_clear") is False:
+            blocked.append("backoff")
         if right_cm > deadband_cm and summary.get("right_swept_clear") is False:
             blocked.append("right")
         if right_cm < -deadband_cm and summary.get("left_swept_clear") is False:
@@ -3278,23 +3375,56 @@ class Route5FusionControlMixin:
         selected_safety: Dict[str, Any] = {}
         selected = str(selected_direction or "").strip().lower()
         selected_rejected_reason = ""
+        depth_summary = event.get("pointcloud_summary", {}) if isinstance(event.get("pointcloud_summary"), dict) else {}
+        output_dir_value = event.get("route5_output_dir") if isinstance(event, dict) else None
+        output_dir = Path(str(output_dir_value)) if output_dir_value else getattr(self, "route5_local_obstacle_output_dir", None)
         for direction in self.route5_or2_candidate_order(selected):
             payload = self.route5_or2_direction_payload(direction, nominal_payload, config)
             predicted = self.route3_predict_next_pose(current_pose, payload)
             safety = self.route3_safety_report_for_pose(target_house_id, predicted)
             risk_ok = self.route5_or2_direction_risk_acceptable(direction, risk_state=risk_state, gate=gate, rule=rule)
-            safe = bool(safety.get("safe", False))
+            depth_blocked = self.route5_payload_blocked_directions_from_depth(depth_summary, payload)
+            depth_clear = not bool(depth_blocked)
+            local_3d_safety = self.query_local_3d_safety(
+                current_pose,
+                payload,
+                config,
+                output_dir=output_dir,
+                stage=str(event.get("route5_stage", event.get("stage", "")) or ""),
+                target_id=str(event.get("target_id", "") or ""),
+                candidate_direction=direction,
+            )
+            local_3d_clear = bool(local_3d_safety.get("safe", True))
+            local_3d_blocked = list(local_3d_safety.get("blocked_directions", [])) if isinstance(local_3d_safety.get("blocked_directions"), list) else []
+            map_safe = bool(safety.get("safe", False))
+            safety_reason = str(safety.get("reason", "") or "")
+            if not depth_clear:
+                safety_reason = f"depth_swept_direction_blocked:{','.join(depth_blocked)}"
+            if not local_3d_clear:
+                safety_reason = str(local_3d_safety.get("reason", "") or f"local_3d_occupancy_blocked:{direction}")
+            safe = bool(map_safe and depth_clear and local_3d_clear)
             candidate_scores[direction] = {
                 "safe": safe,
+                "map_safe": map_safe,
+                "depth_swept_clear": depth_clear,
+                "depth_blocked_directions": list(depth_blocked),
+                "local_3d_clear": local_3d_clear,
+                "local_3d_blocked_directions": local_3d_blocked,
+                "local_3d_rejected_reason": "" if local_3d_clear else str(local_3d_safety.get("reason", "") or f"local_3d_occupancy_blocked:{direction}"),
+                "local_3d_safety": self.route5_json_safe(local_3d_safety),
                 "risk_acceptable": bool(risk_ok),
-                "safety_reason": str(safety.get("reason", "") or ""),
+                "safety_reason": safety_reason,
                 "payload": self.route5_json_safe(payload),
                 "predicted_pose": self.route5_json_safe(predicted),
             }
             if direction == selected:
                 selected_safety = safety
-                if not safe:
+                if not map_safe:
                     selected_rejected_reason = str(safety.get("reason", "unsafe_selected_or2_action") or "unsafe_selected_or2_action")
+                elif not depth_clear:
+                    selected_rejected_reason = safety_reason
+                elif not local_3d_clear:
+                    selected_rejected_reason = safety_reason
                 elif not risk_ok:
                     selected_rejected_reason = "or2_risk_not_acceptable"
             if safe and risk_ok:
@@ -4079,12 +4209,22 @@ class Route5FusionControlMixin:
         event["route5_stage"] = stage
         event["facade"] = facade
         event["target_id"] = target_id
+        event["route5_output_dir"] = str(output_dir)
         event["depth_lookahead_plan"] = lookahead_plan or {}
         event["nominal_payload"] = nominal_payload or {}
         prediction = self.route5_predict_obstacle_representation(event)
         event["or2_prediction"] = prediction
         event["representation_prediction"] = {"status": "replaced_by_or2", "or2_front_risk_state": prediction.get("front_risk_state", "")}
         event["representation_obstacle_hint"] = "or2_risk_region"
+        try:
+            event["local_obstacle_map_update"] = self.update_local_obstacle_map_from_event(
+                event,
+                event.get("current_pose", {}) if isinstance(event.get("current_pose"), dict) else {},
+                output_dir,
+            )
+        except Exception as exc:
+            event["local_obstacle_map_update"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+            self.route5_log_event(output_dir, "local_obstacle_map_update_failed", event["local_obstacle_map_update"])
         self.route5_update_state(last_obstacle_event=self.route5_json_safe(event), last_or2_event=self.route5_json_safe(event))
         self.route5_log_event(output_dir, "obstacle_sensing", event)
         self.append_jsonl(
@@ -4586,6 +4726,15 @@ class Route5FusionControlMixin:
                     self.root.after(0, lambda e=exc: self.llm_route5_avoidance_status_var.set(f"Avoidance: fallback navigation ({e})"))
             predicted = self.route3_predict_next_pose(current, payload)
             safety = self.route3_safety_report_for_pose(target_house_id, predicted)
+            local_3d_safety = self.query_local_3d_safety(
+                current,
+                payload,
+                config,
+                output_dir=output_dir,
+                stage=stage,
+                target_id=target_id,
+                candidate_direction=str(payload.get("action_name", "") or ""),
+            )
             escape_safety_allowed = self.route3_escape_safety_allowed(current, predicted, target_pose, safety, escape_obstacle)
             trace = {
                 "stage": stage,
@@ -4600,9 +4749,12 @@ class Route5FusionControlMixin:
                 "payload": payload,
                 "predicted_pose": predicted,
                 "safety": safety,
+                "local_3d_safety": local_3d_safety,
                 "obstacle_event_frame_id": event.get("frame_id") if event else None,
                 "created_at": datetime.now().isoformat(timespec="milliseconds"),
             }
+            if event:
+                event["local_3d_safety"] = local_3d_safety
             self.append_jsonl(output_dir / "route5_movement_trace.jsonl", trace)
             self.root.after(
                 0,
@@ -4626,6 +4778,34 @@ class Route5FusionControlMixin:
                     "target_reset_count": reset_count,
                     "pose_error": error,
                     "safety": safety,
+                    "current_pose": current,
+                }
+            if not bool(local_3d_safety.get("safe", True)):
+                reason = str(local_3d_safety.get("reason", "local_3d_occupancy_blocked") or "local_3d_occupancy_blocked")
+                if event:
+                    event["local_3d_safety"] = local_3d_safety
+                    event["avoidance_active"] = True
+                    event["selected_action"] = "route5_local_3d_safety_hold"
+                    event["selected_action_reason"] = reason
+                    event["selected_action_payload"] = action_payload("hold")
+                    event["final_payload"] = action_payload("hold")
+                    event = self.route5_normalize_avoidance_event(event)
+                    self.route5_write_frame_decision(output_dir, event, final_payload=action_payload("hold"))
+                    self.append_jsonl(output_dir / "avoidance_events.jsonl", self.route5_json_safe(event))
+                    self.route5_write_avoidance_summary(output_dir, status="running")
+                self.route5_hold(session, output_dir=output_dir, reason=reason)
+                self.route5_log_event(output_dir, "local_3d_navigation_blocked", trace)
+                return {
+                    "status": "blocked",
+                    "reason": reason,
+                    "stage": stage,
+                    "facade": facade,
+                    "target_id": target_id,
+                    "final_target_id": target_id,
+                    "final_target_pose": target_pose,
+                    "target_reset_count": reset_count,
+                    "pose_error": error,
+                    "local_3d_safety": local_3d_safety,
                     "current_pose": current,
                 }
             result = self.safe("Route V5 fused movement tick", lambda p=payload: session.move_relative(p))

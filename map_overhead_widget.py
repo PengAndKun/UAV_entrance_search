@@ -71,6 +71,8 @@ ROUTE_PLAN_VISITED_COLOR = "#6ee7a8"
 ROUTE_PLAN_TEXT_COLOR = "#fff3bf"
 TRAJECTORY_COLOR = "#2dd4bf"
 TRAJECTORY_DOT_COLOR = "#ccfbf1"
+POINT_OVERLAY_COLOR = "#f97316"
+POINT_OVERLAY_TEXT_COLOR = "#fed7aa"
 
 # House status 鈫?(fill, outline, outline_width)
 _STATUS_STYLE: Dict[str, Tuple[str, str, int]] = {
@@ -136,6 +138,7 @@ class OverheadMapWidget:
         self._route_target: Optional[Tuple[float, float]] = None
         self._route_plan: List[dict] = []
         self._trajectory_points: List[Tuple[float, float]] = []
+        self._point_overlay_points: List[dict] = []
         self._image_size: Optional[Tuple[int, int]] = None
         self._image_canvas_rect: Optional[Tuple[float, float, float, float]] = None
         self._image_layer_offset_px: Tuple[float, float] = (0.0, 0.0)
@@ -323,6 +326,32 @@ class OverheadMapWidget:
                 except Exception:
                     continue
         self._trajectory_points = normalized
+        self._redraw()
+
+    def set_point_overlay_points(self, points: Optional[Any]) -> None:
+        """Set unconnected world-space point overlays such as local obstacles."""
+        normalized: List[dict] = []
+        if isinstance(points, list):
+            for idx, point in enumerate(points):
+                if not isinstance(point, dict):
+                    continue
+                try:
+                    wx = float(point.get("x", point.get("world_x")))
+                    wy = float(point.get("y", point.get("world_y")))
+                except Exception:
+                    continue
+                normalized.append(
+                    {
+                        "x": wx,
+                        "y": wy,
+                        "label": str(point.get("label", "") or f"P{idx}"),
+                        "status": str(point.get("status", "") or ""),
+                        "color": str(point.get("color", "") or POINT_OVERLAY_COLOR),
+                        "outline_color": str(point.get("outline_color", "") or "#111827"),
+                        "radius_px": point.get("radius_px", 4),
+                    }
+                )
+        self._point_overlay_points = normalized
         self._redraw()
 
     def set_calibration(
@@ -532,6 +561,9 @@ class OverheadMapWidget:
 
         if self._trajectory_points:
             self._draw_trajectory()
+
+        if self._point_overlay_points:
+            self._draw_point_overlays()
 
         for house_box in self._house_boxes:
             self._draw_house_box(house_box)
@@ -812,6 +844,43 @@ class OverheadMapWidget:
                 outline="",
                 tags="dynamic",
             )
+
+    def _draw_point_overlays(self) -> None:
+        """Draw unconnected point overlays without affecting route lines."""
+        if not self._canvas_alive() or not self._point_overlay_points:
+            return
+        for idx, point in enumerate(self._point_overlay_points):
+            try:
+                cx, cy = self.world_to_canvas(float(point["x"]), float(point["y"]))
+            except Exception:
+                continue
+            try:
+                radius = max(2.0, min(10.0, float(point.get("radius_px", 4) or 4)))
+            except Exception:
+                radius = 4.0
+            color = str(point.get("color", "") or POINT_OVERLAY_COLOR)
+            outline = str(point.get("outline_color", "") or "#111827")
+            self.canvas.create_oval(
+                cx - radius,
+                cy - radius,
+                cx + radius,
+                cy + radius,
+                fill=color,
+                outline=outline,
+                width=1,
+                tags="dynamic",
+            )
+            label = str(point.get("label", "") or "")
+            if label and idx % 20 == 0:
+                self.canvas.create_text(
+                    cx + 7,
+                    cy + 6,
+                    text=label,
+                    fill=POINT_OVERLAY_TEXT_COLOR,
+                    font=("Consolas", 7, "bold"),
+                    anchor="w",
+                    tags="dynamic",
+                )
 
     def _draw_calibration_anchor(self, anchor: dict) -> None:
         """Draw a numbered calibration anchor marker on the map."""
