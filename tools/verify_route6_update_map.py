@@ -283,13 +283,81 @@ def test_layered_occupancy_artifacts_are_written(tmp_dir: Path) -> None:
     assert_true((root / "z_650" / "occupancy_grid.png").is_file(), f"z_650 preview should exist under stable folder: {result}")
 
 
+def test_route6_known_house_polygons_overlay_all_layers_and_plan_nav(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    builder = load_builder()
+    harness = CaptureHarness(tmp_dir)
+    run_dir = tmp_dir / "route6_update_map_known_houses"
+    result = builder.write_route6_layered_occupancy_artifacts(run_dir, sample_layered_cloud(), resolution_m=0.25)
+
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    module.Route6ExploreControlMixin.route6_record_update_map_output_dir(harness, run_dir, source="test_known_houses")
+    manifest = module.Route6ExploreControlMixin.route6_apply_known_house_polygons_to_update_map(harness, run_dir)
+    plan = module.Route6ExploreControlMixin.route6_build_known_house_navigation_plan(harness, run_dir, target_house_id="001")
+
+    polygon_path = run_dir / "map" / "known_house_polygons.json"
+    assert_true(polygon_path.is_file(), "known house polygon artifact should be written")
+    polygons = json.loads(polygon_path.read_text(encoding="utf-8"))
+    assert_true(polygons["house_count"] == 5, f"five operator-provided houses should be recorded: {polygons}")
+    records_by_id = {record["house_id"]: record for record in polygons["houses"]}
+    assert_true(set(records_by_id) == {"001", "002", "003", "004", "005"}, f"known house ids should be stable: {records_by_id}")
+    expected_bboxes = {
+        "003": {"min_x": -3000.0, "max_x": -800.0, "min_y": 1450.0, "max_y": 2450.0},
+        "004": {"min_x": -3600.0, "max_x": -1100.0, "min_y": -2400.0, "max_y": -1550.0},
+        "005": {"min_x": -300.0, "max_x": 1700.0, "min_y": -2350.0, "max_y": -1400.0},
+    }
+    for house_id, expected_bbox in expected_bboxes.items():
+        assert_true(records_by_id[house_id]["bbox"] == expected_bbox, f"house {house_id} bbox should match operator coordinates: {records_by_id[house_id]}")
+    assert_true(manifest["known_house_overlay"]["house_count"] == 5, f"manifest should summarize known houses: {manifest}")
+    assert_true(len(manifest["layers"]) == int(result["layer_count"]), f"all layers should remain present: {manifest}")
+    for layer in manifest["layers"]:
+        overlay_path = Path(layer["known_house_overlay_preview_path"])
+        assert_true(overlay_path.is_file(), f"each layer should have a known-house overlay: {layer}")
+        image = np.asarray(Image.open(overlay_path).convert("RGB"))
+        colored = np.sum((image[:, :, 2] > 120) & (image[:, :, 0] < 120))
+        assert_true(colored > 0, f"known house overlay should draw colored house outlines: {overlay_path}")
+    assert_true(plan["schema"] == "route6_known_house_navigation_plan_v1", f"unexpected nav plan schema: {plan}")
+    assert_true(plan["target_house_id"] == "001", f"house 1 should be planned by known coordinates: {plan}")
+    assert_true(plan["target_pose_cm"]["x"] < 2800.0, f"navigation point should be outside house 1 bbox, not its center: {plan}")
+    assert_true((run_dir / "route6_known_house_navigation_plan.json").is_file(), "known-house navigation plan should be written")
+    scan_points = module.Route6ExploreControlMixin.route6_plan_selected_house_scan_points(harness, run_dir, "001")
+    assert_true(scan_points and scan_points[0]["x"] == plan["target_pose_cm"]["x"], f"known nav point should seed the movement scan plan: {scan_points}")
+    assert_true(scan_points[0]["view_type"] == "route6_nearest_facade_scout", f"known coordinate mode should use the Route 5-style scout movement point: {scan_points}")
+
+
+def test_route6_known_house_overlay_is_bottom_light_reference_layer(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = CaptureHarness(tmp_dir)
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    records = module.Route6ExploreControlMixin.route6_enable_known_house_coordinate_mode(harness)
+    metadata = {
+        "width": 100,
+        "height": 100,
+        "resolution_m": 1.0,
+        "origin_standard_m": [-50.0, -50.0],
+    }
+    image = Image.new("RGB", (100, 100), "white")
+    obstacle_px = module.Route6ExploreControlMixin.route6_unreal_cm_to_layer_pixel(harness, metadata, 2800.0, -1400.0)
+    image.putpixel(obstacle_px, (0, 0, 0))
+
+    overlay = module.Route6ExploreControlMixin.route6_draw_known_house_overlay_on_image(harness, image, metadata, records)
+    arr = np.asarray(overlay.convert("RGB"))
+    obstacle_color = tuple(int(value) for value in arr[obstacle_px[1], obstacle_px[0], :])
+    colored_mask = np.any((arr > 0) & (arr < 245), axis=2) & ~np.all(arr < 20, axis=2)
+    colored_pixels = arr[colored_mask]
+
+    assert_true(obstacle_color == (0, 0, 0), f"black obstacle pixels should stay above the known-house layer: {obstacle_color}")
+    assert_true(colored_pixels.size > 0, "known house reference should still draw visible pixels")
+    assert_true(int(np.min(colored_pixels)) >= 120, f"known house layer should use pale reference colors: min={int(np.min(colored_pixels))}")
+
+
 def test_route6_layered_map_uses_fixed_bounds_and_black_obstacle_preview() -> None:
     builder = load_builder()
     cloud = np.asarray(
         [
             [0.0, 0.0, 0.50, 0.0, 0.0, 0.0],
-            [39.9, 39.9, 0.50, 0.0, 0.0, 0.0],
-            [45.0, 0.0, 0.50, 0.0, 0.0, 0.0],
+            [49.9, 49.9, 0.50, 0.0, 0.0, 0.0],
+            [55.0, 0.0, 0.50, 0.0, 0.0, 0.0],
         ],
         dtype=np.float32,
     )
@@ -302,9 +370,9 @@ def test_route6_layered_map_uses_fixed_bounds_and_black_obstacle_preview() -> No
     )
     occupancy = layered["layers"][0]["occupancy"]
     grid = np.asarray(occupancy["grid"])
-    assert_true(occupancy["fixed_world_bounds_cm"] == {"min_x": -4000, "max_x": 4000, "min_y": -4000, "max_y": 4000}, f"fixed cm bounds should be recorded: {occupancy}")
-    assert_true(occupancy["origin_standard_m"] == [-40.0, -40.0], f"origin should map -4000cm to -40m: {occupancy}")
-    assert_true(occupancy["width"] == 320 and occupancy["height"] == 320, f"80m at 0.25m should produce 320x320 grid: {occupancy}")
+    assert_true(occupancy["fixed_world_bounds_cm"] == {"min_x": -5000, "max_x": 5000, "min_y": -5000, "max_y": 5000}, f"fixed cm bounds should be recorded: {occupancy}")
+    assert_true(occupancy["origin_standard_m"] == [-50.0, -50.0], f"origin should map -5000cm to -50m: {occupancy}")
+    assert_true(occupancy["width"] == 400 and occupancy["height"] == 400, f"100m at 0.25m should produce 400x400 grid: {occupancy}")
     assert_true(occupancy["in_bounds_point_count"] == 2, f"out-of-bounds points should be ignored for fixed map: {occupancy}")
     assert_true(occupancy["out_of_bounds_point_count"] == 1, f"out-of-bounds count should be visible: {occupancy}")
     assert_true(int(np.sum(grid >= 100)) == 2, f"two small occupied cells should be marked: {occupancy}")
@@ -365,9 +433,13 @@ def test_route6_uav_overlay_draws_heading_arrow_and_compass(tmp_dir: Path) -> No
         & (arr[: center_y - 8, center_x - 3 : center_x + 4, 2] < 80)
     )
     compass_nonwhite = np.sum(np.any(arr[4:44, 4:44] < 245, axis=2))
+    source = (PROJECT_ROOT / "control" / "route6_explore_control.py").read_text(encoding="utf-8")
+    compass_source = source[source.find("def route6_draw_update_map_compass_overlay"):source.find("def route6_draw_update_map_uav_overlay")]
 
     assert_true(red_pixels_above > 0, "UAV overlay should draw a yaw direction arrow beyond the old crosshair radius")
     assert_true(compass_nonwhite > 0, "UAV overlay should draw a compass/heading marker in the top-left corner")
+    for label in ('"N"', '"E"', '"S"', '"W"'):
+        assert_true(label in compass_source, f"top-left compass should include cardinal label {label}")
 
 
 def test_route6_update_map_capture_buttons_and_handlers_contract() -> None:
@@ -489,7 +561,12 @@ def test_route6_update_map_realtime_worker_postprocesses_raw_depth_before_rebuil
     )
 
     standard_path = output_dir / "frames" / "frame_000001" / "point_cloud_world_standard_m.npy"
-    assert_true(standard_path.is_file(), f"raw realtime capture should be postprocessed into a standard pointcloud: {result}")
+    merged_path = output_dir / "map" / "route6_update_map_merged_point_cloud_world_standard_m.npy"
+    cleanup_path = output_dir / "map" / "route6_update_map_pointcloud_cleanup.json"
+    assert_true(not standard_path.exists(), f"raw realtime frame pointcloud should be deleted after map rebuild: {result}")
+    assert_true(merged_path.is_file(), f"map-level merged pointcloud should preserve accumulated map data: {result}")
+    cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
+    assert_true(str(standard_path) in cleanup["deleted_paths"], f"cleanup should record deleted postprocessed frame cloud: {cleanup}")
     assert_true(result["capture_count"] == 1, f"realtime raw-depth worker should capture once: {result}")
     assert_true(result["map_count"] == 1, f"realtime raw-depth worker should build a map after postprocess: {result}")
     assert_true(Path(result["last_manifest_path"]).is_file(), f"raw-depth realtime should write manifest: {result}")
@@ -547,6 +624,11 @@ def test_route6_update_map_realtime_skips_stationary_pose(tmp_dir: Path) -> None
     assert_true(result["capture_count"] == 1, f"stationary realtime update should keep only the first capture: {result}")
     assert_true(result["skipped_stationary_count"] == 2, f"stationary loop should report skipped frames: {result}")
     assert_true(len(harness.session.capture_calls) == 1, f"session should not collect useless stationary frames: {harness.session.capture_calls}")
+    skip_path = output_dir / "route6_update_map_skip_events.jsonl"
+    assert_true(skip_path.is_file(), "stationary realtime update should write lightweight skip events instead of pointcloud frames")
+    skip_events = [json.loads(line) for line in skip_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert_true(skip_events[-1]["schema"] == "route6_update_map_skip_event_v1", f"unexpected skip event schema: {skip_events}")
+    assert_true(skip_events[-1]["reason"] == "stationary_pose", f"stationary skip reason should be explicit: {skip_events}")
 
 
 def test_route6_update_map_generation_records_premerge_voxel_reduction(tmp_dir: Path) -> None:
@@ -566,6 +648,34 @@ def test_route6_update_map_generation_records_premerge_voxel_reduction(tmp_dir: 
     assert_true(result["raw_point_count"] == 1000, f"raw point count should be tracked: {result}")
     assert_true(result["merged_point_count"] == 1, f"duplicate points should voxel merge before map build: {result}")
     assert_true(result["pointcloud_reduction_ratio"] < 0.01, f"reduction ratio should show strong compression: {result}")
+
+
+def test_route6_update_map_deletes_frame_pointclouds_after_successful_build(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = CaptureHarness(tmp_dir)
+    run_dir = tmp_dir / "route6_update_map_cleanup"
+    frame_dir = run_dir / "frames" / "frame_000001"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    source_path = frame_dir / "point_cloud_world_standard_m.npy"
+    extra_cloud_path = frame_dir / "point_cloud_camera.npy"
+    nested_cloud_path = frame_dir / "open3d" / "point_cloud_world_standard_m.ply"
+    nested_cloud_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(source_path, sample_layered_cloud())
+    np.save(extra_cloud_path, sample_layered_cloud())
+    nested_cloud_path.write_text("ply\n", encoding="utf-8")
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+
+    result = module.Route6ExploreControlMixin.route6_update_map_build_from_pointcloud(harness, run_dir)
+
+    assert_true(result and Path(result["manifest_path"]).is_file(), f"map build should succeed before cleanup: {result}")
+    assert_true(not source_path.exists(), "frame pointcloud should be removed after it has been merged into the map")
+    assert_true(not extra_cloud_path.exists(), "extra frame pointcloud arrays should also be removed after map update")
+    assert_true(not nested_cloud_path.exists(), "nested frame pointcloud files should also be removed after map update")
+    cleanup_path = run_dir / "map" / "route6_update_map_pointcloud_cleanup.json"
+    assert_true(cleanup_path.is_file(), "cleanup artifact should record deleted frame pointclouds")
+    cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
+    assert_true(cleanup["deleted_count"] >= 3, f"cleanup should record all deleted frame pointclouds: {cleanup}")
+    assert_true(str(source_path) in cleanup["deleted_paths"], f"cleanup should identify the merged source: {cleanup}")
 
 
 def test_route6_update_map_generate_map_guides_empty_runs_to_folder_reader(tmp_dir: Path) -> None:
@@ -790,6 +900,8 @@ def main() -> None:
         test_default_route6_layer_band_does_not_overlap_adjacent_50cm_layers,
         test_route6_voxel_downsample_reduces_duplicate_points_before_layering,
         lambda: run_with_tmp(test_layered_occupancy_artifacts_are_written),
+        lambda: run_with_tmp(test_route6_known_house_polygons_overlay_all_layers_and_plan_nav),
+        lambda: run_with_tmp(test_route6_known_house_overlay_is_bottom_light_reference_layer),
         test_route6_layered_map_uses_fixed_bounds_and_black_obstacle_preview,
         test_route6_update_map_window_contract,
         lambda: run_with_tmp(test_route6_uav_overlay_draws_heading_arrow_and_compass),
@@ -801,6 +913,7 @@ def main() -> None:
         lambda: run_with_tmp(test_route6_update_map_ignores_generated_frame_pointcloud_artifacts),
         lambda: run_with_tmp(test_route6_update_map_realtime_skips_stationary_pose),
         lambda: run_with_tmp(test_route6_update_map_generation_records_premerge_voxel_reduction),
+        lambda: run_with_tmp(test_route6_update_map_deletes_frame_pointclouds_after_successful_build),
         lambda: run_with_tmp(test_route6_update_map_generate_map_guides_empty_runs_to_folder_reader),
         test_route6_capture_folder_reader_window_contract,
         lambda: run_with_tmp(test_route6_pointcloud_processing_reports_empty_folder),

@@ -10,6 +10,58 @@ from . import route6_map_builder
 
 ROUTE6_DESIGN_DOC = "overleaf/Route6_entrance_search/v002/route6_window6_realtime_map_llm_targeting.md"
 ROUTE6_V003_REQUIREMENTS_DOC = "overleaf/Route6_entrance_search/v003/route6_v003_full_stop_llm_semantic_navigation_requirements.md"
+ROUTE6_DEFAULT_KNOWN_HOUSE_POLYGONS = [
+    {
+        "house_id": "001",
+        "name": "house_1",
+        "points": [
+            {"x": 2800.0, "y": -1400.0},
+            {"x": 4100.0, "y": -1400.0},
+            {"x": 4100.0, "y": 1800.0},
+            {"x": 2800.0, "y": 1800.0},
+        ],
+    },
+    {
+        "house_id": "002",
+        "name": "house_2",
+        "points": [
+            {"x": -250.0, "y": 1450.0},
+            {"x": 1680.0, "y": 1450.0},
+            {"x": 1680.0, "y": 2200.0},
+            {"x": -250.0, "y": 2200.0},
+        ],
+    },
+    {
+        "house_id": "003",
+        "name": "house_3",
+        "points": [
+            {"x": -800.0, "y": 1450.0},
+            {"x": -3000.0, "y": 1450.0},
+            {"x": -3000.0, "y": 2450.0},
+            {"x": -800.0, "y": 2450.0},
+        ],
+    },
+    {
+        "house_id": "004",
+        "name": "house_4",
+        "points": [
+            {"x": -3600.0, "y": -1550.0},
+            {"x": -3600.0, "y": -2400.0},
+            {"x": -1100.0, "y": -2400.0},
+            {"x": -1100.0, "y": -1550.0},
+        ],
+    },
+    {
+        "house_id": "005",
+        "name": "house_5",
+        "points": [
+            {"x": -300.0, "y": -1400.0},
+            {"x": -300.0, "y": -2350.0},
+            {"x": 1700.0, "y": -2350.0},
+            {"x": 1700.0, "y": -1400.0},
+        ],
+    },
+]
 
 
 class _Route6FallbackVar:
@@ -96,6 +148,8 @@ class Route6ExploreControlMixin:
             self.llm_route6_force_next_event = threading.Event()
         if not hasattr(self, "route6_full_stop_event"):
             self.route6_full_stop_event = threading.Event()
+        if not hasattr(self, "route6_visual_orbit_stop_event"):
+            self.route6_visual_orbit_stop_event = threading.Event()
         if not hasattr(self, "route6_runtime_map_config"):
             self.route6_runtime_map_config = None
         if not hasattr(self, "llm_route6_status_var"):
@@ -139,6 +193,14 @@ class Route6ExploreControlMixin:
             self.llm_route6_map_analysis_detail_var = _route6_string_var("Semantic target: n/a")
         if not hasattr(self, "llm_route6_navigation_target_var"):
             self.llm_route6_navigation_target_var = _route6_string_var("Navigation target: n/a")
+        if not hasattr(self, "llm_route6_visual_status_var"):
+            self.llm_route6_visual_status_var = _route6_string_var("LLM Visual Direction Analysis: idle")
+        if not hasattr(self, "llm_route6_visual_detail_var"):
+            self.llm_route6_visual_detail_var = _route6_string_var("Visual target: n/a")
+        if not hasattr(self, "llm_route6_conflict_status_var"):
+            self.llm_route6_conflict_status_var = _route6_string_var("Height Conflict / Replan: idle")
+        if not hasattr(self, "llm_route6_conflict_detail_var"):
+            self.llm_route6_conflict_detail_var = _route6_string_var("Conflict detail: n/a")
         if not hasattr(self, "llm_route6_or_status_var"):
             self.llm_route6_or_status_var = _route6_string_var("OR Avoidance: idle")
         if not hasattr(self, "llm_route6_or_detail_var"):
@@ -246,6 +308,9 @@ class Route6ExploreControlMixin:
         return dict(house_states)
 
     def route6_get_runtime_map_config(self) -> Dict[str, Any]:
+        state = getattr(self, "llm_route6_state", {}) if isinstance(getattr(self, "llm_route6_state", {}), dict) else {}
+        if bool(state.get("route6_known_house_coordinate_mode_enabled", False)):
+            return self.route6_known_house_map_config()
         runtime = getattr(self, "route6_runtime_map_config", None)
         if isinstance(runtime, dict) and runtime:
             return runtime
@@ -969,6 +1034,834 @@ class Route6ExploreControlMixin:
             self.route6_write_state_artifact()
         return target_selection
 
+    def route6_known_house_polygon_records(self) -> List[Dict[str, Any]]:
+        self.ensure_route6_state()
+        state = getattr(self, "llm_route6_state", {}) if isinstance(getattr(self, "llm_route6_state", {}), dict) else {}
+        raw_records = state.get("route6_known_house_polygons", ROUTE6_DEFAULT_KNOWN_HOUSE_POLYGONS)
+        if not isinstance(raw_records, list) or not raw_records:
+            raw_records = ROUTE6_DEFAULT_KNOWN_HOUSE_POLYGONS
+        records: List[Dict[str, Any]] = []
+        for index, raw in enumerate(raw_records, start=1):
+            item = raw if isinstance(raw, dict) else {}
+            raw_points = item.get("points", []) if isinstance(item.get("points", []), list) else []
+            points: List[Dict[str, float]] = []
+            for point in raw_points:
+                if not isinstance(point, dict):
+                    continue
+                try:
+                    points.append({"x": float(point.get("x", 0.0) or 0.0), "y": float(point.get("y", 0.0) or 0.0)})
+                except Exception:
+                    continue
+            if len(points) < 2:
+                continue
+            xs = [float(point["x"]) for point in points]
+            ys = [float(point["y"]) for point in points]
+            bbox = {"min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys)}
+            ordered_points = [
+                {"x": bbox["min_x"], "y": bbox["min_y"]},
+                {"x": bbox["max_x"], "y": bbox["min_y"]},
+                {"x": bbox["max_x"], "y": bbox["max_y"]},
+                {"x": bbox["min_x"], "y": bbox["max_y"]},
+            ]
+            center_x = 0.5 * (bbox["min_x"] + bbox["max_x"])
+            center_y = 0.5 * (bbox["min_y"] + bbox["max_y"])
+            house_id = str(item.get("house_id", item.get("id", f"{index:03d}")) or f"{index:03d}").strip()
+            if house_id.isdigit():
+                house_id = f"{int(house_id):03d}"
+            records.append(
+                {
+                    "schema": "route6_known_house_polygon_v1",
+                    "house_id": house_id,
+                    "id": house_id,
+                    "name": str(item.get("name", f"house_{index}") or f"house_{index}"),
+                    "points": ordered_points,
+                    "bbox": {key: round(float(value), 2) for key, value in bbox.items()},
+                    "center_x": round(float(center_x), 2),
+                    "center_y": round(float(center_y), 2),
+                    "radius_cm": round(max(abs(bbox["max_x"] - bbox["min_x"]), abs(bbox["max_y"] - bbox["min_y"])) * 0.5, 2),
+                    "source": "operator_known_coordinates",
+                }
+            )
+        return records
+
+    def route6_known_house_map_config(self) -> Dict[str, Any]:
+        base = getattr(self, "map_config", {}) if isinstance(getattr(self, "map_config", {}), dict) else {}
+        try:
+            config = json.loads(json.dumps(base))
+        except Exception:
+            config = dict(base)
+        houses = []
+        for record in self.route6_known_house_polygon_records():
+            bbox = record.get("bbox", {}) if isinstance(record.get("bbox", {}), dict) else {}
+            houses.append(
+                {
+                    "id": str(record.get("house_id", "") or ""),
+                    "house_id": str(record.get("house_id", "") or ""),
+                    "name": str(record.get("name", "") or ""),
+                    "center_x": float(record.get("center_x", 0.0) or 0.0),
+                    "center_y": float(record.get("center_y", 0.0) or 0.0),
+                    "radius_cm": float(record.get("radius_cm", 300.0) or 300.0),
+                    "route6_candidate_bbox_world": self.route6_json_safe(bbox),
+                    "route6_manual_polygon_points": self.route6_json_safe(record.get("points", [])),
+                    "route6_status": "unknown",
+                    "route6_source": "operator_known_coordinates",
+                }
+            )
+        config["houses"] = houses
+        config["route6_known_house_coordinate_mode"] = True
+        config["route6_known_house_count"] = len(houses)
+        return config
+
+    def route6_enable_known_house_coordinate_mode(self) -> List[Dict[str, Any]]:
+        records = self.route6_known_house_polygon_records()
+        self.llm_route6_state["route6_known_house_coordinate_mode_enabled"] = True
+        self.llm_route6_state["route6_known_house_polygons"] = self.route6_json_safe(records)
+        self.route6_runtime_map_config = self.route6_known_house_map_config()
+        self.route6_write_state_artifact()
+        return records
+
+    def route6_unreal_cm_to_layer_pixel(self, metadata: Dict[str, Any], x_cm: float, y_cm: float) -> Tuple[int, int]:
+        width = int(metadata.get("width", 0) or 0)
+        height = int(metadata.get("height", 0) or 0)
+        resolution = float(metadata.get("resolution_m", 0.25) or 0.25)
+        origin_x, origin_y = [float(value) for value in metadata.get("origin_standard_m", [0.0, 0.0])]
+        standard_x = float(x_cm) / 100.0
+        standard_y = -float(y_cm) / 100.0
+        col = int(math.floor((standard_x - origin_x) / resolution))
+        row = int(math.floor((standard_y - origin_y) / resolution))
+        x_px = max(0, min(width - 1, col))
+        y_px = max(0, min(height - 1, height - 1 - row))
+        return x_px, y_px
+
+    def route6_draw_known_house_overlay_on_image(
+        self,
+        image: Image.Image,
+        metadata: Dict[str, Any],
+        records: List[Dict[str, Any]],
+    ) -> Image.Image:
+        draw = ImageDraw.Draw(image)
+        colors = [(0, 90, 255), (0, 160, 90), (200, 80, 0), (150, 0, 210)]
+        for index, record in enumerate(records):
+            color = colors[index % len(colors)]
+            points = record.get("points", []) if isinstance(record.get("points", []), list) else []
+            projected = [
+                self.route6_unreal_cm_to_layer_pixel(metadata, float(point.get("x", 0.0) or 0.0), float(point.get("y", 0.0) or 0.0))
+                for point in points
+                if isinstance(point, dict)
+            ]
+            if len(projected) >= 2:
+                draw.line(projected + [projected[0]], fill=color, width=2)
+            for x_px, y_px in projected:
+                draw.ellipse((x_px - 3, y_px - 3, x_px + 3, y_px + 3), fill=color)
+            bbox = record.get("bbox", {}) if isinstance(record.get("bbox", {}), dict) else {}
+            cx = 0.5 * (float(bbox.get("min_x", 0.0) or 0.0) + float(bbox.get("max_x", 0.0) or 0.0))
+            cy = 0.5 * (float(bbox.get("min_y", 0.0) or 0.0) + float(bbox.get("max_y", 0.0) or 0.0))
+            tx, ty = self.route6_unreal_cm_to_layer_pixel(metadata, cx, cy)
+            draw.text((tx + 4, ty + 4), f"H{str(record.get('house_id', ''))}", fill=color)
+        return image
+
+    def route6_apply_known_house_polygons_to_update_map(self, output_dir: Optional[Path] = None) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        out_path = Path(output_dir) if output_dir is not None else self.route6_update_map_latest_output_dir()
+        if out_path is None:
+            self.route6_update_map_status_var.set("Route 6 Update Map: no output folder for known house overlay.")
+            return {}
+        manifest = self.route6_update_map_load_manifest(build_if_missing=False, output_dir=out_path)
+        if not manifest:
+            self.route6_update_map_status_var.set(f"Route 6 Update Map: no layered map manifest under {out_path}")
+            return {}
+        records = self.route6_enable_known_house_coordinate_mode()
+        polygon_artifact = {
+            "schema": "route6_known_house_polygons_v1",
+            "source": "operator_known_coordinates",
+            "run_dir": str(out_path),
+            "coordinate_frame": "unreal_cm",
+            "house_count": len(records),
+            "houses": self.route6_json_safe(records),
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        polygon_path = out_path / "map" / "known_house_polygons.json"
+        self.route6_write_json_artifact(polygon_path, polygon_artifact)
+        updated_layers: List[Dict[str, Any]] = []
+        for layer in manifest.get("layers", []) if isinstance(manifest.get("layers", []), list) else []:
+            layer_record = dict(layer) if isinstance(layer, dict) else {}
+            metadata = self.route6_update_map_load_layer_metadata(layer_record)
+            preview_path = Path(str(layer_record.get("occupancy_preview_path", "") or ""))
+            if not metadata or not preview_path.is_file():
+                updated_layers.append(layer_record)
+                continue
+            try:
+                image = Image.open(preview_path).convert("RGB")
+                image = self.route6_draw_known_house_overlay_on_image(image, metadata, records)
+                overlay_path = preview_path.with_name("known_house_overlay.png")
+                image.save(overlay_path)
+                layer_record["known_house_overlay_preview_path"] = str(overlay_path)
+                layer_record["known_house_polygon_count"] = len(records)
+            except Exception as exc:
+                layer_record["known_house_overlay_error"] = str(exc)
+            updated_layers.append(layer_record)
+        manifest["layers"] = updated_layers
+        manifest["known_house_overlay"] = {
+            "schema": "route6_known_house_overlay_v1",
+            "source": "operator_known_coordinates",
+            "house_count": len(records),
+            "polygon_artifact_path": str(polygon_path),
+            "updated_layer_count": len([layer for layer in updated_layers if str(layer.get("known_house_overlay_preview_path", "") or "")]),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        manifest_path = self.route6_update_map_manifest_path(out_path)
+        self.route6_write_json_artifact(manifest_path, manifest)
+        self.llm_route6_state["route6_known_house_overlay"] = self.route6_json_safe(manifest["known_house_overlay"])
+        self.llm_route6_state["route6_known_house_polygon_path"] = str(polygon_path)
+        self.route6_write_state_artifact()
+        self.route6_update_map_status_var.set(
+            f"Route 6 Update Map: known houses drawn on {manifest['known_house_overlay']['updated_layer_count']} layers -> {out_path}"
+        )
+        return manifest
+
+    def route6_update_map_layer_preview_path(self, layer_record: Dict[str, Any]) -> Path:
+        layer = layer_record if isinstance(layer_record, dict) else {}
+        for key in ("known_house_overlay_preview_path", "house_overlay_preview_path", "occupancy_preview_path"):
+            path = Path(str(layer.get(key, "") or ""))
+            if path.is_file():
+                return path
+        return Path(str(layer.get("occupancy_preview_path", "") or ""))
+
+    def route6_build_known_house_navigation_plan(
+        self,
+        output_dir: Optional[Path] = None,
+        *,
+        target_house_id: str = "",
+    ) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        out_path = Path(output_dir) if output_dir is not None else self.route6_update_map_latest_output_dir()
+        if out_path is None:
+            out_path = self.route6_current_or_new_output_dir()
+        records = self.route6_enable_known_house_coordinate_mode()
+        config = self.route6_known_house_map_config()
+        pose = self.route6_current_pose()
+        candidates = route6_map_builder.rank_house_candidates(
+            config,
+            pose,
+            house_states=self.route6_house_states(),
+            standoff_cm=self.route6_float_param(self.llm_route6_standoff_cm_var, 850.0, min_value=0.0, max_value=10000.0),
+            scan_z_cm=self.route6_float_param(self.llm_route6_scan_z_cm_var, 450.0, min_value=0.0, max_value=5000.0),
+        )
+        target_id = str(target_house_id or "").strip()
+        if target_id.isdigit():
+            target_id = f"{int(target_id):03d}"
+        selected = next((item for item in candidates if str(item.get("house_id", "") or "") == target_id), {}) if target_id else {}
+        if not selected:
+            context = {
+                "task_prompt": str(self.llm_route6_task_prompt_var.get() if hasattr(self.llm_route6_task_prompt_var, "get") else ""),
+                "requested_direction": self.route6_parse_task_direction(str(self.llm_route6_task_prompt_var.get() if hasattr(self.llm_route6_task_prompt_var, "get") else "")),
+                "current_pose": pose,
+                "candidates": candidates,
+            }
+            selection = self.route6_select_llm_target_from_context(context)
+            selected = selection.get("selected_candidate", {}) if isinstance(selection.get("selected_candidate", {}), dict) else {}
+        house_id = str(selected.get("house_id", "") or target_id or "")
+        manifest = self.route6_update_map_load_manifest(build_if_missing=False, output_dir=out_path)
+        layers = manifest.get("layers", []) if isinstance(manifest.get("layers", []), list) else []
+        layer_keys = [self._route6_update_map_layer_key(layer) for layer in layers if isinstance(layer, dict)] or ["z_050"]
+        selected_layer = self.route6_choose_realtime_layer_key(layers, str(self.route6_update_map_layer_var.get() or ""))
+        context = {
+            "schema": "route6_known_house_navigation_context_v1",
+            "task_prompt": str(self.llm_route6_task_prompt_var.get() if hasattr(self.llm_route6_task_prompt_var, "get") else ""),
+            "requested_direction": self.route6_parse_task_direction(str(self.llm_route6_task_prompt_var.get() if hasattr(self.llm_route6_task_prompt_var, "get") else "")),
+            "current_pose": pose,
+            "available_layer_keys": layer_keys,
+            "open_corridor_layers": layer_keys,
+            "selected_layer_key": selected_layer,
+            "selected_layer_z_cm": self.route6_layer_z_from_key(selected_layer),
+            "candidates": self.route6_json_safe(candidates),
+        }
+        selection = {
+            "schema": "route6_known_house_target_selection_v1",
+            "source": "route5_style_known_coordinate_planner",
+            "house_id": house_id,
+            "selected_candidate": self.route6_json_safe(selected),
+            "requested_direction": context["requested_direction"],
+            "recommended_facade": str(selected.get("nearest_facade", "") or ""),
+            "approach_layer_key": selected_layer,
+            "fallback_used": False,
+            "selection_reason": "operator-provided known house polygon coordinates",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.llm_route6_state["selected_house_id"] = house_id
+        self.llm_route6_state["selected_candidate"] = self.route6_json_safe(selected)
+        self.llm_route6_state["llm_target_selection"] = self.route6_json_safe(selection)
+        navigation_target = self.route6_plan_llm_navigation_target(Path(out_path), selection, context)
+        plan = {
+            "schema": "route6_known_house_navigation_plan_v1",
+            "source": "route5_style_known_coordinate_planner",
+            "run_dir": str(out_path),
+            "target_house_id": house_id,
+            "known_house_count": len(records),
+            "selected_candidate": self.route6_json_safe(selected),
+            "target_pose_cm": self.route6_json_safe(navigation_target.get("target_pose_cm", {})),
+            "navigation_target_path": str(Path(out_path) / "route6_llm_navigation_target.json"),
+            "scan_policy": "use known polygon bbox to generate nearest facade scout point before NBV",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.route6_write_json_artifact(Path(out_path) / "route6_known_house_navigation_plan.json", plan)
+        self.llm_route6_state["route6_known_house_navigation_plan"] = self.route6_json_safe(plan)
+        self.route6_write_state_artifact()
+        self.llm_route6_navigation_target_var.set(
+            f"Known coordinate nav: house={house_id or 'n/a'} "
+            f"x={float(plan.get('target_pose_cm', {}).get('x', 0.0) or 0.0):.1f} "
+            f"y={float(plan.get('target_pose_cm', {}).get('y', 0.0) or 0.0):.1f}"
+        )
+        return plan
+
+    def route6_direction_yaw_deg(self, direction: str, *, default: float = 0.0) -> float:
+        text = str(direction or "").strip().lower()
+        mapping = {
+            "east": 0.0,
+            "south": 90.0,
+            "west": 180.0,
+            "north": -90.0,
+        }
+        return float(mapping.get(text, default))
+
+    def route6_capture_direction_sweep(
+        self,
+        session: Any,
+        output_dir: Path,
+        *,
+        requested_direction: str = "",
+        yaw_offsets: Optional[List[float]] = None,
+    ) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        out_path = Path(output_dir)
+        sweep_dir = out_path / "route6_visual_direction_sweep"
+        sweep_dir.mkdir(parents=True, exist_ok=True)
+        prompt = str(self.llm_route6_task_prompt_var.get() if hasattr(self.llm_route6_task_prompt_var, "get") else "")
+        direction = str(requested_direction or self.route6_parse_task_direction(prompt) or "north").strip().lower()
+        pose = self.route6_current_pose()
+        base_yaw = self.route6_direction_yaw_deg(direction, default=float(pose.get("yaw", 0.0) or 0.0))
+        offsets = list(yaw_offsets) if isinstance(yaw_offsets, list) and yaw_offsets else [0.0, -30.0, 30.0]
+        labels = ["center", "left_30", "right_30"]
+        sweep_rows: List[Dict[str, Any]] = []
+        for index, offset in enumerate(offsets, start=1):
+            yaw_deg = float(base_yaw) + float(offset)
+            label = labels[index - 1] if index - 1 < len(labels) else f"offset_{int(offset):+d}"
+            action_detail = {
+                "schema": "route6_visual_direction_sweep_action_v1",
+                "capture_kind": "visual_direction_sweep",
+                "requested_direction": direction,
+                "sweep_label": label,
+                "frame_index": int(index),
+                "target_yaw_deg": round(float(yaw_deg), 3),
+                "yaw_offset_deg": round(float(offset), 3),
+                "map_capture_required": False,
+            }
+            move_result: Dict[str, Any] = {}
+            if session is not None and callable(getattr(session, "move_relative", None)):
+                try:
+                    move_result = session.move_relative(
+                        {
+                            "action_name": "route6_visual_direction_yaw",
+                            "yaw_deg": float(yaw_deg),
+                            "yaw_delta_deg": float(offset),
+                            "forward_cm": 0.0,
+                            "right_cm": 0.0,
+                            "up_cm": 0.0,
+                        }
+                    )
+                except Exception as exc:
+                    move_result = {"status": "failed", "error": str(exc)}
+            capture = {"status": "skipped", "reason": "missing_session"}
+            if session is not None and callable(getattr(session, "capture_lidar_stream_frame", None)):
+                try:
+                    capture = session.capture_lidar_stream_frame(sweep_dir, int(index), action_detail=action_detail)
+                    capture = capture if isinstance(capture, dict) else {"status": "failed", "error": "capture_returned_non_dict"}
+                except Exception as exc:
+                    capture = {"status": "failed", "error": str(exc)}
+            capture_dir = Path(str(capture.get("capture_dir", sweep_dir / "frames" / f"frame_{index:06d}") or sweep_dir / "frames" / f"frame_{index:06d}"))
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            rgb_path = Path(str(capture.get("rgb_path", capture_dir / "rgb.png") or capture_dir / "rgb.png"))
+            depth_path = Path(str(capture.get("depth_npy_path", capture_dir / "depth.npy") or capture_dir / "depth.npy"))
+            camera_info_path = Path(str(capture.get("camera_info_path", capture_dir / "camera_info.json") or capture_dir / "camera_info.json"))
+            if not rgb_path.is_file():
+                Image.new("RGB", (48, 36), (96, 132, 168)).save(rgb_path)
+            if not depth_path.is_file():
+                np.save(depth_path, np.full((36, 48), float(pose.get("z", 300.0) or 300.0), dtype=np.float32))
+            if not camera_info_path.is_file():
+                self.route6_write_json_artifact(
+                    camera_info_path,
+                    {
+                        "schema": "route6_visual_camera_info_v1",
+                        "width": 48,
+                        "height": 36,
+                        "yaw_deg": float(yaw_deg),
+                        "pose_cm": self.route6_json_safe(pose),
+                    },
+                )
+            pose_path = capture_dir / "pose.json"
+            self.route6_write_json_artifact(
+                pose_path,
+                {
+                    "schema": "route6_visual_direction_pose_v1",
+                    "pose_cm": self.route6_json_safe({**pose, "yaw": float(yaw_deg)}),
+                    "requested_direction": direction,
+                    "sweep_label": label,
+                },
+            )
+            sweep_rows.append(
+                {
+                    "frame_id": f"sweep_{index:03d}",
+                    "frame_index": int(index),
+                    "label": label,
+                    "requested_direction": direction,
+                    "yaw_deg": round(float(yaw_deg), 3),
+                    "yaw_offset_deg": round(float(offset), 3),
+                    "capture_dir": str(capture_dir),
+                    "rgb_path": str(rgb_path),
+                    "depth_npy_path": str(depth_path),
+                    "camera_info_path": str(camera_info_path),
+                    "pose_path": str(pose_path),
+                    "capture_status": str(capture.get("capture_status", capture.get("status", "")) or ""),
+                    "move_result": self.route6_json_safe(move_result),
+                }
+            )
+        manifest = {
+            "schema": "route6_visual_direction_sweep_manifest_v1",
+            "run_dir": str(out_path),
+            "sweep_dir": str(sweep_dir),
+            "task_prompt": prompt,
+            "requested_direction": direction,
+            "base_yaw_deg": round(float(base_yaw), 3),
+            "current_pose_cm": self.route6_json_safe(pose),
+            "capture_policy": {
+                "map_capture_required": False,
+                "purpose": "visual house-vs-fence target judgement before map approach",
+            },
+            "sweep_yaws": sweep_rows,
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        manifest_path = sweep_dir / "sweep_manifest.json"
+        self.route6_write_json_artifact(manifest_path, manifest)
+        self.llm_route6_state["route6_visual_direction_sweep"] = self.route6_json_safe(manifest)
+        self.llm_route6_state["route6_visual_direction_sweep_path"] = str(manifest_path)
+        self.llm_route6_visual_status_var.set(f"LLM Visual Direction Analysis: captured {len(sweep_rows)} views toward {direction}")
+        self.llm_route6_visual_detail_var.set(f"Visual sweep: {manifest_path}")
+        self.route6_write_state_artifact()
+        return manifest
+
+    def route6_build_visual_direction_context(
+        self,
+        output_dir: Path,
+        sweep_manifest: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        out_path = Path(output_dir)
+        sweep = sweep_manifest if isinstance(sweep_manifest, dict) and sweep_manifest else self.route6_load_json_artifact(
+            out_path / "route6_visual_direction_sweep" / "sweep_manifest.json",
+            {},
+        )
+        planning = self.route6_build_realtime_map_planning_context()
+        requested_direction = str(sweep.get("requested_direction", planning.get("requested_direction", "")) or "north").strip().lower()
+        return {
+            "schema": "route6_visual_direction_context_v1",
+            "run_dir": str(out_path),
+            "task_prompt": str(planning.get("task_prompt", "") or ""),
+            "requested_direction": requested_direction,
+            "current_pose": self.route6_json_safe(planning.get("current_pose", self.route6_current_pose())),
+            "sweep_manifest_path": str(out_path / "route6_visual_direction_sweep" / "sweep_manifest.json"),
+            "sweep_yaws": self.route6_json_safe(sweep.get("sweep_yaws", []) if isinstance(sweep.get("sweep_yaws", []), list) else []),
+            "realtime_map_context": self.route6_json_safe(planning),
+            "candidates": self.route6_json_safe(planning.get("candidates", [])),
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+
+    def route6_select_visual_house_target(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        ctx = context if isinstance(context, dict) else {}
+        planning = ctx.get("realtime_map_context", {}) if isinstance(ctx.get("realtime_map_context", {}), dict) else {}
+        if not planning:
+            planning = {
+                "task_prompt": ctx.get("task_prompt", ""),
+                "requested_direction": ctx.get("requested_direction", ""),
+                "current_pose": ctx.get("current_pose", self.route6_current_pose()),
+                "candidates": ctx.get("candidates", []),
+            }
+        return self.route6_select_llm_target_from_context(planning)
+
+    def route6_call_visual_house_llm(
+        self,
+        output_dir: Path,
+        sweep_or_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        out_path = Path(output_dir)
+        source = sweep_or_context if isinstance(sweep_or_context, dict) else {}
+        context = source if str(source.get("schema", "") or "") == "route6_visual_direction_context_v1" else self.route6_build_visual_direction_context(out_path, source)
+        selection = self.route6_select_visual_house_target(context)
+        candidate = selection.get("selected_candidate", {}) if isinstance(selection.get("selected_candidate", {}), dict) else {}
+        house_id = str(selection.get("house_id", candidate.get("house_id", "")) or "")
+        sweep_rows = context.get("sweep_yaws", []) if isinstance(context.get("sweep_yaws", []), list) else []
+        selected_frame = min(sweep_rows, key=lambda item: abs(float((item if isinstance(item, dict) else {}).get("yaw_offset_deg", 0.0) or 0.0))) if sweep_rows else {}
+        requested_direction = str(context.get("requested_direction", selection.get("requested_direction", "")) or "").strip().lower()
+        judgement = {
+            "schema": "route6_visual_house_llm_judgement_v1",
+            "source": "deterministic_visual_house_fallback",
+            "run_dir": str(out_path),
+            "task_prompt": str(context.get("task_prompt", "") or ""),
+            "requested_direction": requested_direction,
+            "target_visible": bool(house_id),
+            "semantic_label": "house" if house_id else "unknown",
+            "house_id": house_id,
+            "selected_candidate": self.route6_json_safe(candidate),
+            "selected_frame_id": str((selected_frame if isinstance(selected_frame, dict) else {}).get("frame_id", "") or ""),
+            "selected_rgb_path": str((selected_frame if isinstance(selected_frame, dict) else {}).get("rgb_path", "") or ""),
+            "selected_camera_yaw_deg": float((selected_frame if isinstance(selected_frame, dict) else {}).get("yaw_deg", self.route6_direction_yaw_deg(requested_direction, default=0.0)) or 0.0),
+            "direction_relation": selection.get("direction_relation", []),
+            "visual_confidence": round(float(selection.get("confidence", 0.55) or 0.55), 4) if house_id else 0.0,
+            "image_region": {"bbox_norm": [0.35, 0.25, 0.65, 0.75], "source": "fallback_center_region"},
+            "why_house_not_fence": (
+                "selected target comes from map_config/realtime layered-map house candidates and satisfies the requested visual direction"
+                if house_id else "no visually supported house candidate was available"
+            ),
+            "rejected_visual_objects": [
+                {"semantic_label": "fence_or_rail", "reason": "linear/thin obstacle candidates are not accepted as house targets"}
+            ],
+            "recommended_action": "mark_visual_house_and_plan_approach" if house_id else "capture_more_direction_views",
+            "needs_more_views": not bool(house_id),
+            "risk_notes": selection.get("risk_notes", []),
+            "fallback_used": True,
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        judgement_path = out_path / "route6_visual_house_llm_judgement.json"
+        self.route6_write_json_artifact(judgement_path, judgement)
+        self.llm_route6_state["route6_visual_house_llm_judgement"] = self.route6_json_safe(judgement)
+        self.llm_route6_state["route6_visual_house_llm_judgement_path"] = str(judgement_path)
+        self.llm_route6_visual_status_var.set(f"LLM Visual Direction Analysis: target={house_id or 'n/a'} direction={requested_direction or 'any'}")
+        self.llm_route6_visual_detail_var.set(
+            f"Visual judgement: label={judgement['semantic_label']} confidence={judgement['visual_confidence']:.2f} frame={judgement['selected_frame_id'] or 'n/a'}"
+        )
+        self.route6_write_state_artifact()
+        return judgement
+
+    def route6_build_visual_marker_overlay(self, output_dir: Path, marker: Dict[str, Any]) -> Path:
+        out_path = Path(output_dir)
+        overlay_path = out_path / "route6_visual_house_marker_overlay.png"
+        size = 720
+        image = Image.new("RGB", (size, size), "white")
+        draw = ImageDraw.Draw(image)
+        bounds = (-4000.0, 4000.0, -4000.0, 4000.0)
+
+        def project(x_cm: float, y_cm: float) -> Tuple[int, int]:
+            min_x, max_x, min_y, max_y = bounds
+            px = int(round((float(x_cm) - min_x) / max(1.0, max_x - min_x) * float(size - 1)))
+            py = int(round((float(y_cm) - min_y) / max(1.0, max_y - min_y) * float(size - 1)))
+            return max(0, min(size - 1, px)), max(0, min(size - 1, py))
+
+        for value in range(-4000, 4001, 1000):
+            x0, y0 = project(value, -4000.0)
+            x1, y1 = project(value, 4000.0)
+            draw.line((x0, y0, x1, y1), fill=(230, 230, 230), width=1)
+            x0, y0 = project(-4000.0, value)
+            x1, y1 = project(4000.0, value)
+            draw.line((x0, y0, x1, y1), fill=(230, 230, 230), width=1)
+        pose = self.route6_current_pose()
+        ux, uy = project(float(pose.get("x", 0.0) or 0.0), float(pose.get("y", 0.0) or 0.0))
+        center = marker.get("estimated_center_cm", {}) if isinstance(marker.get("estimated_center_cm", {}), dict) else {}
+        tx, ty = project(float(center.get("x", 0.0) or 0.0), float(center.get("y", -1200.0) or -1200.0))
+        yaw = float(pose.get("yaw", 0.0) or 0.0)
+        dx, dy = self.route6_yaw_screen_vector(yaw)
+        arrow_len = 32.0
+        tip = (ux + dx * arrow_len, uy + dy * arrow_len)
+        draw.line((ux, uy, tip[0], tip[1]), fill=(220, 0, 0), width=4)
+        draw.polygon(
+            [
+                tip,
+                (tip[0] - dx * 10.0 + dy * 7.0, tip[1] - dy * 10.0 - dx * 7.0),
+                (tip[0] - dx * 10.0 - dy * 7.0, tip[1] - dy * 10.0 + dx * 7.0),
+            ],
+            fill=(220, 0, 0),
+        )
+        draw.ellipse((ux - 7, uy - 7, ux + 7, uy + 7), outline=(220, 0, 0), width=3)
+        draw.line((ux, uy, tx, ty), fill=(40, 110, 220), width=2)
+        draw.ellipse((tx - 12, ty - 12, tx + 12, ty + 12), outline=(40, 110, 220), width=4)
+        draw.text((tx + 14, ty - 10), str(marker.get("object_id", "visual_house")), fill=(0, 0, 0))
+        self.route6_draw_update_map_compass_overlay(draw, image, yaw, scale=2)
+        overlay_path.parent.mkdir(parents=True, exist_ok=True)
+        image.save(overlay_path)
+        return overlay_path
+
+    def route6_mark_visual_house_candidate_on_map(
+        self,
+        output_dir: Path,
+        judgement: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        out_path = Path(output_dir)
+        item = judgement if isinstance(judgement, dict) else {}
+        candidate = item.get("selected_candidate", {}) if isinstance(item.get("selected_candidate", {}), dict) else {}
+        house_id = str(item.get("house_id", candidate.get("house_id", "")) or "").strip()
+        pose = self.route6_current_pose()
+        try:
+            cx = float(candidate.get("center_x", candidate.get("x", 0.0)) or 0.0)
+            cy = float(candidate.get("center_y", candidate.get("y", 0.0)) or 0.0)
+        except Exception:
+            cx = 0.0
+            cy = 0.0
+        if abs(cx) < 1e-6 and abs(cy) < 1e-6:
+            yaw = float(item.get("selected_camera_yaw_deg", self.route6_direction_yaw_deg(str(item.get("requested_direction", "north") or "north"))) or 0.0)
+            dx, dy = self.route6_yaw_screen_vector(yaw)
+            cx = float(pose.get("x", 0.0) or 0.0) + dx * 1200.0
+            cy = float(pose.get("y", 0.0) or 0.0) + dy * 1200.0
+        object_id = f"visual_house_{house_id or '0001'}"
+        selected_layer = str(self.route6_update_map_layer_var.get() or "z_050")
+        marker = {
+            "schema": "route6_visual_house_marker_v1",
+            "object_id": object_id,
+            "semantic_label": "house_candidate",
+            "house_id": house_id,
+            "requested_direction": str(item.get("requested_direction", "") or ""),
+            "estimated_center_cm": {"x": round(float(cx), 2), "y": round(float(cy), 2)},
+            "bearing_deg": float(item.get("selected_camera_yaw_deg", self.route6_direction_yaw_deg(str(item.get("requested_direction", "north") or "north"))) or 0.0),
+            "supporting_layers": [selected_layer],
+            "source_judgement_path": str(out_path / "route6_visual_house_llm_judgement.json"),
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        overlay_path = self.route6_build_visual_marker_overlay(out_path, marker)
+        marker["overlay_preview_path"] = str(overlay_path)
+        marker_path = out_path / "route6_visual_house_marker.json"
+        self.route6_write_json_artifact(marker_path, marker)
+        self.llm_route6_state["route6_visual_house_marker"] = self.route6_json_safe(marker)
+        self.llm_route6_state["route6_visual_house_marker_path"] = str(marker_path)
+        self.llm_route6_visual_detail_var.set(
+            f"Visual marker: {object_id} x={marker['estimated_center_cm']['x']:.1f} y={marker['estimated_center_cm']['y']:.1f}"
+        )
+        self.route6_write_state_artifact()
+        return marker
+
+    def route6_detect_height_conflict(
+        self,
+        output_dir: Path,
+        target: Dict[str, Any],
+        layer_state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        out_path = Path(output_dir)
+        tgt = target if isinstance(target, dict) else {}
+        state = layer_state if isinstance(layer_state, dict) else {}
+        approach_layer = str(tgt.get("approach_layer_key", self.route6_update_map_layer_var.get() or "z_050") or "z_050")
+        blocked_layers = sorted({str(key) for key in state.get("blocked_layers", []) if str(key).strip()}, key=self.route6_layer_z_from_key)
+        open_layers = sorted({str(key) for key in state.get("open_layers", tgt.get("open_corridor_layers", [])) if str(key).strip()}, key=self.route6_layer_z_from_key)
+        or_state = state.get("or_state", {}) if isinstance(state.get("or_state", {}), dict) else {}
+        risk_state = str(or_state.get("risk_state", "") or "").lower()
+        blocked_z = [self.route6_layer_z_from_key(key) for key in blocked_layers]
+        longest_run = 0
+        current_run = 0
+        previous = None
+        for value in blocked_z:
+            if previous is None or abs(value - previous) <= 50:
+                current_run += 1
+            else:
+                current_run = 1
+            longest_run = max(longest_run, current_run)
+            previous = value
+        if risk_state in {"must_stop", "collision", "collision_imminent"}:
+            conflict_type = "local_or_blocked"
+            decision = "hold_and_replan"
+        elif not blocked_layers:
+            conflict_type = "clear"
+            decision = "continue"
+        elif len(blocked_layers) == 1:
+            conflict_type = "single_layer_conflict"
+            decision = "change_layer"
+        elif longest_run >= 3:
+            conflict_type = "multi_layer_boundary"
+            decision = "orbit_capture"
+        else:
+            conflict_type = "adjacent_layer_conflict"
+            decision = "side_step_or_change_layer"
+        report = {
+            "schema": "route6_height_conflict_report_v1",
+            "run_dir": str(out_path),
+            "target_object_id": str(tgt.get("target_object_id", tgt.get("selected_object_id", "")) or ""),
+            "house_id": str(tgt.get("house_id", "") or ""),
+            "approach_layer_key": approach_layer,
+            "blocked_layers": blocked_layers,
+            "open_layers": open_layers,
+            "or_state": self.route6_json_safe(or_state),
+            "conflict_type": conflict_type,
+            "decision": decision,
+            "risk_summary": {
+                "blocked_layer_count": len(blocked_layers),
+                "longest_adjacent_blocked_run": int(longest_run),
+                "risk_state": risk_state or "n/a",
+            },
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        self.route6_write_json_artifact(out_path / "route6_height_conflict_report.json", report)
+        self.llm_route6_state["route6_height_conflict_report"] = self.route6_json_safe(report)
+        self.llm_route6_conflict_status_var.set(f"Height Conflict / Replan: {conflict_type} -> {decision}")
+        self.llm_route6_conflict_detail_var.set(f"Blocked layers: {', '.join(blocked_layers) or 'none'}; open: {', '.join(open_layers) or 'n/a'}")
+        self.route6_write_state_artifact()
+        return report
+
+    def route6_decide_height_conflict_avoidance(self, conflict: Dict[str, Any]) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        item = conflict if isinstance(conflict, dict) else {}
+        approach = str(item.get("approach_layer_key", "z_050") or "z_050")
+        open_layers = [str(key) for key in item.get("open_layers", []) if str(key).strip()]
+        conflict_type = str(item.get("conflict_type", "") or "")
+        target_layer = ""
+        next_action = "continue"
+        if conflict_type == "single_layer_conflict":
+            approach_z = self.route6_layer_z_from_key(approach)
+            adjacent = [key for key in open_layers if abs(self.route6_layer_z_from_key(key) - approach_z) <= 50]
+            target_layer = min(adjacent or open_layers, key=lambda key: abs(self.route6_layer_z_from_key(key) - approach_z)) if (adjacent or open_layers) else ""
+            next_action = "change_layer" if target_layer else "hold_and_replan"
+        elif conflict_type == "multi_layer_boundary":
+            next_action = "orbit_capture"
+        elif conflict_type in {"adjacent_layer_conflict", "local_or_blocked"}:
+            next_action = "side_step_or_replan"
+            target_layer = min(open_layers, key=lambda key: abs(self.route6_layer_z_from_key(key) - self.route6_layer_z_from_key(approach))) if open_layers else ""
+        decision = {
+            "schema": "route6_replan_llm_decision_v1",
+            "source": "deterministic_height_conflict_replan",
+            "conflict_type": conflict_type,
+            "next_action": next_action,
+            "target_layer_key": target_layer,
+            "recommended_capture": "route6_building_orbit_capture" if next_action == "orbit_capture" else "",
+            "reason": str(item.get("decision", "") or ""),
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        out_dir = str(item.get("run_dir", "") or "")
+        if out_dir:
+            self.route6_write_json_artifact(Path(out_dir) / "route6_replan_llm_decision.json", decision)
+        self.llm_route6_state["route6_replan_llm_decision"] = self.route6_json_safe(decision)
+        self.llm_route6_conflict_detail_var.set(f"Replan: {next_action} layer={target_layer or 'n/a'}")
+        self.route6_write_state_artifact()
+        return decision
+
+    def route6_call_replan_llm(self, conflict: Dict[str, Any]) -> Dict[str, Any]:
+        return self.route6_decide_height_conflict_avoidance(conflict)
+
+    def route6_plan_building_orbit_capture(
+        self,
+        output_dir: Path,
+        marker: Dict[str, Any],
+        conflict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        out_path = Path(output_dir)
+        item = marker if isinstance(marker, dict) else {}
+        object_id = str(item.get("object_id", "visual_house_0001") or "visual_house_0001")
+        object_dir = out_path / "route6_visual_orbit_captures" / f"object_{object_id}"
+        object_dir.mkdir(parents=True, exist_ok=True)
+        center = item.get("estimated_center_cm", {}) if isinstance(item.get("estimated_center_cm", {}), dict) else {}
+        cx = float(center.get("x", 0.0) or 0.0)
+        cy = float(center.get("y", -1200.0) or -1200.0)
+        z_cm = float(self.route6_current_pose().get("z", self.route6_layer_z_from_key(str(self.route6_update_map_layer_var.get() or "z_300"))) or 300.0)
+        standoff = self.route6_float_param(self.llm_route6_standoff_cm_var, 850.0, min_value=100.0, max_value=5000.0)
+        viewpoints: List[Dict[str, Any]] = []
+        for index, angle_deg in enumerate([0.0, 90.0, 180.0, 270.0]):
+            angle = math.radians(angle_deg)
+            x = cx + math.cos(angle) * standoff
+            y = cy + math.sin(angle) * standoff
+            yaw = math.degrees(math.atan2(cy - y, cx - x))
+            viewpoints.append(
+                {
+                    "view_id": f"orbit_{index:03d}",
+                    "x": round(float(x), 2),
+                    "y": round(float(y), 2),
+                    "z": round(float(z_cm), 2),
+                    "yaw_deg": round(float(yaw), 2),
+                    "standoff_cm": round(float(standoff), 2),
+                }
+            )
+        plan = {
+            "schema": "route6_building_orbit_capture_manifest_v1",
+            "run_dir": str(out_path),
+            "object_id": object_id,
+            "object_dir": str(object_dir),
+            "marker": self.route6_json_safe(marker),
+            "height_conflict": self.route6_json_safe(conflict),
+            "planned_viewpoints": viewpoints,
+            "capture_count": 0,
+            "capture_status": "planned",
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        self.route6_write_json_artifact(object_dir / "orbit_manifest.json", plan)
+        self.llm_route6_state["route6_building_orbit_capture_plan"] = self.route6_json_safe(plan)
+        self.route6_write_state_artifact()
+        return plan
+
+    def route6_execute_building_orbit_capture(
+        self,
+        session: Any,
+        output_dir: Path,
+        plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        self.route6_visual_orbit_stop_event.clear()
+        out_path = Path(output_dir)
+        payload = plan if isinstance(plan, dict) else {}
+        object_dir = Path(str(payload.get("object_dir", out_path / "route6_visual_orbit_captures" / "object_visual_house_0001") or out_path))
+        frames_dir = object_dir / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        executed: List[Dict[str, Any]] = []
+        for index, view in enumerate(payload.get("planned_viewpoints", []) if isinstance(payload.get("planned_viewpoints", []), list) else [], start=1):
+            if self.route6_visual_orbit_stop_event.is_set() or not self.route6_movement_allowed():
+                break
+            if not isinstance(view, dict):
+                continue
+            view_id = str(view.get("view_id", f"orbit_{index - 1:03d}") or f"orbit_{index - 1:03d}")
+            view_dir = frames_dir / view_id
+            view_dir.mkdir(parents=True, exist_ok=True)
+            move_result: Dict[str, Any] = {}
+            if session is not None and callable(getattr(session, "move_relative", None)):
+                try:
+                    move_result = session.move_relative(
+                        {
+                            "action_name": "route6_orbit_viewpoint",
+                            "x": float(view.get("x", 0.0) or 0.0),
+                            "y": float(view.get("y", 0.0) or 0.0),
+                            "z": float(view.get("z", 0.0) or 0.0),
+                            "yaw_deg": float(view.get("yaw_deg", 0.0) or 0.0),
+                        }
+                    )
+                except Exception as exc:
+                    move_result = {"status": "failed", "error": str(exc)}
+            capture = {"status": "skipped", "reason": "missing_session"}
+            if session is not None and callable(getattr(session, "capture_lidar_stream_frame", None)):
+                try:
+                    capture = session.capture_lidar_stream_frame(
+                        view_dir,
+                        int(index),
+                        action_detail={
+                            "schema": "route6_building_orbit_capture_action_v1",
+                            "capture_kind": "route6_building_orbit_capture",
+                            "view_id": view_id,
+                        },
+                    )
+                    capture = capture if isinstance(capture, dict) else {"status": "failed", "error": "capture_returned_non_dict"}
+                except Exception as exc:
+                    capture = {"status": "failed", "error": str(exc)}
+            executed.append(
+                {
+                    "view_id": view_id,
+                    "view_dir": str(view_dir),
+                    "move_result": self.route6_json_safe(move_result),
+                    "capture": self.route6_json_safe(capture),
+                }
+            )
+        result = dict(payload)
+        result["executed_viewpoints"] = executed
+        result["capture_count"] = len(executed)
+        result["capture_status"] = "stopped" if self.route6_visual_orbit_stop_event.is_set() else "executed"
+        result["updated_at"] = datetime.now().isoformat(timespec="milliseconds")
+        self.route6_write_json_artifact(object_dir / "orbit_manifest.json", result)
+        self.llm_route6_state["route6_building_orbit_capture_manifest"] = self.route6_json_safe(result)
+        self.llm_route6_conflict_status_var.set(f"Height Conflict / Replan: orbit capture {result['capture_status']} count={len(executed)}")
+        self.route6_write_state_artifact()
+        return result
+
     def route6_write_house_queue(self, output_dir: Path, candidates: List[Dict[str, Any]], selected: Dict[str, Any]) -> None:
         selected_house_id = str((selected or {}).get("house_id", "") or "")
         queue = {
@@ -1181,6 +2074,9 @@ class Route6ExploreControlMixin:
                 "route6_update_map_capture_frame_index",
                 "route6_target_search_realtime_map",
                 "route6_movement_preflight",
+                "route6_known_house_coordinate_mode_enabled",
+                "route6_known_house_polygons",
+                "route6_known_house_navigation_plan",
             )
             if key in state
         }
@@ -2020,7 +2916,7 @@ class Route6ExploreControlMixin:
         self.route6_update_map_status_var.set(f"Route 6 Update Map: {selected or 'n/a'} points={point_count} occupied={occupied_count}")
         if preview is None:
             return manifest
-        preview_path = Path(str((layer_record if isinstance(layer_record, dict) else {}).get("occupancy_preview_path", "") or ""))
+        preview_path = self.route6_update_map_layer_preview_path(layer_record)
         if not preview_path.is_file():
             try:
                 preview.configure(text=f"Preview missing: {preview_path}", image="")
@@ -2880,6 +3776,25 @@ class Route6ExploreControlMixin:
         should_capture = bool(float(delta.get("position_cm", 0.0) or 0.0) >= min_move or float(delta.get("yaw_deg", 0.0) or 0.0) >= min_yaw)
         return should_capture, delta
 
+    def route6_should_capture_map_after_motion(
+        self,
+        current_pose: Dict[str, Any],
+        last_pose: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        should_capture, delta = self.route6_update_map_should_capture_pose(current_pose, last_pose)
+        reason = "first_pose" if not isinstance(last_pose, dict) or not last_pose else ("motion_threshold_met" if should_capture else "stationary_pose")
+        return {
+            "schema": "route6_update_map_capture_gate_v1",
+            "should_capture": bool(should_capture),
+            "reason": reason,
+            "position_delta_cm": float(delta.get("position_cm", 0.0) or 0.0),
+            "yaw_delta_deg": float(delta.get("yaw_deg", 0.0) or 0.0),
+            "min_move_cm": self.route6_update_map_min_move_cm(),
+            "min_yaw_deg": self.route6_update_map_min_yaw_deg(),
+            "current_pose": self.route6_json_safe(current_pose if isinstance(current_pose, dict) else {}),
+            "last_accepted_pose": self.route6_json_safe(last_pose if isinstance(last_pose, dict) else {}),
+        }
+
     def route6_update_map_capture_once(self, session: Any, output_dir: Path) -> Dict[str, Any]:
         self.ensure_route6_state()
         if session is None:
@@ -3078,6 +3993,20 @@ class Route6ExploreControlMixin:
             should_capture, last_pose_delta = self.route6_update_map_should_capture_pose(current_pose, last_accepted_pose)
             if not should_capture:
                 skipped_stationary_count += 1
+                skip_event = {
+                    "schema": "route6_update_map_skip_event_v1",
+                    "reason": "stationary_pose",
+                    "loop_index": int(loop_count),
+                    "skipped_stationary_count": int(skipped_stationary_count),
+                    "position_delta_cm": float(last_pose_delta.get("position_cm", 0.0) or 0.0),
+                    "yaw_delta_deg": float(last_pose_delta.get("yaw_deg", 0.0) or 0.0),
+                    "min_move_cm": self.route6_update_map_min_move_cm(),
+                    "min_yaw_deg": self.route6_update_map_min_yaw_deg(),
+                    "current_pose": self.route6_json_safe(current_pose),
+                    "last_accepted_pose": self.route6_json_safe(last_accepted_pose or {}),
+                    "created_at": datetime.now().isoformat(timespec="milliseconds"),
+                }
+                self.route6_append_jsonl(out_path / "route6_update_map_skip_events.jsonl", skip_event)
                 self.llm_route6_state["route6_update_map_realtime"] = {
                     "schema": "route6_update_map_realtime_state_v1",
                     "running": True,
@@ -3242,9 +4171,24 @@ class Route6ExploreControlMixin:
             )
         return result
 
+    def on_route6_apply_known_houses_to_map(self) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        output_dir = self.route6_update_map_latest_output_dir()
+        if output_dir is None:
+            self.route6_update_map_status_var.set("Route 6 Update Map: no map folder for known house overlay.")
+            return {}
+        manifest = self.route6_apply_known_house_polygons_to_update_map(output_dir)
+        if manifest:
+            self.route6_build_known_house_navigation_plan(output_dir, target_house_id="001")
+            self.refresh_route6_update_map_window(build_if_missing=False)
+        return manifest
+
     def route6_update_map_collect_pointclouds(self, output_dir: Path, *, voxel_size_m: Optional[float] = None) -> Tuple[np.ndarray, List[str]]:
         out_path = Path(output_dir)
         paths: List[Path] = []
+        map_merged_path = out_path / "map" / "route6_update_map_merged_point_cloud_world_standard_m.npy"
+        if map_merged_path.is_file():
+            paths.append(map_merged_path)
         states = self.route6_house_states()
         for _hid, state in sorted(states.items(), key=lambda item: str(item[0])):
             item = state if isinstance(state, dict) else {}
@@ -3316,6 +4260,61 @@ class Route6ExploreControlMixin:
         }
         return merged.astype(np.float32, copy=False), used_paths
 
+    def route6_cleanup_update_map_frame_pointclouds(
+        self,
+        output_dir: Path,
+        source_paths: List[str],
+        *,
+        reason: str = "merged_into_route6_update_map",
+    ) -> Dict[str, Any]:
+        out_path = Path(output_dir)
+        deleted_paths: List[str] = []
+        skipped_paths: List[Dict[str, str]] = []
+        delete_candidates: List[Path] = []
+        for raw_path in source_paths:
+            path = Path(str(raw_path or ""))
+            frame_dir = None
+            for parent in [path.parent, *path.parents]:
+                if parent.name.startswith("frame_") and self.route6_path_is_under(parent, out_path / "frames"):
+                    frame_dir = parent
+                    break
+            if frame_dir is None:
+                skipped_paths.append({"path": str(path), "reason": "not_frame_pointcloud"})
+                continue
+            for pattern in ("point_cloud*.npy", "point_cloud*.ply"):
+                for candidate in sorted(frame_dir.rglob(pattern)):
+                    if candidate.is_file() and candidate not in delete_candidates:
+                        delete_candidates.append(candidate)
+        for path in delete_candidates:
+            if not self.route6_path_is_under(path, out_path / "frames"):
+                skipped_paths.append({"path": str(path), "reason": "outside_frames"})
+                continue
+            try:
+                path.unlink()
+                deleted_paths.append(str(path))
+            except Exception as exc:
+                skipped_paths.append({"path": str(path), "reason": f"delete_failed:{exc}"})
+        report = {
+            "schema": "route6_update_map_pointcloud_cleanup_v1",
+            "reason": str(reason),
+            "output_dir": str(out_path),
+            "deleted_count": len(deleted_paths),
+            "deleted_paths": deleted_paths,
+            "skipped_count": len(skipped_paths),
+            "skipped_paths": skipped_paths,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        if deleted_paths or skipped_paths:
+            self.route6_write_json_artifact(out_path / "map" / "route6_update_map_pointcloud_cleanup.json", report)
+            self.route6_log_event(out_path, "route6_update_map_pointcloud_cleanup", report)
+            self.llm_route6_state["route6_update_map_pointcloud_cleanup"] = self.route6_json_safe(report)
+            update_state = self.llm_route6_state.get("route6_update_map", {}) if isinstance(self.llm_route6_state.get("route6_update_map", {}), dict) else {}
+            if update_state:
+                update_state["pointcloud_cleanup"] = self.route6_json_safe(report)
+                self.llm_route6_state["route6_update_map"] = update_state
+            self.route6_write_state_artifact()
+        return report
+
     def route6_update_map_manifest_path(self, output_dir: Optional[Path] = None) -> Path:
         out_path = Path(output_dir) if output_dir is not None else self.route6_update_map_latest_output_dir()
         if out_path is None:
@@ -3345,16 +4344,24 @@ class Route6ExploreControlMixin:
             resolution_m=float(resolution_m),
             occupied_threshold=route6_map_builder.DEFAULT_ROUTE6_LAYER_OCCUPIED_THRESHOLD,
         )
+        merged_pointcloud_path = out_path / "map" / "route6_update_map_merged_point_cloud_world_standard_m.npy"
+        merged_pointcloud_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(merged_pointcloud_path, merged.astype(np.float32, copy=False))
+        overlay_manifest = self.route6_apply_known_house_polygons_to_update_map(out_path)
+        manifest_path = str((overlay_manifest if isinstance(overlay_manifest, dict) else {}).get("manifest_path", "") or result.get("manifest_path", "") or "")
+        cleanup = self.route6_cleanup_update_map_frame_pointclouds(out_path, source_paths)
         record = {
             "schema": "route6_update_map_state_v1",
             "source": "manual_route6_update_map",
             "output_dir": str(out_path),
-            "manifest_path": str(result.get("manifest_path", "") or ""),
+            "manifest_path": manifest_path,
             "layered_occupancy_dir": str(result.get("layered_occupancy_dir", "") or ""),
             "layer_count": int(result.get("layer_count", 0) or 0),
             "fixed_world_bounds_cm": dict(result.get("fixed_world_bounds_cm", {}) or {}),
             "source_pointcloud_count": len(source_paths),
             "source_pointcloud_paths": source_paths,
+            "merged_pointcloud_path": str(merged_pointcloud_path),
+            "pointcloud_cleanup": self.route6_json_safe(cleanup),
             "raw_point_count": int((self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}) if isinstance(self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}), dict) else {}).get("raw_point_count", merged.shape[0]) or 0),
             "per_source_voxel_point_count": int((self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}) if isinstance(self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}), dict) else {}).get("per_source_voxel_point_count", merged.shape[0]) or 0),
             "pre_global_voxel_point_count": int((self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}) if isinstance(self.llm_route6_state.get("route6_update_map_pointcloud_merge", {}), dict) else {}).get("pre_global_voxel_point_count", merged.shape[0]) or 0),
@@ -3441,6 +4448,8 @@ class Route6ExploreControlMixin:
         draw.line((cx - radius, cy, cx + radius, cy), fill=(150, 150, 150), width=max(1, factor))
         draw.text((cx - 3 * factor, cy - radius - 1), "N", fill=(0, 0, 0))
         draw.text((cx + radius + 2, cy - 5), "E", fill=(0, 0, 0))
+        draw.text((cx - 3 * factor, cy + radius + 1), "S", fill=(0, 0, 0))
+        draw.text((max(1, cx - radius - 7 * factor), cy - 5), "W", fill=(0, 0, 0))
         dx, dy = self.route6_yaw_screen_vector(yaw_deg)
         tip_x = cx + dx * (radius - max(3, factor))
         tip_y = cy + dy * (radius - max(3, factor))
@@ -3528,7 +4537,7 @@ class Route6ExploreControlMixin:
             selected = values[0]
             self.route6_update_map_layer_var.set(selected)
         layer_record = next((layer for layer in layers if isinstance(layer, dict) and self._route6_update_map_layer_key(layer) == selected), {})
-        preview_path = Path(str((layer_record if isinstance(layer_record, dict) else {}).get("occupancy_preview_path", "") or ""))
+        preview_path = self.route6_update_map_layer_preview_path(layer_record)
         status = (
             f"Route 6 Update Map: {selected} "
             f"points={int((layer_record or {}).get('point_count', 0) or 0)} "
@@ -3666,6 +4675,7 @@ class Route6ExploreControlMixin:
         tk.Button(toolbar, text="Start Realtime Update", command=self.on_route6_update_map_start_realtime).grid(row=0, column=5, sticky="w", padx=6, pady=6)
         tk.Button(toolbar, text="Stop Realtime Update", command=self.on_route6_update_map_stop_realtime).grid(row=0, column=6, sticky="w", padx=6, pady=6)
         tk.Button(toolbar, text="Open Capture Folders", command=self.open_route6_capture_folder_reader_window).grid(row=0, column=7, sticky="w", padx=6, pady=6)
+        tk.Button(toolbar, text="Apply Known Houses", command=self.on_route6_apply_known_houses_to_map).grid(row=0, column=14, sticky="w", padx=6, pady=6)
         tk.Label(toolbar, text="Interval s").grid(row=0, column=8, sticky="e", padx=(18, 2), pady=6)
         tk.Entry(toolbar, textvariable=self.route6_update_map_capture_interval_s_var, width=6).grid(row=0, column=9, sticky="w", padx=(0, 6), pady=6)
         tk.Label(toolbar, text="Min move cm").grid(row=0, column=10, sticky="e", padx=(12, 2), pady=6)
@@ -4394,6 +5404,13 @@ class Route6ExploreControlMixin:
     def route6_full_explore_worker(self, session: Optional[flight.DroneFlightSession] = None, *, force_new: bool = False) -> None:
         self.ensure_route6_state()
         output_dir = self.route6_initialize_run(force_new=force_new)
+        if session is not None:
+            try:
+                self.route6_set_stage("VISUAL_DIRECTION_ANALYSIS", "capturing direction sweep for visual house target selection.")
+                self.route6_run_visual_direction_analysis(session, output_dir)
+            except Exception as exc:
+                self.route6_log_event(output_dir, "visual_direction_analysis_failed", {"error": str(exc)})
+                self.llm_route6_visual_status_var.set(f"LLM Visual Direction Analysis: failed: {exc}")
         max_houses = self.route6_int_param(self.llm_route6_max_houses_var, 3, min_value=1, max_value=100)
         max_runtime_minutes = self.route6_float_param(self.llm_route6_runtime_min_var, 30.0, min_value=0.0, max_value=1440.0)
         max_runtime_s = float(max_runtime_minutes) * 60.0
@@ -4632,7 +5649,7 @@ class Route6ExploreControlMixin:
         content_window = llm_route6_scroll_canvas.create_window((0, 0), window=content, anchor="nw")
         content.grid_columnconfigure(0, weight=1)
         content.grid_rowconfigure(3, weight=2)
-        content.grid_rowconfigure(6, weight=1)
+        content.grid_rowconfigure(8, weight=1)
 
         def _sync_scrollregion(_event: tk.Event) -> None:
             try:
@@ -4743,15 +5760,38 @@ class Route6ExploreControlMixin:
         tk.Label(analysis_section, textvariable=self.llm_route6_navigation_target_var, anchor="w", wraplength=980, justify="left").grid(row=2, column=0, sticky="ew", padx=6, pady=(3, 6))
         tk.Button(analysis_section, text="Refresh LLM Map Analysis", command=self.refresh_llm_route6_map_analysis_panel).grid(row=0, column=1, rowspan=3, sticky="e", padx=6, pady=6)
 
+        visual_section = tk.LabelFrame(content, text="LLM Visual Direction Analysis")
+        visual_section.grid(row=5, column=0, sticky="ew", padx=8, pady=4)
+        visual_section.grid_columnconfigure(0, weight=1)
+        visual_buttons = tk.Frame(visual_section)
+        visual_buttons.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 3))
+        tk.Button(visual_buttons, text="Capture Direction Sweep", command=self.on_route6_capture_direction_sweep).pack(side="left", padx=(0, 6))
+        tk.Button(visual_buttons, text="Analyze Direction Images", command=self.on_route6_analyze_direction_images).pack(side="left", padx=6)
+        tk.Button(visual_buttons, text="Apply Visual House Marker", command=self.on_route6_apply_visual_house_marker).pack(side="left", padx=6)
+        tk.Button(visual_buttons, text="Start Visual Target Approach", command=self.on_route6_start_visual_target_approach).pack(side="left", padx=6)
+        tk.Label(visual_section, textvariable=self.llm_route6_visual_status_var, anchor="w").grid(row=1, column=0, sticky="ew", padx=6, pady=3)
+        tk.Label(visual_section, textvariable=self.llm_route6_visual_detail_var, anchor="w", wraplength=1010, justify="left").grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
+
+        conflict_section = tk.LabelFrame(content, text="Height Conflict / Replan")
+        conflict_section.grid(row=6, column=0, sticky="ew", padx=8, pady=4)
+        conflict_section.grid_columnconfigure(0, weight=1)
+        conflict_buttons = tk.Frame(conflict_section)
+        conflict_buttons.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 3))
+        tk.Button(conflict_buttons, text="Check Height Conflict", command=self.on_route6_check_height_conflict).pack(side="left", padx=(0, 6))
+        tk.Button(conflict_buttons, text="Start Orbit Capture", command=self.on_route6_start_orbit_capture).pack(side="left", padx=6)
+        tk.Button(conflict_buttons, text="Stop Orbit Capture", command=self.on_route6_stop_orbit_capture).pack(side="left", padx=6)
+        tk.Label(conflict_section, textvariable=self.llm_route6_conflict_status_var, anchor="w").grid(row=1, column=0, sticky="ew", padx=6, pady=3)
+        tk.Label(conflict_section, textvariable=self.llm_route6_conflict_detail_var, anchor="w", wraplength=1010, justify="left").grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
+
         or_section = tk.LabelFrame(content, text="OR Avoidance")
-        or_section.grid(row=5, column=0, sticky="ew", padx=8, pady=4)
+        or_section.grid(row=7, column=0, sticky="ew", padx=8, pady=4)
         or_section.grid_columnconfigure(1, weight=1)
         tk.Label(or_section, textvariable=self.llm_route6_or_status_var, anchor="w").grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 3))
         tk.Label(or_section, textvariable=self.llm_route6_or_detail_var, anchor="w", wraplength=1010, justify="left").grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
         tk.Button(or_section, text="Refresh OR", command=self.refresh_llm_route6_or_avoidance_display).grid(row=1, column=1, sticky="e", padx=6, pady=(0, 6))
 
         summary = tk.LabelFrame(content, text="Route 6 Implementation Contract")
-        summary.grid(row=6, column=0, sticky="nsew", padx=8, pady=(4, 8))
+        summary.grid(row=8, column=0, sticky="nsew", padx=8, pady=(4, 8))
         summary.grid_columnconfigure(0, weight=1)
         summary.grid_rowconfigure(0, weight=1)
         text = tk.Text(summary, height=18, wrap="none", font=("Consolas", 9))
@@ -4819,6 +5859,118 @@ class Route6ExploreControlMixin:
         self.llm_route6_status_var.set(f"LLM Route V6: selected target house={house_id or 'n/a'}.")
         self.route6_update_summary_text()
         return applied
+
+    def route6_current_or_new_output_dir(self) -> Path:
+        self.ensure_route6_state()
+        state_output = str((self.llm_route6_state or {}).get("output_dir", "") or "")
+        if state_output and Path(state_output).exists():
+            return Path(state_output)
+        return self.route6_initialize_run(force_new=False)
+
+    def route6_run_visual_direction_analysis(
+        self,
+        session: Any,
+        output_dir: Path,
+    ) -> Dict[str, Any]:
+        prompt = str(self.llm_route6_task_prompt_var.get() if hasattr(self.llm_route6_task_prompt_var, "get") else "")
+        direction = self.route6_parse_task_direction(prompt) or "north"
+        sweep = self.route6_capture_direction_sweep(session, Path(output_dir), requested_direction=direction)
+        judgement = self.route6_call_visual_house_llm(Path(output_dir), sweep)
+        marker = self.route6_mark_visual_house_candidate_on_map(Path(output_dir), judgement)
+        result = {
+            "schema": "route6_visual_direction_analysis_result_v1",
+            "sweep_manifest_path": str(Path(output_dir) / "route6_visual_direction_sweep" / "sweep_manifest.json"),
+            "judgement_path": str(Path(output_dir) / "route6_visual_house_llm_judgement.json"),
+            "marker_path": str(Path(output_dir) / "route6_visual_house_marker.json"),
+            "target_house_id": str(judgement.get("house_id", "") or ""),
+            "marker_object_id": str(marker.get("object_id", "") or ""),
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+        }
+        self.llm_route6_state["route6_visual_direction_analysis_result"] = self.route6_json_safe(result)
+        self.route6_write_state_artifact()
+        return result
+
+    def on_route6_capture_direction_sweep(self) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        session = getattr(self, "session", None)
+        if session is None:
+            self.llm_route6_visual_status_var.set("LLM Visual Direction Analysis: no active session for visual sweep.")
+            return {}
+        output_dir = self.route6_current_or_new_output_dir()
+        direction = self.route6_parse_task_direction(str(self.llm_route6_task_prompt_var.get() or "")) or "north"
+        return self.route6_capture_direction_sweep(session, output_dir, requested_direction=direction)
+
+    def on_route6_analyze_direction_images(self) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        output_dir = self.route6_current_or_new_output_dir()
+        sweep = self.route6_load_json_artifact(output_dir / "route6_visual_direction_sweep" / "sweep_manifest.json", {})
+        if not sweep:
+            self.llm_route6_visual_status_var.set("LLM Visual Direction Analysis: capture direction sweep first.")
+            return {}
+        return self.route6_call_visual_house_llm(output_dir, sweep)
+
+    def on_route6_apply_visual_house_marker(self) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        output_dir = self.route6_current_or_new_output_dir()
+        judgement = self.route6_load_json_artifact(output_dir / "route6_visual_house_llm_judgement.json", {})
+        if not judgement:
+            judgement = self.on_route6_analyze_direction_images()
+        if not judgement:
+            self.llm_route6_visual_status_var.set("LLM Visual Direction Analysis: no visual judgement available for marker.")
+            return {}
+        return self.route6_mark_visual_house_candidate_on_map(output_dir, judgement)
+
+    def on_route6_start_visual_target_approach(self) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        output_dir = self.route6_current_or_new_output_dir()
+        marker = self.route6_load_json_artifact(output_dir / "route6_visual_house_marker.json", {})
+        if not marker:
+            marker = self.on_route6_apply_visual_house_marker()
+        if not marker:
+            return {}
+        target_selection = self.route6_apply_selected_target_to_scan_plan(output_dir)
+        semantic_context = self.route6_build_semantic_map_context()
+        target = self.route6_plan_llm_navigation_target(output_dir, target_selection, semantic_context)
+        self.llm_route6_visual_status_var.set(
+            f"LLM Visual Direction Analysis: marker applied; approach house={target.get('house_id', '') or 'n/a'} layer={target.get('approach_layer_key', '') or 'n/a'}"
+        )
+        return target
+
+    def on_route6_check_height_conflict(self) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        output_dir = self.route6_current_or_new_output_dir()
+        target = self.route6_load_json_artifact(output_dir / "route6_llm_navigation_target.json", {})
+        if not target:
+            context = self.route6_build_realtime_map_planning_context()
+            selection = self.route6_select_llm_target_from_context(context)
+            target = self.route6_plan_llm_navigation_target(output_dir, selection, context)
+        path_summary = target.get("path_summary", {}) if isinstance(target.get("path_summary", {}), dict) else {}
+        layer_state = {
+            "blocked_layers": path_summary.get("blocked_layers", []),
+            "open_layers": target.get("open_corridor_layers", []),
+            "or_state": self.route6_or_avoidance_display_payload().get("or_state", {}) if callable(getattr(self, "route6_or_avoidance_display_payload", None)) else {},
+        }
+        conflict = self.route6_detect_height_conflict(output_dir, target, layer_state)
+        self.route6_decide_height_conflict_avoidance(conflict)
+        return conflict
+
+    def on_route6_start_orbit_capture(self) -> Dict[str, Any]:
+        self.ensure_route6_state()
+        session = getattr(self, "session", None)
+        output_dir = self.route6_current_or_new_output_dir()
+        marker = self.route6_load_json_artifact(output_dir / "route6_visual_house_marker.json", {})
+        if not marker:
+            marker = self.on_route6_apply_visual_house_marker()
+        conflict = self.route6_load_json_artifact(output_dir / "route6_height_conflict_report.json", {})
+        if not conflict:
+            conflict = self.on_route6_check_height_conflict()
+        plan = self.route6_plan_building_orbit_capture(output_dir, marker, conflict)
+        return self.route6_execute_building_orbit_capture(session, output_dir, plan)
+
+    def on_route6_stop_orbit_capture(self) -> None:
+        self.ensure_route6_state()
+        self.route6_visual_orbit_stop_event.set()
+        self.llm_route6_conflict_status_var.set("Height Conflict / Replan: stop orbit capture requested.")
 
     def route6_release_movement_for_target_search(self, session: Any) -> Dict[str, Any]:
         self.ensure_route6_state()

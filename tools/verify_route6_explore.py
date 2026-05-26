@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import numpy as np
+from PIL import Image
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -417,6 +418,38 @@ class FakeMotionSession:
         return {"status": "ok", "movement_mode": str(mode)}
 
 
+class FakeVisualSession(FakeMotionSession):
+    def __init__(self) -> None:
+        super().__init__()
+        self.capture_calls: List[Dict[str, Any]] = []
+
+    def capture_lidar_stream_frame(self, stream_dir: Path, frame_index: int, action_detail: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        frame_dir = Path(stream_dir) / "frames" / f"frame_{int(frame_index):06d}"
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        rgb_path = frame_dir / "rgb.png"
+        depth_path = frame_dir / "depth.npy"
+        camera_info_path = frame_dir / "camera_info.json"
+        Image.new("RGB", (32, 24), (80 + int(frame_index) * 20, 120, 160)).save(rgb_path)
+        np.save(depth_path, np.full((24, 32), 450.0 + float(frame_index), dtype=np.float32))
+        camera_info_path.write_text(json.dumps({"width": 32, "height": 24, "frame_index": int(frame_index)}, indent=2), encoding="utf-8")
+        self.capture_calls.append({
+            "stream_dir": str(stream_dir),
+            "frame_index": int(frame_index),
+            "action_detail": dict(action_detail or {}),
+        })
+        return {
+            "status": "ok",
+            "capture_status": "ok",
+            "capture_kind": str((action_detail or {}).get("capture_kind", "visual_direction_sweep")),
+            "frame_index": int(frame_index),
+            "capture_dir": str(frame_dir),
+            "rgb_path": str(rgb_path),
+            "depth_npy_path": str(depth_path),
+            "camera_info_path": str(camera_info_path),
+            "point_count": 0,
+        }
+
+
 def test_route6_full_stop_uav_disables_motion(tmp_dir: Path) -> None:
     module = importlib.import_module("control.route6_explore_control")
     harness = Harness(tmp_dir)
@@ -535,6 +568,127 @@ def test_route6_llm_navigation_target_uses_13_layer_open_corridor(tmp_dir: Path)
     assert_true(target["approach_layer_key"] in context["available_layer_keys"], f"target should pick a known layer: {target}")
     assert_true(target["path_summary"]["status"] in {"candidate_clear", "candidate_unknown"}, f"target should summarize path status: {target}")
     assert_true((run_dir / "route6_llm_navigation_target.json").is_file(), "navigation target artifact should be written")
+
+
+def test_route6_visual_direction_sweep_writes_manifest(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = Harness(tmp_dir)
+    harness.latest_state = {"pose": [0.0, 0.0, 300.0, 0.0]}
+    session = FakeVisualSession()
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    run_dir = module.Route6ExploreControlMixin.route6_initialize_run(harness, force_new=True)
+
+    sweep = module.Route6ExploreControlMixin.route6_capture_direction_sweep(harness, session, run_dir, requested_direction="north")
+
+    assert_true(sweep["schema"] == "route6_visual_direction_sweep_manifest_v1", f"unexpected sweep schema: {sweep}")
+    assert_true(sweep["requested_direction"] == "north", f"sweep should record requested direction: {sweep}")
+    assert_true(len(sweep["sweep_yaws"]) >= 3, f"default sweep should capture center/left/right views: {sweep}")
+    assert_true(sweep["capture_policy"]["map_capture_required"] is False, f"visual sweep should not require occupancy rebuild: {sweep}")
+    assert_true(all(Path(item["rgb_path"]).is_file() for item in sweep["sweep_yaws"]), f"sweep RGB frames should exist: {sweep}")
+    assert_true((run_dir / "route6_visual_direction_sweep" / "sweep_manifest.json").is_file(), "sweep manifest should be written")
+    assert_true(all(call["action_detail"].get("capture_kind") == "visual_direction_sweep" for call in session.capture_calls), f"sweep captures should be tagged: {session.capture_calls}")
+
+
+def test_route6_visual_house_llm_marks_north_house_candidate(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = Harness(tmp_dir)
+    harness.latest_state = {"pose": [0.0, 0.0, 300.0, 0.0]}
+    harness.map_config = {
+        "houses": [
+            {"id": "101", "name": "NorthHouse", "center_x": 0.0, "center_y": -1200.0, "radius_cm": 250.0},
+            {"id": "201", "name": "SouthHouse", "center_x": 0.0, "center_y": 1200.0, "radius_cm": 250.0},
+        ],
+    }
+    session = FakeVisualSession()
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    run_dir = module.Route6ExploreControlMixin.route6_initialize_run(harness, force_new=True)
+    sweep = module.Route6ExploreControlMixin.route6_capture_direction_sweep(harness, session, run_dir, requested_direction="north")
+
+    judgement = module.Route6ExploreControlMixin.route6_call_visual_house_llm(harness, run_dir, sweep)
+    marker = module.Route6ExploreControlMixin.route6_mark_visual_house_candidate_on_map(harness, run_dir, judgement)
+
+    assert_true(judgement["schema"] == "route6_visual_house_llm_judgement_v1", f"unexpected judgement schema: {judgement}")
+    assert_true(judgement["target_visible"] is True, f"north house should be visually selected by fallback: {judgement}")
+    assert_true(judgement["semantic_label"] == "house", f"judgement should classify house: {judgement}")
+    assert_true(judgement["fallback_used"] is True, f"offline visual LLM should mark deterministic fallback: {judgement}")
+    assert_true(marker["schema"] == "route6_visual_house_marker_v1", f"unexpected marker schema: {marker}")
+    assert_true(marker["object_id"].startswith("visual_house_"), f"marker should create visual object id: {marker}")
+    assert_true(marker["estimated_center_cm"]["y"] < 0.0, f"north marker should estimate negative y: {marker}")
+    assert_true(Path(marker["overlay_preview_path"]).is_file(), f"marker overlay should be preserved: {marker}")
+    assert_true((run_dir / "route6_visual_house_llm_judgement.json").is_file(), "visual LLM judgement should be written")
+    assert_true((run_dir / "route6_visual_house_marker.json").is_file(), "visual marker artifact should be written")
+
+
+def test_route6_height_conflict_single_layer_changes_layer(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = Harness(tmp_dir)
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    run_dir = module.Route6ExploreControlMixin.route6_initialize_run(harness, force_new=True)
+    target = {
+        "target_object_id": "visual_house_0001",
+        "house_id": "101",
+        "target_pose_cm": {"x": 0.0, "y": -1200.0, "z": 300.0, "yaw": -90.0},
+        "approach_layer_key": "z_300",
+        "available_layer_keys": [f"z_{value:03d}" for value in range(50, 651, 50)],
+        "open_corridor_layers": ["z_250", "z_350", "z_400"],
+    }
+    layer_state = {"blocked_layers": ["z_300"], "open_layers": ["z_250", "z_350", "z_400"], "or_state": {"risk_state": "clear"}}
+
+    conflict = module.Route6ExploreControlMixin.route6_detect_height_conflict(harness, run_dir, target, layer_state)
+    decision = module.Route6ExploreControlMixin.route6_decide_height_conflict_avoidance(harness, conflict)
+
+    assert_true(conflict["schema"] == "route6_height_conflict_report_v1", f"unexpected conflict schema: {conflict}")
+    assert_true(conflict["conflict_type"] == "single_layer_conflict", f"single blocked layer should be classified: {conflict}")
+    assert_true(decision["next_action"] == "change_layer", f"single-layer conflict should try changing layer: {decision}")
+    assert_true(decision["target_layer_key"] in {"z_250", "z_350"}, f"decision should choose adjacent open layer: {decision}")
+
+
+def test_route6_height_conflict_multi_layer_triggers_orbit_capture(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = Harness(tmp_dir)
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    run_dir = module.Route6ExploreControlMixin.route6_initialize_run(harness, force_new=True)
+    target = {
+        "target_object_id": "visual_house_0001",
+        "house_id": "101",
+        "target_pose_cm": {"x": 0.0, "y": -1200.0, "z": 300.0, "yaw": -90.0},
+        "approach_layer_key": "z_300",
+        "available_layer_keys": [f"z_{value:03d}" for value in range(50, 651, 50)],
+        "open_corridor_layers": ["z_050", "z_100", "z_150"],
+    }
+    layer_state = {"blocked_layers": ["z_250", "z_300", "z_350", "z_400"], "open_layers": ["z_050", "z_100", "z_150"], "or_state": {"risk_state": "obstacle_warning", "front_depth_cm": 180.0}}
+
+    conflict = module.Route6ExploreControlMixin.route6_detect_height_conflict(harness, run_dir, target, layer_state)
+    decision = module.Route6ExploreControlMixin.route6_decide_height_conflict_avoidance(harness, conflict)
+
+    assert_true(conflict["conflict_type"] == "multi_layer_boundary", f"three adjacent blocked layers should become boundary: {conflict}")
+    assert_true(conflict["decision"] == "orbit_capture", f"multi-layer boundary should request orbit capture: {conflict}")
+    assert_true(decision["next_action"] == "orbit_capture", f"replan decision should choose orbit capture: {decision}")
+    assert_true((run_dir / "route6_height_conflict_report.json").is_file(), "height conflict report should be written")
+
+
+def test_route6_orbit_capture_writes_new_folder_manifest(tmp_dir: Path) -> None:
+    module = importlib.import_module("control.route6_explore_control")
+    harness = Harness(tmp_dir)
+    session = FakeVisualSession()
+    module.Route6ExploreControlMixin.ensure_route6_state(harness)
+    run_dir = module.Route6ExploreControlMixin.route6_initialize_run(harness, force_new=True)
+    marker = {
+        "object_id": "visual_house_0001",
+        "semantic_label": "house_candidate",
+        "estimated_center_cm": {"x": 0.0, "y": -1200.0},
+        "bearing_deg": -90.0,
+    }
+    conflict = {"conflict_type": "multi_layer_boundary", "decision": "orbit_capture"}
+
+    plan = module.Route6ExploreControlMixin.route6_plan_building_orbit_capture(harness, run_dir, marker, conflict)
+    executed = module.Route6ExploreControlMixin.route6_execute_building_orbit_capture(harness, session, run_dir, plan)
+
+    object_dir = run_dir / "route6_visual_orbit_captures" / "object_visual_house_0001"
+    assert_true(plan["schema"] == "route6_building_orbit_capture_manifest_v1", f"unexpected orbit plan: {plan}")
+    assert_true(executed["capture_count"] == len(plan["planned_viewpoints"]), f"orbit execution should capture each planned view: {executed}")
+    assert_true((object_dir / "orbit_manifest.json").is_file(), f"orbit manifest should be written under new object folder: {object_dir}")
+    assert_true(any((object_dir / "frames").glob("orbit_*")), "orbit capture frames should be saved in the object folder")
 
 
 def test_route6_initialize_run_writes_state_and_queue(tmp_dir: Path) -> None:
@@ -1113,6 +1267,11 @@ def main() -> None:
         lambda: run_with_tmp(test_route6_full_stop_blocks_future_movement_ticks),
         lambda: run_with_tmp(test_route6_semantic_map_skips_fence_for_north_first_house),
         lambda: run_with_tmp(test_route6_llm_navigation_target_uses_13_layer_open_corridor),
+        lambda: run_with_tmp(test_route6_visual_direction_sweep_writes_manifest),
+        lambda: run_with_tmp(test_route6_visual_house_llm_marks_north_house_candidate),
+        lambda: run_with_tmp(test_route6_height_conflict_single_layer_changes_layer),
+        lambda: run_with_tmp(test_route6_height_conflict_multi_layer_triggers_orbit_capture),
+        lambda: run_with_tmp(test_route6_orbit_capture_writes_new_folder_manifest),
         lambda: run_with_tmp(test_route6_initialize_run_writes_state_and_queue),
         lambda: run_with_tmp(test_route6_llm_target_selection_prefers_first_house_north_and_writes_artifact),
         lambda: run_with_tmp(test_route6_llm_target_selection_skips_blocked_direction_candidate),
