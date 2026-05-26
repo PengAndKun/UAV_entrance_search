@@ -1,10 +1,11 @@
 ﻿from __future__ import annotations
 
 from copy import deepcopy
+from PIL import ImageDraw
 
 from .common import *
 from .local_obstacle_map import LocalObstacleMap, LocalObstacleMapConfig
-from . import lidar_yolo_analysis
+from . import lidar_yolo_analysis, route6_map_builder
 
 from obstacle_avoidance.collect_route_episodes import (
     DEFAULT_ROUTE_SIDE_CORRECTION_CM,
@@ -27,6 +28,24 @@ from obstacle_avoidance_3.control_utils import serializable_or2_prediction
 from obstacle_avoidance_3.or2_direction_rule import select_or2_direction
 from obstacle_avoidance_3.plans import DEFAULT_PLAN_FILENAME as OA3_DEFAULT_PLAN_FILENAME
 from obstacle_representation_2.demo import ObstacleRepresentation2Predictor, render_affordance_overlay
+
+
+class _Route5FallbackVar:
+    def __init__(self, value: Any = "") -> None:
+        self.value = value
+
+    def get(self) -> Any:
+        return self.value
+
+    def set(self, value: Any) -> None:
+        self.value = value
+
+
+def _route5_string_var(value: str) -> Any:
+    try:
+        return tk.StringVar(value=value)
+    except RuntimeError:
+        return _Route5FallbackVar(value)
 
 
 class Route5FusionControlMixin:
@@ -178,6 +197,936 @@ class Route5FusionControlMixin:
             self.llm_route5_control_locked = False
         if not hasattr(self, "llm_route5_auto_refresh_job"):
             self.llm_route5_auto_refresh_job = None
+        if not hasattr(self, "llm_route7_window"):
+            self.llm_route7_window = None
+        if not hasattr(self, "llm_route7_window_canvas"):
+            self.llm_route7_window_canvas = None
+        if not hasattr(self, "llm_route7_window_content"):
+            self.llm_route7_window_content = None
+        if not hasattr(self, "llm_route7_window_content_window"):
+            self.llm_route7_window_content_window = None
+        if not hasattr(self, "llm_route7_update_map_frame"):
+            self.llm_route7_update_map_frame = None
+        if not hasattr(self, "llm_route7_update_map_preview_label"):
+            self.llm_route7_update_map_preview_label = None
+        if not hasattr(self, "llm_route7_update_map_preview_photo"):
+            self.llm_route7_update_map_preview_photo = None
+        if not hasattr(self, "llm_route7_update_map_layer_combo"):
+            self.llm_route7_update_map_layer_combo = None
+        if not hasattr(self, "llm_route7_update_map_after_id"):
+            self.llm_route7_update_map_after_id = None
+        if not hasattr(self, "llm_route7_map_layer_var"):
+            self.llm_route7_map_layer_var = _route5_string_var("z_300")
+        if not hasattr(self, "llm_route7_map_status_var"):
+            self.llm_route7_map_status_var = _route5_string_var("Route V7 Map: idle")
+
+    def ensure_route7_state(self) -> None:
+        self.ensure_route5_state()
+        try:
+            if not str(self.llm_route7_map_layer_var.get() or "").strip():
+                self.llm_route7_map_layer_var.set("z_300")
+        except Exception:
+            pass
+
+    def route7_default_exploration_z_cm(self) -> float:
+        return 300.0
+
+    def route7_default_layer_key(self) -> str:
+        return f"z_{int(round(self.route7_default_exploration_z_cm())):03d}"
+
+    def route7_prepare_new_map_output_dir(self, target_house_id: str) -> Path:
+        self.ensure_route7_state()
+        output_dir = self.make_route7_fused_output_dir(target_house_id)
+        self.route5_update_state(
+            mode="route7_llm_route_oa3_or2_fusion",
+            route_window_label="V7",
+            target_house_id=str(target_house_id or ""),
+            output_dir=str(output_dir),
+            route7_map_output_dir=str(output_dir),
+            observation_z_override_cm=self.route7_default_exploration_z_cm(),
+            stage="INIT_RUN",
+        )
+        if callable(getattr(self, "ensure_route6_state", None)):
+            self.ensure_route6_state()
+        if callable(getattr(self, "route6_record_update_map_output_dir", None)):
+            self.route6_record_update_map_output_dir(output_dir, source="route7_fresh_start")
+        return output_dir
+
+    def route7_current_map_output_dir(self) -> Optional[Path]:
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        for key in ("route7_map_output_dir", "output_dir"):
+            raw = str(state.get(key, "") or "")
+            if raw:
+                path = Path(raw)
+                if path.exists():
+                    return path
+        route6_state = getattr(self, "llm_route6_state", {}) if isinstance(getattr(self, "llm_route6_state", {}), dict) else {}
+        raw = str(route6_state.get("route6_update_map_output_dir", "") or "")
+        if raw:
+            path = Path(raw)
+            if path.exists():
+                return path
+        return None
+
+    def route7_start_update_map_realtime(self, session: Any, output_dir: Path) -> bool:
+        self.ensure_route7_state()
+        if callable(getattr(self, "ensure_route6_state", None)):
+            self.ensure_route6_state()
+        realtime_thread = getattr(self, "route6_update_map_realtime_thread", None)
+        if realtime_thread is not None and realtime_thread.is_alive():
+            self.route6_update_map_realtime_stop_event.set()
+            try:
+                realtime_thread.join(timeout=1.0)
+            except RuntimeError:
+                pass
+        capture_thread = getattr(self, "route6_update_map_capture_thread", None)
+        if capture_thread is not None and capture_thread.is_alive():
+            self.route6_update_map_capture_stop_event.set()
+            try:
+                capture_thread.join(timeout=1.0)
+            except RuntimeError:
+                pass
+        realtime_thread = getattr(self, "route6_update_map_realtime_thread", None)
+        if realtime_thread is not None and realtime_thread.is_alive():
+            self.route6_update_map_status_var.set("Route 6 Update Map: waiting for previous realtime update to stop.")
+            return False
+        capture_thread = getattr(self, "route6_update_map_capture_thread", None)
+        if capture_thread is not None and capture_thread.is_alive():
+            self.route6_update_map_status_var.set("Route 6 Update Map: waiting for previous capture to stop.")
+            return False
+        self.route6_record_update_map_output_dir(Path(output_dir), source="route7_realtime")
+        self.llm_route6_state["route6_update_map_capture_frame_index"] = 0
+        self.route6_update_map_capture_stop_event.clear()
+        self.route6_update_map_realtime_stop_event.clear()
+        self.route6_update_map_realtime_thread = threading.Thread(
+            target=lambda: self.route6_update_map_realtime_worker(session, Path(output_dir)),
+            daemon=True,
+        )
+        self.route6_update_map_realtime_thread.start()
+        self.route6_update_map_status_var.set(f"Route 6 Update Map: V7 realtime update started -> {output_dir}")
+        return True
+
+    def route7_map_layer_z_cm_from_key(self, key: str) -> float:
+        text = str(key or "").strip().lower()
+        if text.startswith("z_"):
+            text = text[2:]
+        try:
+            return float(text)
+        except Exception:
+            return self.route7_default_exploration_z_cm()
+
+    def route7_selected_map_layer_record(self, output_dir: Optional[Path] = None) -> Tuple[Dict[str, Any], str, float, Dict[str, Any]]:
+        manifest: Dict[str, Any] = {}
+        load_manifest = getattr(self, "route6_update_map_load_manifest", None)
+        if callable(load_manifest):
+            manifest = load_manifest(build_if_missing=True, output_dir=output_dir) or {}
+        layers = manifest.get("layers", []) if isinstance(manifest.get("layers", []), list) else []
+        selected_key = self.route7_select_update_map_layer_key(layers) if layers else self.route7_default_layer_key()
+        key_fn = getattr(self, "_route6_update_map_layer_key", None)
+        selected_layer = next(
+            (
+                layer
+                for layer in layers
+                if isinstance(layer, dict)
+                and ((str(key_fn(layer)) if callable(key_fn) else f"z_{int(float(layer.get('z_cm', 0) or 0)):03d}") == selected_key)
+            ),
+            {},
+        )
+        layer_z = self.route7_map_layer_z_cm_from_key(selected_key)
+        if selected_layer:
+            try:
+                layer_z = float(selected_layer.get("z_cm", layer_z) or layer_z)
+            except Exception:
+                pass
+        return dict(selected_layer), selected_key, float(layer_z), manifest
+
+    def route7_axis_values_near_house_edge(self, bbox: Dict[str, Any], facade: str, safe_intervals: List[Dict[str, Any]]) -> List[float]:
+        axis_min, axis_max = self.route2_facade_axis_range(bbox, facade)
+        low, high = sorted((float(axis_min), float(axis_max)))
+        span = max(0.0, high - low)
+        if span <= 0.0:
+            return [low, high]
+        inset = min(max(120.0, span * 0.12), span * 0.25)
+        raw_values = [low + inset, high - inset] if span > inset * 2.0 else [low + span * 0.25, low + span * 0.75]
+        intervals = [
+            (float(item.get("min")), float(item.get("max")))
+            for item in safe_intervals
+            if isinstance(item, dict) and self._as_float_or_none(item.get("min")) is not None and self._as_float_or_none(item.get("max")) is not None
+        ]
+        if not intervals:
+            return raw_values
+        adjusted: List[float] = []
+        for value in raw_values:
+            containing = [(min(lo, hi), max(lo, hi)) for lo, hi in intervals if min(lo, hi) <= value <= max(lo, hi)]
+            if containing:
+                adjusted.append(float(value))
+                continue
+            nearest = min(
+                ((min(lo, hi), max(lo, hi)) for lo, hi in intervals),
+                key=lambda pair: min(abs(value - pair[0]), abs(value - pair[1])),
+            )
+            adjusted.append(min(max(float(value), nearest[0]), nearest[1]))
+        if len(adjusted) >= 2 and abs(adjusted[0] - adjusted[1]) < 1.0:
+            lo, hi = min(intervals, key=lambda pair: abs((pair[1] - pair[0]) - span))
+            adjusted = [lo, hi] if hi > lo else raw_values
+        return adjusted[:2]
+
+    def route7_layer_pose_occupancy_score(self, layer_record: Dict[str, Any], pose: Dict[str, Any], *, radius_cells: int = 2) -> Dict[str, Any]:
+        metadata = self.route6_update_map_load_layer_metadata(layer_record) if callable(getattr(self, "route6_update_map_load_layer_metadata", None)) else {}
+        grid_path = Path(str((layer_record if isinstance(layer_record, dict) else {}).get("occupancy_grid_path", "") or ""))
+        if not metadata or not grid_path.is_file():
+            return {"status": "no_layer_grid", "occupied_cell_count": None, "free_cell_count": None}
+        try:
+            width = int(metadata.get("width", 0) or 0)
+            height = int(metadata.get("height", 0) or 0)
+            resolution = float(metadata.get("resolution_m", 0.25) or 0.25)
+            origin_x, origin_y = [float(value) for value in metadata.get("origin_standard_m", [0.0, 0.0])]
+            standard_x_m = float(pose.get("x", 0.0) or 0.0) / 100.0
+            standard_y_m = -float(pose.get("y", 0.0) or 0.0) / 100.0
+            col = int(math.floor((standard_x_m - origin_x) / resolution))
+            row = int(math.floor((standard_y_m - origin_y) / resolution))
+            if col < 0 or col >= width or row < 0 or row >= height:
+                return {"status": "outside_layer_grid", "occupied_cell_count": None, "free_cell_count": None, "grid_col": col, "grid_row": row}
+            grid = np.asarray(np.load(grid_path), dtype=np.int16)
+            r = max(1, int(radius_cells))
+            patch = grid[max(0, row - r): min(grid.shape[0], row + r + 1), max(0, col - r): min(grid.shape[1], col + r + 1)]
+            occupied = int(np.sum(patch >= 100))
+            free = int(np.sum(patch == 0))
+            return {"status": "ok", "occupied_cell_count": occupied, "free_cell_count": free, "grid_col": col, "grid_row": row}
+        except Exception as exc:
+            return {"status": "error", "reason": str(exc), "occupied_cell_count": None, "free_cell_count": None}
+
+    def route7_load_layer_occupancy_grid(self, layer_record: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = self.route6_update_map_load_layer_metadata(layer_record) if callable(getattr(self, "route6_update_map_load_layer_metadata", None)) else {}
+        grid_path = Path(str((layer_record if isinstance(layer_record, dict) else {}).get("occupancy_grid_path", "") or ""))
+        if not metadata or not grid_path.is_file():
+            return {"status": "missing_layer_grid", "reason": "missing_route7_layer_grid", "metadata": metadata, "grid": None}
+        try:
+            grid = np.asarray(np.load(grid_path), dtype=np.int16)
+        except Exception as exc:
+            return {"status": "error", "reason": f"load_route7_layer_grid_failed:{exc}", "metadata": metadata, "grid": None}
+        if grid.ndim != 2 or grid.size <= 0:
+            return {"status": "error", "reason": "invalid_route7_layer_grid_shape", "metadata": metadata, "grid": None}
+        metadata = dict(metadata)
+        metadata["height"] = int(metadata.get("height", grid.shape[0]) or grid.shape[0])
+        metadata["width"] = int(metadata.get("width", grid.shape[1]) or grid.shape[1])
+        metadata["resolution_m"] = float(metadata.get("resolution_m", 0.25) or 0.25)
+        metadata.setdefault("origin_standard_m", [0.0, 0.0])
+        return {"status": "ok", "metadata": metadata, "grid": grid, "grid_path": str(grid_path)}
+
+    def route7_pose_to_layer_cell(self, metadata: Dict[str, Any], pose: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+        try:
+            width = int(metadata.get("width", 0) or 0)
+            height = int(metadata.get("height", 0) or 0)
+            resolution = float(metadata.get("resolution_m", 0.25) or 0.25)
+            origin_x, origin_y = [float(value) for value in metadata.get("origin_standard_m", [0.0, 0.0])]
+            standard_x_m = float(pose.get("x", 0.0) or 0.0) / 100.0
+            standard_y_m = -float(pose.get("y", 0.0) or 0.0) / 100.0
+        except Exception:
+            return None
+        if width <= 0 or height <= 0 or resolution <= 0:
+            return None
+        col = int(math.floor((standard_x_m - origin_x) / resolution))
+        row = int(math.floor((standard_y_m - origin_y) / resolution))
+        if col < 0 or col >= width or row < 0 or row >= height:
+            return None
+        return row, col
+
+    def route7_layer_cell_to_pose(self, metadata: Dict[str, Any], cell: Tuple[int, int], *, z_cm: float, yaw_deg: float) -> Dict[str, float]:
+        resolution = float(metadata.get("resolution_m", 0.25) or 0.25)
+        origin_x, origin_y = [float(value) for value in metadata.get("origin_standard_m", [0.0, 0.0])]
+        row, col = int(cell[0]), int(cell[1])
+        x_cm = (origin_x + (float(col) + 0.5) * resolution) * 100.0
+        y_cm = -(origin_y + (float(row) + 0.5) * resolution) * 100.0
+        return {"x": round(x_cm, 3), "y": round(y_cm, 3), "z": round(float(z_cm), 3), "yaw": round(float(yaw_deg), 3)}
+
+    def route7_inflated_occupied_mask(self, grid: np.ndarray, *, inflation_cells: int = 1) -> np.ndarray:
+        occupied = np.asarray(grid, dtype=np.int16) >= 100
+        radius = max(0, int(inflation_cells))
+        if radius <= 0:
+            return occupied
+        padded = np.pad(occupied, radius, mode="constant", constant_values=False)
+        inflated = np.zeros_like(occupied, dtype=bool)
+        height, width = occupied.shape
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if dr * dr + dc * dc > radius * radius:
+                    continue
+                inflated |= padded[radius + dr: radius + dr + height, radius + dc: radius + dc + width]
+        return inflated
+
+    def route7_layer_segment_cells(self, start_cell: Tuple[int, int], target_cell: Tuple[int, int]) -> List[Tuple[int, int]]:
+        r0, c0 = int(start_cell[0]), int(start_cell[1])
+        r1, c1 = int(target_cell[0]), int(target_cell[1])
+        steps = max(abs(r1 - r0), abs(c1 - c0), 1)
+        cells: List[Tuple[int, int]] = []
+        seen: set[Tuple[int, int]] = set()
+        for idx in range(steps + 1):
+            t = float(idx) / float(steps)
+            cell = (int(round(r0 + (r1 - r0) * t)), int(round(c0 + (c1 - c0) * t)))
+            if cell in seen:
+                continue
+            seen.add(cell)
+            cells.append(cell)
+        return cells
+
+    def route7_layer_cell_blocked(self, mask: np.ndarray, cell: Tuple[int, int]) -> bool:
+        row, col = int(cell[0]), int(cell[1])
+        return row < 0 or col < 0 or row >= int(mask.shape[0]) or col >= int(mask.shape[1]) or bool(mask[row, col])
+
+    def route7_layer_segment_blocked(self, mask: np.ndarray, start_cell: Tuple[int, int], target_cell: Tuple[int, int]) -> bool:
+        return any(self.route7_layer_cell_blocked(mask, cell) for cell in self.route7_layer_segment_cells(start_cell, target_cell))
+
+    def route7_nearest_free_layer_cell(self, mask: np.ndarray, cell: Tuple[int, int], *, max_radius: int = 24) -> Optional[Tuple[int, int]]:
+        row, col = int(cell[0]), int(cell[1])
+        height, width = int(mask.shape[0]), int(mask.shape[1])
+        if 0 <= row < height and 0 <= col < width and not bool(mask[row, col]):
+            return row, col
+        for radius in range(1, max(1, int(max_radius)) + 1):
+            candidates: List[Tuple[float, Tuple[int, int]]] = []
+            for rr in range(row - radius, row + radius + 1):
+                for cc in (col - radius, col + radius):
+                    if 0 <= rr < height and 0 <= cc < width and not bool(mask[rr, cc]):
+                        candidates.append((math.hypot(rr - row, cc - col), (rr, cc)))
+            for cc in range(col - radius + 1, col + radius):
+                for rr in (row - radius, row + radius):
+                    if 0 <= rr < height and 0 <= cc < width and not bool(mask[rr, cc]):
+                        candidates.append((math.hypot(rr - row, cc - col), (rr, cc)))
+            if candidates:
+                return min(candidates, key=lambda item: item[0])[1]
+        return None
+
+    def route7_smooth_layer_path(self, mask: np.ndarray, cells: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        if len(cells) <= 2:
+            return cells
+        smoothed: List[Tuple[int, int]] = [cells[0]]
+        anchor = 0
+        while anchor < len(cells) - 1:
+            next_index = len(cells) - 1
+            while next_index > anchor + 1:
+                if not self.route7_layer_segment_blocked(mask, cells[anchor], cells[next_index]):
+                    break
+                next_index -= 1
+            smoothed.append(cells[next_index])
+            anchor = next_index
+        return smoothed
+
+    def route7_layer_nearest_occupied_distance_cm(self, grid: np.ndarray, cell: Tuple[int, int], metadata: Dict[str, Any]) -> Optional[float]:
+        occupied = np.argwhere(np.asarray(grid, dtype=np.int16) >= 100)
+        if occupied.size <= 0:
+            return None
+        row, col = int(cell[0]), int(cell[1])
+        deltas = occupied.astype(np.float64) - np.asarray([[float(row), float(col)]], dtype=np.float64)
+        distances = np.sqrt(np.sum(deltas * deltas, axis=1))
+        resolution_cm = float(metadata.get("resolution_m", 0.25) or 0.25) * 100.0
+        return round(float(np.min(distances)) * resolution_cm, 3)
+
+    def route7_map_route_clearance_report(
+        self,
+        current_pose: Dict[str, Any],
+        target_pose: Dict[str, Any],
+        *,
+        output_dir: Optional[Path] = None,
+        inflation_cells: int = 1,
+    ) -> Dict[str, Any]:
+        layer_record, layer_key, layer_z_cm, _manifest = self.route7_selected_map_layer_record(output_dir)
+        loaded = self.route7_load_layer_occupancy_grid(layer_record)
+        if loaded.get("status") != "ok":
+            return {"status": "unavailable", "reason": str(loaded.get("reason", loaded.get("status", "missing_route7_layer_grid"))), "layer_key": layer_key}
+        metadata = loaded["metadata"]
+        grid = loaded["grid"]
+        current_cell = self.route7_pose_to_layer_cell(metadata, current_pose)
+        target_cell = self.route7_pose_to_layer_cell(metadata, target_pose)
+        if current_cell is None or target_cell is None:
+            return {
+                "status": "outside_layer_grid",
+                "reason": "current_or_target_outside_route7_layer_grid",
+                "layer_key": layer_key,
+                "current_cell": current_cell,
+                "target_cell": target_cell,
+            }
+        mask = self.route7_inflated_occupied_mask(grid, inflation_cells=inflation_cells)
+        segment_cells = self.route7_layer_segment_cells(current_cell, target_cell)
+        blocked_cells = [cell for cell in segment_cells if self.route7_layer_cell_blocked(mask, cell)]
+        nearest_distance = self.route7_layer_nearest_occupied_distance_cm(grid, current_cell, metadata)
+        first_blocked = blocked_cells[0] if blocked_cells else None
+        return {
+            "status": "ok",
+            "layer_key": layer_key,
+            "layer_z_cm": round(float(layer_z_cm), 3),
+            "route_blocked": bool(blocked_cells),
+            "blocked_cell_count": len(blocked_cells),
+            "first_blocked_cell": list(first_blocked) if first_blocked else [],
+            "current_cell": list(current_cell),
+            "target_cell": list(target_cell),
+            "path_sample_count": len(segment_cells),
+            "nearest_occupied_distance_cm": nearest_distance,
+            "inflation_cells": int(inflation_cells),
+        }
+
+    def route7_plan_navigation_waypoints_from_map(
+        self,
+        start_pose: Dict[str, float],
+        target_pose: Dict[str, float],
+        *,
+        output_dir: Optional[Path] = None,
+        stage: str = "",
+        target_id: str = "",
+        target_house_id: str = "",
+        inflation_cells: int = 1,
+    ) -> Dict[str, Any]:
+        layer_record, layer_key, layer_z_cm, _manifest = self.route7_selected_map_layer_record(output_dir)
+        loaded = self.route7_load_layer_occupancy_grid(layer_record)
+        if loaded.get("status") != "ok":
+            return {
+                "status": "fallback",
+                "reason": str(loaded.get("reason", loaded.get("status", "missing_route7_layer_grid"))),
+                "planner_source": "route7_layered_occupancy_astar",
+                "route7_map_route_replan_policy": "map_first_runtime_revalidate",
+                "layer_key": layer_key,
+                "waypoints": [],
+            }
+        metadata = loaded["metadata"]
+        grid = loaded["grid"]
+        mask = self.route7_inflated_occupied_mask(grid, inflation_cells=inflation_cells)
+        start_cell_raw = self.route7_pose_to_layer_cell(metadata, start_pose)
+        target_cell_raw = self.route7_pose_to_layer_cell(metadata, target_pose)
+        if start_cell_raw is None or target_cell_raw is None:
+            return {
+                "status": "fallback",
+                "reason": "start_or_target_outside_route7_layer_grid",
+                "planner_source": "route7_layered_occupancy_astar",
+                "route7_map_route_replan_policy": "map_first_runtime_revalidate",
+                "layer_key": layer_key,
+                "start_cell": list(start_cell_raw) if start_cell_raw else [],
+                "target_cell": list(target_cell_raw) if target_cell_raw else [],
+                "waypoints": [],
+            }
+        start_cell = self.route7_nearest_free_layer_cell(mask, start_cell_raw)
+        target_cell = self.route7_nearest_free_layer_cell(mask, target_cell_raw)
+        if start_cell is None or target_cell is None:
+            return {
+                "status": "blocked",
+                "reason": "route7_map_start_or_target_enclosed",
+                "planner_source": "route7_layered_occupancy_astar",
+                "route7_map_route_replan_policy": "map_first_runtime_revalidate",
+                "layer_key": layer_key,
+                "start_cell": list(start_cell_raw),
+                "target_cell": list(target_cell_raw),
+                "waypoints": [],
+            }
+
+        neighbors = [
+            (-1, -1, math.sqrt(2.0)),
+            (-1, 0, 1.0),
+            (-1, 1, math.sqrt(2.0)),
+            (0, -1, 1.0),
+            (0, 1, 1.0),
+            (1, -1, math.sqrt(2.0)),
+            (1, 0, 1.0),
+            (1, 1, math.sqrt(2.0)),
+        ]
+
+        def node_valid(node: Tuple[int, int]) -> bool:
+            return not self.route7_layer_cell_blocked(mask, node)
+
+        def diagonal_clear(node: Tuple[int, int], dr: int, dc: int) -> bool:
+            if abs(dr) != 1 or abs(dc) != 1:
+                return True
+            return node_valid((node[0] + dr, node[1])) and node_valid((node[0], node[1] + dc))
+
+        open_heap: List[Tuple[float, float, Tuple[int, int]]] = []
+        heapq.heappush(open_heap, (0.0, 0.0, start_cell))
+        came_from: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        best_cost: Dict[Tuple[int, int], float] = {start_cell: 0.0}
+        visited = 0
+        max_visits = min(100000, max(1000, int(mask.size) * 2))
+        found = start_cell == target_cell
+        while open_heap and not found and visited <= max_visits:
+            _priority, cost, node = heapq.heappop(open_heap)
+            if cost > best_cost.get(node, float("inf")) + 1e-6:
+                continue
+            visited += 1
+            for dr, dc, step_cost in neighbors:
+                nxt = (node[0] + dr, node[1] + dc)
+                if not node_valid(nxt) or not diagonal_clear(node, dr, dc):
+                    continue
+                new_cost = cost + step_cost
+                if new_cost + 1e-6 >= best_cost.get(nxt, float("inf")):
+                    continue
+                best_cost[nxt] = new_cost
+                came_from[nxt] = node
+                heuristic = math.hypot(float(target_cell[0] - nxt[0]), float(target_cell[1] - nxt[1]))
+                heapq.heappush(open_heap, (new_cost + heuristic, new_cost, nxt))
+                if nxt == target_cell:
+                    found = True
+                    break
+        if not found:
+            return {
+                "status": "blocked",
+                "reason": "route7_layered_occupancy_astar_no_path",
+                "planner_source": "route7_layered_occupancy_astar",
+                "route7_map_route_replan_policy": "map_first_runtime_revalidate",
+                "layer_key": layer_key,
+                "layer_z_cm": round(float(layer_z_cm), 3),
+                "start_cell": list(start_cell),
+                "target_cell": list(target_cell),
+                "visited": visited,
+                "inflation_cells": int(inflation_cells),
+                "occupied_cell_count": int(np.sum(np.asarray(grid) >= 100)),
+                "waypoints": [],
+            }
+        cells = [target_cell]
+        while cells[-1] != start_cell:
+            cells.append(came_from[cells[-1]])
+        cells.reverse()
+        smooth_cells = self.route7_smooth_layer_path(mask, cells)
+        waypoints: List[Dict[str, Any]] = []
+        previous_pose = dict(start_pose)
+        for idx, cell in enumerate(smooth_cells[1:], start=1):
+            is_last = idx == len(smooth_cells) - 1
+            waypoint = dict(target_pose) if is_last else self.route7_layer_cell_to_pose(
+                metadata,
+                cell,
+                z_cm=float(target_pose.get("z", layer_z_cm) or layer_z_cm),
+                yaw_deg=float(target_pose.get("yaw", start_pose.get("yaw", 0.0)) or 0.0),
+            )
+            if not is_last:
+                dx = float(waypoint.get("x", 0.0)) - float(previous_pose.get("x", 0.0))
+                dy = float(waypoint.get("y", 0.0)) - float(previous_pose.get("y", 0.0))
+                if abs(dx) > 1e-6 or abs(dy) > 1e-6:
+                    waypoint["yaw"] = round(math.degrees(math.atan2(-dy, dx)), 3)
+            waypoint.update(
+                {
+                    "waypoint_index": idx,
+                    "waypoint_final": bool(is_last),
+                    "route_point_type": "navigation_waypoint",
+                    "route7_map_layer_key": layer_key,
+                    "route7_map_cell": list(cell),
+                    "route7_map_route_replan_policy": "map_first_runtime_revalidate",
+                }
+            )
+            waypoints.append(waypoint)
+            previous_pose = waypoint
+        return {
+            "status": "ok",
+            "reason": "route7_layered_occupancy_astar_path",
+            "planner_source": "route7_layered_occupancy_astar",
+            "route7_map_route_replan_policy": "map_first_runtime_revalidate",
+            "layer_key": layer_key,
+            "layer_z_cm": round(float(layer_z_cm), 3),
+            "stage": str(stage or ""),
+            "target_id": str(target_id or ""),
+            "target_house_id": str(target_house_id or ""),
+            "grid_resolution_m": round(float(metadata.get("resolution_m", 0.25) or 0.25), 4),
+            "start_cell": list(start_cell),
+            "target_cell": list(target_cell),
+            "raw_cells": [list(cell) for cell in cells],
+            "smooth_cells": [list(cell) for cell in smooth_cells],
+            "visited": visited,
+            "inflation_cells": int(inflation_cells),
+            "occupied_cell_count": int(np.sum(np.asarray(grid) >= 100)),
+            "inflated_occupied_cell_count": int(np.sum(mask)),
+            "waypoints": waypoints or [dict(target_pose)],
+        }
+
+    def route7_write_navigation_plan_visualization(
+        self,
+        output_dir: Path,
+        plan: Dict[str, Any],
+        *,
+        current_pose: Dict[str, Any],
+        target_pose: Dict[str, Any],
+        target_id: str = "",
+    ) -> Dict[str, Any]:
+        if not isinstance(plan, dict) or str(plan.get("planner_source", "") or "") != "route7_layered_occupancy_astar":
+            return {"status": "skipped", "reason": "not_route7_layered_occupancy_plan"}
+        out_path = Path(output_dir)
+        layer_record, layer_key, _layer_z_cm, _manifest = self.route7_selected_map_layer_record(out_path)
+        loaded = self.route7_load_layer_occupancy_grid(layer_record)
+        if loaded.get("status") != "ok":
+            return {"status": "skipped", "reason": str(loaded.get("reason", loaded.get("status", "missing_layer_grid")))}
+        metadata = loaded["metadata"]
+        grid = np.asarray(loaded["grid"], dtype=np.int16)
+        height, width = grid.shape
+        scale = max(2, min(8, int(900 / max(1, max(width, height)))))
+        preview_path = Path(str(layer_record.get("occupancy_preview_path", "") or ""))
+        if preview_path.is_file():
+            try:
+                image = Image.open(preview_path).convert("RGB")
+                if image.width != width * scale or image.height != height * scale:
+                    image = image.resize((width * scale, height * scale), Image.Resampling.NEAREST)
+            except Exception:
+                image = Image.new("RGB", (width * scale, height * scale), "white")
+        else:
+            image = Image.new("RGB", (width * scale, height * scale), "white")
+            draw_grid = ImageDraw.Draw(image)
+            occupied = np.argwhere(grid >= 100)
+            for row, col in occupied:
+                x0 = int(col) * scale
+                y0 = (height - 1 - int(row)) * scale
+                draw_grid.rectangle((x0, y0, x0 + scale - 1, y0 + scale - 1), fill=(20, 20, 20))
+        draw = ImageDraw.Draw(image)
+
+        def cell_pixel(cell: Any) -> Optional[Tuple[int, int]]:
+            if not isinstance(cell, (list, tuple)) or len(cell) < 2:
+                return None
+            try:
+                row = int(cell[0])
+                col = int(cell[1])
+            except Exception:
+                return None
+            if row < 0 or row >= height or col < 0 or col >= width:
+                return None
+            return int(col * scale + scale / 2), int((height - 1 - row) * scale + scale / 2)
+
+        def pose_pixel(pose: Dict[str, Any]) -> Optional[Tuple[int, int]]:
+            cell = self.route7_pose_to_layer_cell(metadata, pose if isinstance(pose, dict) else {})
+            return cell_pixel(cell) if cell is not None else None
+
+        raw_pixels = [pixel for pixel in (cell_pixel(cell) for cell in plan.get("raw_cells", []) if isinstance(plan.get("raw_cells", []), list)) if pixel is not None]
+        smooth_pixels = [pixel for pixel in (cell_pixel(cell) for cell in plan.get("smooth_cells", []) if isinstance(plan.get("smooth_cells", []), list)) if pixel is not None]
+        if len(raw_pixels) >= 2:
+            draw.line(raw_pixels, fill=(126, 211, 153), width=max(1, scale))
+        if len(smooth_pixels) >= 2:
+            draw.line(smooth_pixels, fill=(0, 128, 64), width=max(2, scale + 1))
+        current_pixel = pose_pixel(current_pose)
+        target_pixel = pose_pixel(target_pose)
+        for pixel, color, label in (
+            (current_pixel, (21, 101, 192), "start"),
+            (target_pixel, (194, 24, 91), "target"),
+        ):
+            if pixel is None:
+                continue
+            radius = max(4, scale * 2)
+            draw.ellipse((pixel[0] - radius, pixel[1] - radius, pixel[0] + radius, pixel[1] + radius), fill=color, outline=(0, 0, 0), width=1)
+            draw.text((pixel[0] + radius + 2, pixel[1] - radius), label, fill=color)
+        for idx, waypoint in enumerate(plan.get("waypoints", []) if isinstance(plan.get("waypoints", []), list) else [], start=1):
+            if not isinstance(waypoint, dict):
+                continue
+            pixel = pose_pixel(waypoint)
+            if pixel is None:
+                continue
+            radius = max(3, scale)
+            draw.rectangle((pixel[0] - radius, pixel[1] - radius, pixel[0] + radius, pixel[1] + radius), outline=(255, 152, 0), width=max(1, scale // 2))
+            draw.text((pixel[0] + radius + 2, pixel[1] + radius + 2), f"wp{idx}", fill=(255, 111, 0))
+        title = f"Route7 planned trajectory {layer_key} target={target_id or plan.get('target_id', '')}"
+        draw.rectangle((0, 0, min(image.width - 1, 560), 22), fill=(255, 255, 255))
+        draw.text((6, 4), title[:92], fill=(0, 0, 0))
+        safe_target = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(target_id or plan.get("target_id", "route7_plan") or "route7_plan")).strip("_") or "route7_plan"
+        vis_dir = out_path / "map"
+        vis_dir.mkdir(parents=True, exist_ok=True)
+        latest_path = vis_dir / "route7_planned_trajectory_latest.png"
+        target_path = vis_dir / f"route7_planned_trajectory_{safe_target}.png"
+        image.save(latest_path)
+        if target_path != latest_path:
+            image.save(target_path)
+        return {
+            "status": "ok",
+            "schema": "route7_planned_trajectory_visualization_v1",
+            "visualization_path": str(latest_path),
+            "target_visualization_path": str(target_path),
+            "layer_key": layer_key,
+            "raw_cell_count": len(raw_pixels),
+            "smooth_cell_count": len(smooth_pixels),
+            "waypoint_count": len([item for item in plan.get("waypoints", []) if isinstance(item, dict)]) if isinstance(plan.get("waypoints", []), list) else 0,
+        }
+
+    def route7_should_use_map_route_planner(self, stage: str, target_id: str = "", *, output_dir: Optional[Path] = None) -> bool:
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        route_label = str(state.get("route_window_label", "") or "").strip().upper()
+        output_text = str(output_dir or state.get("route7_map_output_dir", state.get("output_dir", "")) or "")
+        is_route7 = route_label == "V7" or "llm_route_7_fusion_runs" in output_text.replace("/", "\\")
+        if not is_route7:
+            return False
+        stage_text = str(stage or "").upper()
+        target_text = str(target_id or "").lower()
+        return stage_text == "NAV_TO_SCAN_POINT" or "_z_" in target_text or "map_layer" in target_text
+
+    def route7_local_3d_replan_decision(
+        self,
+        current_pose: Dict[str, Any],
+        target_pose: Dict[str, Any],
+        payload: Dict[str, Any],
+        local_3d_safety: Dict[str, Any],
+        gate: Dict[str, Any],
+        *,
+        output_dir: Optional[Path] = None,
+        stage: str = "",
+        target_id: str = "",
+    ) -> Dict[str, Any]:
+        front_min = self._as_float_or_none((gate if isinstance(gate, dict) else {}).get("front_min_depth_cm"))
+        front_min_cm = float(front_min) if front_min is not None else 0.0
+        must_stop = bool((gate if isinstance(gate, dict) else {}).get("must_stop", False))
+        can_forward = bool((gate if isinstance(gate, dict) else {}).get("can_forward", False))
+        risk_state = str((gate if isinstance(gate, dict) else {}).get("front_risk_state", "") or "")
+        hard_stop_cm = 140.0
+        if must_stop or risk_state == "must_stop" or (front_min_cm > 0.0 and front_min_cm < hard_stop_cm):
+            return {
+                "action": "stop",
+                "reason": "route7_hard_obstacle_stop",
+                "front_min_depth_cm": round(front_min_cm, 3),
+                "risk_state": risk_state,
+                "route7_map_route_replan_policy": "map_first_runtime_revalidate",
+            }
+        clearance = self.route7_map_route_clearance_report(current_pose, target_pose, output_dir=output_dir)
+        action = "replan"
+        reason = "route7_map_route_replan_required"
+        if clearance.get("status") == "ok" and not bool(clearance.get("route_blocked", False)) and can_forward and front_min_cm >= 180.0:
+            action = "continue_cautious"
+            reason = "route7_map_route_clear_local_3d_soft_block"
+        elif clearance.get("status") == "ok" and bool(clearance.get("route_blocked", False)):
+            action = "replan"
+            reason = "route7_map_route_obstacle_replan"
+        return {
+            "action": action,
+            "reason": reason,
+            "front_min_depth_cm": round(front_min_cm, 3),
+            "risk_state": risk_state,
+            "can_forward": can_forward,
+            "must_stop": must_stop,
+            "local_3d_safety": self.route5_json_safe(local_3d_safety),
+            "payload": self.route5_json_safe(payload),
+            "map_route_clearance": self.route5_json_safe(clearance),
+            "route7_map_route_replan_policy": "map_first_runtime_revalidate",
+            "stage": str(stage or ""),
+            "target_id": str(target_id or ""),
+        }
+
+    def route7_or2_soft_obstacle_policy(
+        self,
+        event: Dict[str, Any],
+        gate: Dict[str, Any],
+        current_pose: Dict[str, Any],
+        target_pose: Dict[str, Any],
+        *,
+        output_dir: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        event_dict = event if isinstance(event, dict) else {}
+        stage = str(event_dict.get("route5_stage", event_dict.get("stage", "")) or "")
+        target_id = str(event_dict.get("target_id", "") or "")
+        if output_dir is None:
+            raw_output_dir = str(event_dict.get("route5_output_dir", "") or "")
+            output_dir = Path(raw_output_dir) if raw_output_dir else None
+        if not self.route7_should_use_map_route_planner(stage, target_id, output_dir=output_dir):
+            return {"mode": "not_route7_map_route"}
+        risk_state = str((gate if isinstance(gate, dict) else {}).get("front_risk_state", "") or "").strip().lower()
+        front_min = self._as_float_or_none((gate if isinstance(gate, dict) else {}).get("front_min_depth_cm"))
+        front_min_cm = float(front_min) if front_min is not None else 0.0
+        must_stop = bool((gate if isinstance(gate, dict) else {}).get("must_stop", False))
+        hard_stop_cm = 140.0
+        base = {
+            "schema": "route7_soft_obstacle_policy_v1",
+            "route7_deep_red_only_avoidance": True,
+            "front_min_depth_cm": round(front_min_cm, 3),
+            "front_risk_state": risk_state,
+            "must_stop": must_stop,
+            "hard_stop_cm": hard_stop_cm,
+            "stage": stage,
+            "target_id": target_id,
+        }
+        if must_stop or risk_state == "must_stop" or (front_min_cm > 0.0 and front_min_cm <= hard_stop_cm):
+            return {**base, "mode": "hard_avoidance", "reason": "route7_deep_red_or_hard_stop_obstacle"}
+        clearance = self.route7_map_route_clearance_report(current_pose, target_pose, output_dir=output_dir)
+        base["map_route_clearance"] = self.route5_json_safe(clearance)
+        if clearance.get("status") == "ok" and bool(clearance.get("route_blocked", False)):
+            return {**base, "mode": "replan", "reason": "route7_map_route_obstacle_replan"}
+        return {**base, "mode": "continue_planned_route", "reason": "route7_soft_obstacle_not_deep_red_continue_planned_route"}
+
+    def route7_select_standoff_for_layer_edge(
+        self,
+        bbox: Dict[str, Any],
+        facade: str,
+        axis_value: float,
+        layer_z_cm: float,
+        preferred_standoff_cm: float,
+        layer_record: Dict[str, Any],
+    ) -> Tuple[float, Dict[str, Any]]:
+        preferred = max(80.0, min(1500.0, float(preferred_standoff_cm)))
+        candidates: List[float] = []
+        for raw in (preferred, preferred + 120.0, preferred + 240.0, preferred - 100.0):
+            value = max(80.0, min(1500.0, float(raw)))
+            if all(abs(value - existing) > 1.0 for existing in candidates):
+                candidates.append(value)
+        scored: List[Tuple[int, float, float, Dict[str, Any]]] = []
+        for standoff in candidates:
+            pose = self.route2_facade_pose_from_axis(bbox, facade, float(axis_value), float(standoff), float(layer_z_cm))
+            score = self.route7_layer_pose_occupancy_score(layer_record, pose)
+            occupied = score.get("occupied_cell_count")
+            occupied_count = int(occupied) if occupied is not None else 0
+            scored.append((occupied_count, abs(float(standoff) - preferred), float(standoff), {**score, "candidate_pose": pose}))
+        if not scored:
+            return preferred, {"status": "no_standoff_candidates"}
+        occupied_count, _delta, selected, score = min(scored, key=lambda item: (item[0], item[1], item[2]))
+        score["selected_occupied_cell_count"] = occupied_count
+        score["preferred_standoff_cm"] = round(float(preferred), 2)
+        score["selected_standoff_cm"] = round(float(selected), 2)
+        return float(selected), score
+
+    def route7_build_update_map_after_observation(
+        self,
+        output_dir: Optional[Path],
+        *,
+        facade: str = "",
+        observation: Optional[Dict[str, Any]] = None,
+        rgb_result: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        out_path = Path(output_dir) if output_dir is not None else self.route7_current_map_output_dir()
+        if out_path is None:
+            return {"status": "skipped", "reason": "missing_route7_output_dir"}
+        result: Dict[str, Any] = {"status": "skipped", "reason": "route6_update_map_build_unavailable", "output_dir": str(out_path)}
+        build_map = getattr(self, "route6_update_map_build_from_pointcloud", None)
+        if callable(build_map):
+            result = build_map(out_path) or {}
+            if not result:
+                result = {"status": "empty", "reason": "no_pointcloud_for_observation_map", "output_dir": str(out_path)}
+        result["schema"] = "route7_observation_map_build_v1"
+        result["facade"] = str(facade or "")
+        result["observation"] = self.route5_json_safe(observation or {})
+        result["rgb_status"] = str((rgb_result if isinstance(rgb_result, dict) else {}).get("status", "") or "")
+        result["purpose"] = "observe_house_surroundings_for_same_layer_obstacle_map"
+        result["preferred_layer_key"] = self.route7_default_layer_key()
+        self.route5_update_state(route7_last_observation_map_build=self.route5_json_safe(result))
+        try:
+            self.route6_update_map_request_window_refresh()
+        except Exception:
+            pass
+        try:
+            self.root.after(0, lambda: self.refresh_llm_route7_update_map(build_if_missing=False))
+        except Exception:
+            pass
+        return result
+
+    def route7_plan_facade_map_layer_scan_current(self) -> Dict[str, Any]:
+        state = self.route2_selected_state()
+        output_dir, facade_dir, house_id, facade = self.route2_facade_paths()
+        observation = state.get("observation_point", {}) if isinstance(state.get("observation_point"), dict) else {}
+        bbox = self.house_world_bbox_for_id(house_id)
+        if output_dir is None or facade_dir is None:
+            raise RuntimeError("missing facade output directory")
+        if not house_id or not facade or not observation or not bbox:
+            return {"points": [], "scan_counts": {}, "validation": {"valid": False, "reason": "missing_v7_scan_context"}}
+        analysis = state.get("facade_analysis", {}) if isinstance(state.get("facade_analysis"), dict) else {}
+        layer_record, layer_key, layer_z_cm, manifest = self.route7_selected_map_layer_record(output_dir)
+        preferred_standoff = self._as_float_or_none(observation.get("standoff_cm"))
+        scan_geometry: Dict[str, Any] = {}
+        try:
+            scan_geometry = self.route2_select_scan_geometry(house_id, facade, bbox, analysis or {})
+            preferred_standoff = self._as_float_or_none(scan_geometry.get("standoff_cm")) or preferred_standoff
+        except Exception:
+            scan_geometry = {}
+        if preferred_standoff is None:
+            try:
+                preferred_standoff = float(self.route_scan_standoff_cm())
+            except Exception:
+                preferred_standoff = 650.0
+        safe_intervals = [
+            item for item in scan_geometry.get("safe_intervals", [])
+            if isinstance(item, dict)
+        ] if isinstance(scan_geometry.get("safe_intervals", []), list) else []
+        axis_values = self.route7_axis_values_near_house_edge(bbox, facade, safe_intervals)
+        points: List[Dict[str, Any]] = []
+        for idx, axis_value in enumerate(axis_values, start=1):
+            standoff, occupancy_score = self.route7_select_standoff_for_layer_edge(
+                bbox,
+                facade,
+                float(axis_value),
+                float(layer_z_cm),
+                float(preferred_standoff),
+                layer_record,
+            )
+            pose = self.route2_facade_pose_from_axis(bbox, facade, float(axis_value), float(standoff), float(layer_z_cm))
+            side_label = "near_min_edge" if idx == 1 else "near_max_edge"
+            points.append(
+                {
+                    "scan_id": f"{house_id}_{facade}_{layer_key}_edge_{idx:03d}",
+                    "local_scan_index": idx - 1,
+                    "house_id": house_id,
+                    "facade": facade,
+                    "facade_id": self.route2_facade_id(house_id, facade),
+                    "route_point_type": "map_layer_edge_capture",
+                    "height_band": layer_key,
+                    "floor_index": 1,
+                    "semantic_region": side_label,
+                    "target_score": str(analysis.get("target_score", "medium") or "medium"),
+                    "translation_span": "map_layer_two_edge_points",
+                    "rule_density": "route7_map_layer_two_points",
+                    "planned_facade_sample_count": 2,
+                    "axis_value": round(float(axis_value), 2),
+                    "x": pose["x"],
+                    "y": pose["y"],
+                    "z": pose["z"],
+                    "yaw_deg": pose["yaw_deg"],
+                    "yaw_source": "route7_face_house_edge",
+                    "standoff_cm": round(float(standoff), 2),
+                    "preferred_standoff_cm": round(float(preferred_standoff), 2),
+                    "scan_standoff_mode": "route7_same_layer_obstacle_aware",
+                    "view_type": "route7_map_layer_edge_capture",
+                    "capture_trigger": "arrive_align_hover_capture",
+                    "safe_interval_index": -1,
+                    "safe_interval_count": len(safe_intervals),
+                    "safe_axis_min": round(min(float(value) for value in axis_values), 2),
+                    "safe_axis_max": round(max(float(value) for value in axis_values), 2),
+                    "route7_map_layer_key": layer_key,
+                    "route7_map_layer_z_cm": round(float(layer_z_cm), 2),
+                    "route7_map_guided_capture": True,
+                    "route7_map_layer_point_count": int(layer_record.get("point_count", 0) or 0) if layer_record else 0,
+                    "route7_map_layer_occupied_cell_count": int(layer_record.get("occupied_cell_count", 0) or 0) if layer_record else 0,
+                    "route7_layer_occupancy_score": self.route5_json_safe(occupancy_score),
+                    "route7_observation_purpose": "observation_points_build_obstacle_map_before_edge_capture",
+                    "status": "planned",
+                }
+            )
+        points = self.route2_order_scan_points_continuously(points, start_pose=observation)
+        validation = self.scan_point_validation_report(house_id, points)
+        search_plan = {
+            "schema": "facade_v7_map_layer_edge_scan_plan",
+            "house_id": house_id,
+            "facade": facade,
+            "facade_id": self.route2_facade_id(house_id, facade),
+            "observation_point": observation,
+            "facade_analysis": analysis,
+            "scan_points": points,
+            "scan_point_validation_report": validation,
+            "route7_map_layer_key": layer_key,
+            "route7_map_layer_z_cm": round(float(layer_z_cm), 2),
+            "route7_map_manifest_path": str(manifest.get("manifest_path", "") or ""),
+            "route7_map_layer_source": "selected_layer" if layer_record else "default_300cm_no_manifest",
+            "route7_capture_policy": "two_points_near_house_edge_on_selected_layer",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.write_json_artifact(facade_dir / "facade_search_plan.json", search_plan)
+        merged_points = self.route5_write_merged_scan_points(
+            output_dir,
+            house_id,
+            policy={"source": "route7_map_layer_edge_scan", "layer_key": layer_key, "point_count": len(points)},
+        )
+        self.route2_update_state(facade_analysis=analysis, facade_search_plan=search_plan, facade_scan_points=points, validation_report=validation)
+        self.route5_update_state(
+            current_facade_scan_points=points,
+            route7_last_map_layer_scan_plan={
+                "facade": facade,
+                "layer_key": layer_key,
+                "layer_z_cm": round(float(layer_z_cm), 2),
+                "point_count": len(points),
+                "merged_scan_count": len(merged_points),
+            },
+        )
+        self.route2_write_state_artifact()
+        return {
+            "points": points,
+            "validation": validation,
+            "scan_counts": {"physical_axis_sample_count": len(points), "total_capture_record_count": len(points), "yaw_supplement_record_count": 0},
+            "boundary_policy": {"source": "route7_map_layer_edge_scan", "layer_key": layer_key},
+        }
+
+    def route5_status_label(self) -> str:
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        label = str(state.get("route_window_label", "V5") or "V5").strip().upper()
+        return label if label.startswith("V") else "V5"
+
+    def route5_status_prefix(self) -> str:
+        return f"LLM Route {self.route5_status_label()}"
 
     def route5_float_param(self, var: tk.StringVar, default: float, *, min_value: float, max_value: float) -> float:
         try:
@@ -649,6 +1598,22 @@ class Route5FusionControlMixin:
         (candidate / "facade_observations").mkdir(parents=True, exist_ok=True)
         return candidate
 
+    def make_route7_fused_output_dir(self, target_house_id: str) -> Path:
+        override = getattr(self, "llm_route7_output_root_override", None)
+        root = Path(override) if override is not None else self.resolve_project_path("llm_route_7_fusion_runs")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        safe_house = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(target_house_id or "unknown")).strip("_") or "unknown"
+        base_name = f"house_{safe_house}_autosearch_v7_or2_fused_{timestamp}"
+        root.mkdir(parents=True, exist_ok=True)
+        candidate = root / base_name
+        suffix = 1
+        while candidate.exists():
+            suffix += 1
+            candidate = root / f"{base_name}_{suffix}"
+        for subdir in ("frames", "reconstruction", "facade_observations", "map"):
+            (candidate / subdir).mkdir(parents=True, exist_ok=True)
+        return candidate
+
     def route5_state_output_dir(self) -> Optional[Path]:
         self.ensure_route5_state()
         state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
@@ -868,6 +1833,8 @@ class Route5FusionControlMixin:
             "plan_repair": self.route5_json_safe(event.get("plan_repair", event.get("plan_repair_record", {}))),
             "repair_action": str(event.get("repair_action", "") or ""),
             "repair_reason": str(event.get("repair_reason", "") or ""),
+            "route7_soft_obstacle_policy": self.route5_json_safe(event.get("route7_soft_obstacle_policy", {})),
+            "route7_map_route_replan_request": bool(event.get("route7_map_route_replan_request", False)),
             "nominal_payload": self.route5_json_safe(event.get("nominal_action", event.get("nominal_payload", {}))),
             "selected_action_payload": self.route5_json_safe(event.get("selected_action_payload", {})),
             "final_payload": self.route5_json_safe(final_payload if isinstance(final_payload, dict) else event.get("selected_action_payload", {})),
@@ -882,6 +1849,39 @@ class Route5FusionControlMixin:
         frame_dir.mkdir(parents=True, exist_ok=True)
         self.write_json_artifact(frame_dir / "decision.json", decision)
         self.append_jsonl(output_dir / "route5_frame_decisions.jsonl", decision)
+        is_route7 = (
+            str(event.get("route_window_label", "") or "").strip().upper() == "V7"
+            or "llm_route_7_fusion_runs" in str(output_dir).replace("/", "\\")
+            or bool(decision.get("route7_soft_obstacle_policy", {}))
+        )
+        if is_route7:
+            concise = {
+                "schema": "route7_decision_log_v1",
+                "frame_id": frame_id,
+                "created_at": decision["created_at"],
+                "stage": decision["stage"],
+                "facade": decision["facade"],
+                "target_id": decision["target_id"],
+                "current_pose": decision["current_pose"],
+                "target_pose": decision["target_pose"],
+                "front_depth_cm": decision["front_depth_cm"],
+                "distance_to_goal_cm": decision["distance_to_goal_cm"],
+                "risk_state": decision["or2"]["front_risk_state"],
+                "can_forward": decision["or2"]["can_forward"],
+                "must_stop": decision["or2"]["must_stop"],
+                "or2_selected_direction": decision["or2"]["selected_direction"],
+                "selected_action": decision["selected_action"],
+                "selected_action_payload": decision["selected_action_payload"],
+                "final_payload": decision["final_payload"],
+                "reason": decision["selected_action_reason"] or decision["decision_reason"],
+                "or2_rule_reason": decision["or2"]["rule_reason"],
+                "rejected_reason": decision["or2_selected_action_rejected_reason"],
+                "safe_alternative_action": decision["safe_alternative_action"],
+                "route7_soft_obstacle_policy": decision["route7_soft_obstacle_policy"],
+                "route7_map_route_replan_request": decision["route7_map_route_replan_request"],
+                "collision_state": decision["collision_state"],
+            }
+            self.append_jsonl(output_dir / "route7_frame_decision_log.jsonl", concise)
         return decision
 
     def route5_write_safety_blocked_frame_decision(
@@ -1086,27 +2086,43 @@ class Route5FusionControlMixin:
             if error:
                 self.root.after(0, lambda e=error: self.llm_route5_error_var.set(f"Error: {e.get('reason', e.get('status', 'CHECK'))}"))
             if message:
-                self.root.after(0, lambda m=message: self.llm_route5_status_var.set(f"LLM Route V5: {m}"))
+                self.root.after(0, lambda m=message, p=self.route5_status_prefix(): self.llm_route5_status_var.set(f"{p}: {m}"))
         except Exception:
             pass
 
-    def route5_initialize_run(self, target_house_id: str, *, force_new: bool = False) -> Path:
+    def route5_initialize_run(
+        self,
+        target_house_id: str,
+        *,
+        force_new: bool = False,
+        output_dir_override: Optional[Path] = None,
+        route_window_label: str = "V5",
+    ) -> Path:
         self.ensure_route5_state()
         current = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
         current_target = str(current.get("target_house_id", "") or "")
         output_dir = self.route5_state_output_dir()
         created_new_run = False
-        if force_new or output_dir is None or current_target != str(target_house_id):
+        label = str(route_window_label or "V5").strip().upper() or "V5"
+        if force_new or output_dir_override is not None or output_dir is None or current_target != str(target_house_id):
             created_new_run = True
-            output_dir = self.make_route5_fused_output_dir(target_house_id)
+            output_dir = Path(output_dir_override) if output_dir_override is not None else (
+                self.make_route7_fused_output_dir(target_house_id) if label == "V7" else self.make_route5_fused_output_dir(target_house_id)
+            )
+            for subdir in ("frames", "reconstruction", "facade_observations"):
+                (output_dir / subdir).mkdir(parents=True, exist_ok=True)
+            if label == "V7":
+                (output_dir / "map").mkdir(parents=True, exist_ok=True)
             self.route5_local_obstacle_map = LocalObstacleMap(self.route5_local_obstacle_config())
             self.route5_local_obstacle_output_dir = output_dir
             self.llm_route5_completed_facades = set()
             self.llm_route5_blocked_facades = set()
             self.llm_route5_state = {
-                "mode": "route5_llm_route_oa3_or2_fusion",
+                "mode": "route7_llm_route_oa3_or2_fusion" if label == "V7" else "route5_llm_route_oa3_or2_fusion",
+                "route_window_label": label,
                 "target_house_id": target_house_id,
                 "output_dir": str(output_dir),
+                "route7_map_output_dir": str(output_dir) if label == "V7" else "",
                 "stage": "INIT_RUN",
                 "nav_config": self.route5_nav_config(),
                 "sensing_config": self.route5_sensing_config(),
@@ -3382,6 +4398,22 @@ class Route5FusionControlMixin:
         depth_summary = event.get("pointcloud_summary", {}) if isinstance(event.get("pointcloud_summary"), dict) else {}
         output_dir_value = event.get("route5_output_dir") if isinstance(event, dict) else None
         output_dir = Path(str(output_dir_value)) if output_dir_value else getattr(self, "route5_local_obstacle_output_dir", None)
+        route7_policy = gate.get("route7_soft_obstacle_policy", {}) if isinstance(gate.get("route7_soft_obstacle_policy", {}), dict) else {}
+        if not route7_policy or str(route7_policy.get("mode", "") or "") == "not_route7_map_route":
+            route7_policy = self.route7_or2_soft_obstacle_policy(event, gate, current_pose, target_pose, output_dir=output_dir)
+        route7_policy_mode = str(route7_policy.get("mode", "") or "")
+        if route7_policy_mode == "replan":
+            return {
+                "direction": "route7_replan",
+                "payload": action_payload("hold"),
+                "selected_action": "route7_map_route_replan_required",
+                "reason_suffix": f"; {route7_policy.get('reason', 'route7_map_route_replan_required')}",
+                "candidate_safety_scores": {},
+                "safe_alternative_action": "",
+                "or2_selected_action_rejected_reason": "route7_map_route_replan_required",
+                "route7_soft_obstacle_policy": self.route5_json_safe(route7_policy),
+                "route7_map_route_replan_request": True,
+            }
         for direction in self.route5_or2_candidate_order(selected):
             payload = self.route5_or2_direction_payload(direction, nominal_payload, config)
             predicted = self.route3_predict_next_pose(current_pose, payload)
@@ -3431,7 +4463,31 @@ class Route5FusionControlMixin:
                     selected_rejected_reason = safety_reason
                 elif not risk_ok:
                     selected_rejected_reason = "or2_risk_not_acceptable"
+                if (
+                    route7_policy_mode == "continue_planned_route"
+                    and direction in {"forward", "slow_forward"}
+                    and selected_rejected_reason
+                ):
+                    continue_direction = "slow_forward" if direction == "forward" else direction
+                    continue_payload = self.route5_or2_direction_payload(continue_direction, nominal_payload, config)
+                    reason_suffix = (
+                        f"; {route7_policy.get('reason', 'route7_soft_obstacle_not_deep_red_continue_planned_route')} "
+                        f"selected_or2_action={selected or 'unknown'} soft_rejected={selected_rejected_reason} "
+                        f"continue={continue_direction}"
+                    )
+                    return {
+                        "direction": continue_direction,
+                        "payload": continue_payload,
+                        "selected_action": str(continue_payload.get("action_name", continue_direction)),
+                        "reason_suffix": reason_suffix,
+                        "candidate_safety_scores": candidate_scores,
+                        "safe_alternative_action": "" if continue_direction == selected else continue_direction,
+                        "or2_selected_action_rejected_reason": selected_rejected_reason,
+                        "route7_soft_obstacle_policy": self.route5_json_safe(route7_policy),
+                    }
             if safe and risk_ok:
+                if route7_policy_mode == "continue_planned_route" and direction not in {"forward", "slow_forward", selected}:
+                    continue
                 if direction == selected:
                     return {
                         "direction": selected_direction,
@@ -3441,6 +4497,7 @@ class Route5FusionControlMixin:
                         "candidate_safety_scores": candidate_scores,
                         "safe_alternative_action": "",
                         "or2_selected_action_rejected_reason": "",
+                        "route7_soft_obstacle_policy": self.route5_json_safe(route7_policy),
                     }
                 reason_suffix = (
                     f"; selected_or2_action={selected or 'unknown'} rejected="
@@ -3455,6 +4512,7 @@ class Route5FusionControlMixin:
                     "candidate_safety_scores": candidate_scores,
                     "safe_alternative_action": direction,
                     "or2_selected_action_rejected_reason": selected_rejected_reason or str(selected_safety.get("reason", "unsafe_or2_action") or "unsafe_or2_action"),
+                    "route7_soft_obstacle_policy": self.route5_json_safe(route7_policy),
                 }
         return {
             "direction": selected_direction,
@@ -3464,6 +4522,7 @@ class Route5FusionControlMixin:
             "candidate_safety_scores": candidate_scores,
             "safe_alternative_action": "",
             "or2_selected_action_rejected_reason": selected_rejected_reason,
+            "route7_soft_obstacle_policy": self.route5_json_safe(route7_policy),
         }
 
     def route5_depth_pointcloud_fallback_decision(
@@ -3560,6 +4619,22 @@ class Route5FusionControlMixin:
             "selected_direction": selected_direction,
             "reason": reason,
         }
+        route7_policy = self.route7_or2_soft_obstacle_policy(event, gate, current_pose, target_pose)
+        if str(route7_policy.get("mode", "") or "") == "continue_planned_route":
+            active = False
+            gate["avoidance_active"] = False
+            gate["route7_deep_red_only_avoidance"] = True
+            gate["route7_soft_obstacle_policy"] = self.route5_json_safe(route7_policy)
+            gate["reason"] = f"{reason}; {route7_policy.get('reason', 'route7_soft_obstacle_not_deep_red_continue_planned_route')}"
+        elif str(route7_policy.get("mode", "") or "") == "replan":
+            active = True
+            gate["avoidance_active"] = True
+            gate["route7_map_route_replan_request"] = True
+            gate["route7_soft_obstacle_policy"] = self.route5_json_safe(route7_policy)
+            gate["reason"] = f"{reason}; {route7_policy.get('reason', 'route7_map_route_replan_required')}"
+        elif str(route7_policy.get("mode", "") or "") == "hard_avoidance":
+            gate["route7_deep_red_only_avoidance"] = True
+            gate["route7_soft_obstacle_policy"] = self.route5_json_safe(route7_policy)
         alternative = self.route5_apply_or2_safe_alternative(
             event=event,
             gate=gate,
@@ -3581,6 +4656,10 @@ class Route5FusionControlMixin:
             gate["safe_alternative_action"] = str(alternative.get("safe_alternative_action", "") or "")
             gate["or2_selected_action_rejected_reason"] = str(alternative.get("or2_selected_action_rejected_reason", "") or "")
             gate["candidate_safety_scores"] = self.route5_json_safe(alternative.get("candidate_safety_scores", {}))
+        if alternative.get("route7_soft_obstacle_policy"):
+            gate["route7_soft_obstacle_policy"] = self.route5_json_safe(alternative.get("route7_soft_obstacle_policy", {}))
+        if alternative.get("route7_map_route_replan_request"):
+            gate["route7_map_route_replan_request"] = True
         selected_action = str(payload.get("action_name", selected_direction))
         phase = "OR2_AVOIDANCE" if active else "ROUTE_NAVIGATION"
         event_updates = {
@@ -3596,6 +4675,8 @@ class Route5FusionControlMixin:
             "or2_selected_action_rejected_reason": str(alternative.get("or2_selected_action_rejected_reason", "") or ""),
             "safe_alternative_action": str(alternative.get("safe_alternative_action", "") or ""),
             "candidate_safety_scores": self.route5_json_safe(alternative.get("candidate_safety_scores", {})),
+            "route7_soft_obstacle_policy": self.route5_json_safe(alternative.get("route7_soft_obstacle_policy", gate.get("route7_soft_obstacle_policy", {}))),
+            "route7_map_route_replan_request": bool(alternative.get("route7_map_route_replan_request", gate.get("route7_map_route_replan_request", False))),
             "or2_risk_overlay_path": str(prediction.get("risk_overlay_path", "") or ""),
             "or2_prediction_json_path": str(prediction.get("prediction_json_path", "") or ""),
             "avoidance_gate": gate,
@@ -4740,6 +5821,35 @@ class Route5FusionControlMixin:
                         ),
                     )
                     self.route5_update_state(last_obstacle_event=self.route5_json_safe(event), last_or2_event=self.route5_json_safe(event), avoidance_active=bool(gate.get("avoidance_active", False)))
+                    if bool(event.get("route7_map_route_replan_request", False)) or bool(gate.get("route7_map_route_replan_request", False)):
+                        reason = "route7_map_route_replan_required"
+                        event["avoidance_active"] = True
+                        event["selected_action"] = "route7_map_route_replan_required"
+                        event["selected_action_reason"] = str(
+                            (event.get("route7_soft_obstacle_policy", {}) if isinstance(event.get("route7_soft_obstacle_policy", {}), dict) else {}).get("reason", reason)
+                            or reason
+                        )
+                        event["selected_action_payload"] = action_payload("hold")
+                        event["final_payload"] = action_payload("hold")
+                        event = self.route5_normalize_avoidance_event(event)
+                        self.route5_write_frame_decision(output_dir, event, final_payload=action_payload("hold"))
+                        self.append_jsonl(output_dir / "avoidance_events.jsonl", self.route5_json_safe(event))
+                        self.route5_write_avoidance_summary(output_dir, status="running")
+                        self.route5_hold(session, output_dir=output_dir, reason=reason)
+                        self.route5_log_event(output_dir, "route7_map_route_replan_required", {"stage": stage, "facade": facade, "target_id": target_id, "event": self.route5_json_safe(event)})
+                        return {
+                            "status": "blocked",
+                            "reason": reason,
+                            "stage": stage,
+                            "facade": facade,
+                            "target_id": target_id,
+                            "final_target_id": target_id,
+                            "final_target_pose": target_pose,
+                            "target_reset_count": reset_count,
+                            "pose_error": error,
+                            "route7_soft_obstacle_policy": self.route5_json_safe(event.get("route7_soft_obstacle_policy", {})),
+                            "current_pose": current,
+                        }
                 except Exception as exc:
                     self.route5_log_event(output_dir, "obstacle_sensing_failed", {"error": str(exc), "stage": stage, "target_id": target_id})
                     self.root.after(0, lambda e=exc: self.llm_route5_avoidance_status_var.set(f"Avoidance: fallback navigation ({e})"))
@@ -4801,32 +5911,81 @@ class Route5FusionControlMixin:
                 }
             if not bool(local_3d_safety.get("safe", True)):
                 reason = str(local_3d_safety.get("reason", "local_3d_occupancy_blocked") or "local_3d_occupancy_blocked")
-                if event:
-                    event["local_3d_safety"] = local_3d_safety
-                    event["avoidance_active"] = True
-                    event["selected_action"] = "route5_local_3d_safety_hold"
-                    event["selected_action_reason"] = reason
-                    event["selected_action_payload"] = action_payload("hold")
-                    event["final_payload"] = action_payload("hold")
-                    event = self.route5_normalize_avoidance_event(event)
-                    self.route5_write_frame_decision(output_dir, event, final_payload=action_payload("hold"))
-                    self.append_jsonl(output_dir / "avoidance_events.jsonl", self.route5_json_safe(event))
-                    self.route5_write_avoidance_summary(output_dir, status="running")
-                self.route5_hold(session, output_dir=output_dir, reason=reason)
-                self.route5_log_event(output_dir, "local_3d_navigation_blocked", trace)
-                return {
-                    "status": "blocked",
-                    "reason": reason,
-                    "stage": stage,
-                    "facade": facade,
-                    "target_id": target_id,
-                    "final_target_id": target_id,
-                    "final_target_pose": target_pose,
-                    "target_reset_count": reset_count,
-                    "pose_error": error,
-                    "local_3d_safety": local_3d_safety,
-                    "current_pose": current,
-                }
+                route7_decision: Dict[str, Any] = {}
+                if self.route7_should_use_map_route_planner(stage, target_id, output_dir=output_dir):
+                    route7_decision = self.route7_local_3d_replan_decision(
+                        current,
+                        target_pose,
+                        payload,
+                        local_3d_safety,
+                        event.get("avoidance_gate", event) if isinstance(event, dict) else {},
+                        output_dir=output_dir,
+                        stage=stage,
+                        target_id=target_id,
+                    )
+                    trace["route7_local_3d_replan_decision"] = route7_decision
+                    if event:
+                        event["route7_local_3d_replan_decision"] = route7_decision
+                    if str(route7_decision.get("action", "") or "") == "continue_cautious":
+                        self.route5_log_event(output_dir, "route7_local_3d_continue_cautious", trace)
+                    elif str(route7_decision.get("action", "") or "") == "replan":
+                        reason = "route7_map_route_replan_required"
+                        if event:
+                            event["local_3d_safety"] = local_3d_safety
+                            event["avoidance_active"] = True
+                            event["selected_action"] = "route7_map_route_replan_required"
+                            event["selected_action_reason"] = str(route7_decision.get("reason", reason) or reason)
+                            event["selected_action_payload"] = action_payload("hold")
+                            event["final_payload"] = action_payload("hold")
+                            event = self.route5_normalize_avoidance_event(event)
+                            self.route5_write_frame_decision(output_dir, event, final_payload=action_payload("hold"))
+                            self.append_jsonl(output_dir / "avoidance_events.jsonl", self.route5_json_safe(event))
+                            self.route5_write_avoidance_summary(output_dir, status="running")
+                        self.route5_hold(session, output_dir=output_dir, reason=reason)
+                        self.route5_log_event(output_dir, "route7_map_route_replan_required", trace)
+                        return {
+                            "status": "blocked",
+                            "reason": reason,
+                            "stage": stage,
+                            "facade": facade,
+                            "target_id": target_id,
+                            "final_target_id": target_id,
+                            "final_target_pose": target_pose,
+                            "target_reset_count": reset_count,
+                            "pose_error": error,
+                            "local_3d_safety": local_3d_safety,
+                            "route7_local_3d_replan_decision": route7_decision,
+                            "current_pose": current,
+                        }
+                if str(route7_decision.get("action", "") or "") == "continue_cautious":
+                    pass
+                else:
+                    if event:
+                        event["local_3d_safety"] = local_3d_safety
+                        event["avoidance_active"] = True
+                        event["selected_action"] = "route5_local_3d_safety_hold"
+                        event["selected_action_reason"] = reason
+                        event["selected_action_payload"] = action_payload("hold")
+                        event["final_payload"] = action_payload("hold")
+                        event = self.route5_normalize_avoidance_event(event)
+                        self.route5_write_frame_decision(output_dir, event, final_payload=action_payload("hold"))
+                        self.append_jsonl(output_dir / "avoidance_events.jsonl", self.route5_json_safe(event))
+                        self.route5_write_avoidance_summary(output_dir, status="running")
+                    self.route5_hold(session, output_dir=output_dir, reason=reason)
+                    self.route5_log_event(output_dir, "local_3d_navigation_blocked", trace)
+                    return {
+                        "status": "blocked",
+                        "reason": reason,
+                        "stage": stage,
+                        "facade": facade,
+                        "target_id": target_id,
+                        "final_target_id": target_id,
+                        "final_target_pose": target_pose,
+                        "target_reset_count": reset_count,
+                        "pose_error": error,
+                        "local_3d_safety": local_3d_safety,
+                        "current_pose": current,
+                    }
             result = self.safe("Route V5 fused movement tick", lambda p=payload: session.move_relative(p))
             if not isinstance(result, dict):
                 self.route5_hold(session, output_dir=output_dir, reason="movement_failed")
@@ -4915,7 +6074,22 @@ class Route5FusionControlMixin:
                     "replan_count": replan_count,
                     "elapsed_s": round(time.time() - started_at, 3),
                 }
-            plan = self.route3_plan_navigation_waypoints(current, target_pose, target_house_id, grid_cm=float(LLM_ROUTE3_ASTAR_GRID_CM))
+            if self.route7_should_use_map_route_planner(stage, target_id, output_dir=output_dir):
+                route7_plan = self.route7_plan_navigation_waypoints_from_map(
+                    current,
+                    target_pose,
+                    output_dir=output_dir,
+                    stage=stage,
+                    target_id=target_id,
+                    target_house_id=target_house_id,
+                )
+                if route7_plan.get("status") == "fallback":
+                    plan = self.route3_plan_navigation_waypoints(current, target_pose, target_house_id, grid_cm=float(LLM_ROUTE3_ASTAR_GRID_CM))
+                    plan["route7_map_plan_fallback"] = self.route5_json_safe(route7_plan)
+                else:
+                    plan = route7_plan
+            else:
+                plan = self.route3_plan_navigation_waypoints(current, target_pose, target_house_id, grid_cm=float(LLM_ROUTE3_ASTAR_GRID_CM))
             plan_log = {
                 "stage": stage,
                 "facade": facade,
@@ -4926,6 +6100,17 @@ class Route5FusionControlMixin:
                 "plan": plan,
                 "created_at": datetime.now().isoformat(timespec="milliseconds"),
             }
+            if str(plan.get("planner_source", "") or "") == "route7_layered_occupancy_astar":
+                visual = self.route7_write_navigation_plan_visualization(
+                    output_dir,
+                    plan,
+                    current_pose=current,
+                    target_pose=target_pose,
+                    target_id=target_id,
+                )
+                plan_log["route7_plan_visualization"] = self.route5_json_safe(visual)
+                if visual.get("status") == "ok":
+                    plan["route7_plan_visualization_path"] = str(visual.get("visualization_path", "") or "")
             self.append_jsonl(output_dir / "route5_navigation_plan.jsonl", plan_log)
             self.route5_log_event(output_dir, "navigation_plan", plan_log)
             self.route5_update_state(current_navigation_plan=self.route5_json_safe(plan_log))
@@ -5065,16 +6250,48 @@ class Route5FusionControlMixin:
         self.route5_write_avoidance_summary(output_dir, status=status)
         return summary
 
-    def route5_full_search_worker(self, session: flight.DroneFlightSession, *, single_facade: bool = False, force_new: bool = False) -> None:
+    def route5_full_search_worker(
+        self,
+        session: flight.DroneFlightSession,
+        *,
+        single_facade: bool = False,
+        force_new: bool = False,
+        observation_z_cm: Optional[float] = None,
+        route_window_label: str = "V5",
+        output_dir_override: Optional[Path] = None,
+    ) -> None:
         self.ensure_route5_state()
+        previous_observation_z = getattr(self, "route_observation_z_override_cm", None)
+        had_previous_observation_z = hasattr(self, "route_observation_z_override_cm")
+        observation_z = None
+        try:
+            if observation_z_cm is not None:
+                observation_z = max(80.0, min(900.0, float(observation_z_cm)))
+                self.route_observation_z_override_cm = observation_z
+        except Exception:
+            observation_z = None
         selected_target_house_id = self.selected_route_target_house_id()
         if not selected_target_house_id:
-            self.root.after(0, lambda: self.llm_route5_status_var.set("LLM Route V5: select a target house first."))
+            self.root.after(0, lambda p=self.route5_status_prefix(): self.llm_route5_status_var.set(f"{p}: select a target house first."))
+            if had_previous_observation_z:
+                self.route_observation_z_override_cm = previous_observation_z
+            elif hasattr(self, "route_observation_z_override_cm"):
+                delattr(self, "route_observation_z_override_cm")
             return
         output_dir: Optional[Path] = None
         status = "done"
         try:
-            output_dir = self.route5_initialize_run(selected_target_house_id, force_new=force_new)
+            output_dir = self.route5_initialize_run(
+                selected_target_house_id,
+                force_new=force_new,
+                output_dir_override=output_dir_override,
+                route_window_label=route_window_label,
+            )
+            self.route5_update_state(
+                route_window_label=str(route_window_label or "V5").strip().upper() or "V5",
+                observation_z_override_cm=observation_z,
+                route7_map_output_dir=str(output_dir) if str(route_window_label or "").strip().upper() == "V7" else self.llm_route5_state.get("route7_map_output_dir", ""),
+            )
             self.route5_set_stage("TASK_ANALYSIS", output_dir=output_dir, message=f"analyzing task for selected house={selected_target_house_id}")
             task_plan = self.route5_analyze_task_plan(selected_target_house_id, output_dir=output_dir)
             target_house_id = str(task_plan.get("target_house_id", selected_target_house_id) or selected_target_house_id)
@@ -5331,11 +6548,26 @@ class Route5FusionControlMixin:
                 rgb_result = self.route3_capture_facade_rgb_current(session, output_dir=output_dir, facade_dir=facade_dir, house_id=target_house_id, facade=facade, planned_pose=obs_pose)
                 self.route5_log_event(output_dir, "facade_rgb_capture", rgb_result)
                 self.root.after(0, self.refresh_route5_support_views)
-                self.route5_set_stage("ANALYZE_VLM", output_dir=output_dir, facade=facade, message=f"analyzing {facade} facade")
-                self.route2_analyze_facade_vlm_worker()
-                self.root.after(0, self.refresh_route5_support_views)
-                self.route5_set_stage("PLAN_SCAN", output_dir=output_dir, facade=facade, message=f"planning {facade} scan")
-                plan_result = self.route5_plan_facade_scan_current()
+                if str(route_window_label or "").strip().upper() == "V7":
+                    self.route5_set_stage("BUILD_OBSTACLE_MAP", output_dir=output_dir, facade=facade, target=obs_pose, message=f"building {facade} obstacle map from observation")
+                    map_build = self.route7_build_update_map_after_observation(
+                        output_dir,
+                        facade=facade,
+                        observation=observation if isinstance(observation, dict) else {},
+                        rgb_result=rgb_result if isinstance(rgb_result, dict) else {},
+                    )
+                    self.route5_log_event(output_dir, "route7_observation_map_build", map_build)
+                    fallback_analysis = self.route2_fallback_facade_analysis("Route V7 uses selected layered occupancy map for direct house-edge capture.")
+                    self.route2_update_state(facade_analysis=fallback_analysis)
+                    self.route2_write_state_artifact()
+                    self.route5_set_stage("PLAN_MAP_LAYER_SCAN", output_dir=output_dir, facade=facade, message=f"planning {facade} map-layer edge capture")
+                    plan_result = self.route7_plan_facade_map_layer_scan_current()
+                else:
+                    self.route5_set_stage("ANALYZE_VLM", output_dir=output_dir, facade=facade, message=f"analyzing {facade} facade")
+                    self.route2_analyze_facade_vlm_worker()
+                    self.root.after(0, self.refresh_route5_support_views)
+                    self.route5_set_stage("PLAN_SCAN", output_dir=output_dir, facade=facade, message=f"planning {facade} scan")
+                    plan_result = self.route5_plan_facade_scan_current()
                 points = [point for point in plan_result.get("points", []) if isinstance(point, dict)]
                 scan_counts = plan_result.get("scan_counts", {}) if isinstance(plan_result.get("scan_counts"), dict) else {}
                 self.route5_log_event(
@@ -5356,8 +6588,8 @@ class Route5FusionControlMixin:
                     total_records = int(scan_counts.get("total_capture_record_count", len(points)) or len(points))
                     self.root.after(
                         0,
-                        lambda f=facade, p=physical, t=total_records: self.llm_route5_status_var.set(
-                            f"LLM Route V5: planned {f} scan physical={p} capture/yaw={t}"
+                        lambda f=facade, p=physical, t=total_records, prefix=self.route5_status_prefix(): self.llm_route5_status_var.set(
+                            f"{prefix}: planned {f} scan physical={p} capture/yaw={t}"
                         ),
                     )
                 if not points:
@@ -5595,16 +6827,20 @@ class Route5FusionControlMixin:
             self.route5_set_stage(final_stage, output_dir=output_dir, message=f"fused autosearch {status}")
             summary = self.route5_run_summary(output_dir, status=status)
             self.route5_log_event(output_dir, "summary", summary)
-            self.root.after(0, lambda s=status, d=output_dir: self.llm_route5_status_var.set(f"LLM Route V5: {s} -> {d}"))
+            self.root.after(0, lambda s=status, d=output_dir, p=self.route5_status_prefix(): self.llm_route5_status_var.set(f"{p}: {s} -> {d}"))
             self.root.after(0, self.refresh_route5_support_views)
         except Exception as exc:
             LOGGER.warning("Route V5 fused autosearch failed: %s", exc)
             if output_dir is not None:
                 self.route5_log_event(output_dir, "error", {"reason": str(exc)})
                 self.route5_run_summary(output_dir, status="failed")
-            self.root.after(0, lambda e=exc: self.llm_route5_status_var.set(f"LLM Route V5: failed: {e}"))
+            self.root.after(0, lambda e=exc, p=self.route5_status_prefix(): self.llm_route5_status_var.set(f"{p}: failed: {e}"))
         finally:
             self.route5_set_control_lock(False)
+            if had_previous_observation_z:
+                self.route_observation_z_override_cm = previous_observation_z
+            elif hasattr(self, "route_observation_z_override_cm"):
+                delattr(self, "route_observation_z_override_cm")
 
     def refresh_route5_preview(self) -> None:
         preview_text = getattr(self, "llm_route5_preview_text", None)
@@ -6613,12 +7849,50 @@ class Route5FusionControlMixin:
         self.route5_or2_report_text.grid(row=0, column=1, sticky="ew")
         return monitor
 
-    def _build_llm_route5_section(self, parent: tk.Misc) -> tk.LabelFrame:
+    def route5_fixed_status_label(
+        self,
+        parent: tk.Misc,
+        textvariable: Any,
+        *,
+        row: int,
+        column: int,
+        width_px: int,
+        height_px: int,
+        columnspan: int = 1,
+        padx: Any = 0,
+        pady: Any = 0,
+        sticky: str = "ew",
+    ) -> tk.Label:
+        frame = tk.Frame(parent, width=max(40, int(width_px)), height=max(20, int(height_px)))
+        frame.grid(row=row, column=column, columnspan=columnspan, sticky=sticky, padx=padx, pady=pady)
+        frame.grid_propagate(False)
+        label = tk.Label(
+            frame,
+            textvariable=textvariable,
+            anchor="nw",
+            justify="left",
+            wraplength=max(20, int(width_px) - 8),
+        )
+        label.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+        return label
+
+    def _build_llm_route5_section(
+        self,
+        parent: tk.Misc,
+        *,
+        route_label: str = "V5",
+        start_command: Optional[Any] = None,
+        step_command: Optional[Any] = None,
+        stop_command: Optional[Any] = None,
+    ) -> tk.LabelFrame:
         self.ensure_route5_state()
-        route = tk.LabelFrame(parent, text="LLM House Entrance Route V5 Fused Route + Avoidance")
+        label = str(route_label or "V5").strip().upper() or "V5"
+        route = tk.LabelFrame(parent, text=f"LLM House Entrance Route {label} Fused Route + Avoidance")
         for col in (1, 3, 5):
             route.grid_columnconfigure(col, weight=1)
-        route.grid_rowconfigure(9, weight=1)
+        route.grid_rowconfigure(7, minsize=132)
+        route.grid_rowconfigure(8, minsize=34)
+        route.grid_rowconfigure(9, minsize=156, weight=0)
         tk.Label(route, text="Target House").grid(row=0, column=0, sticky="w", padx=6, pady=6)
         combo = ttk.Combobox(route, textvariable=self.llm_route_target_var, values=list(self.house_choice_map.keys()), state="readonly", width=22)
         combo.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
@@ -6674,30 +7948,37 @@ class Route5FusionControlMixin:
 
         actions = tk.Frame(route)
         actions.grid(row=6, column=0, columnspan=6, sticky="ew", padx=0, pady=(0, 4))
-        tk.Button(actions, text="Start Fused Route+Avoidance", command=self.on_route5_start_fused_search).pack(side="left", padx=6, pady=4)
-        tk.Button(actions, text="Step Facade", command=self.on_route5_step_facade).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Start Fused Route+Avoidance", command=start_command or self.on_route5_start_fused_search).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Step Facade", command=step_command or self.on_route5_step_facade).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Pause/Resume", command=self.on_route5_toggle_pause).pack(side="left", padx=6, pady=4)
-        tk.Button(actions, text="Stop", command=self.on_route5_stop).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text="Stop", command=stop_command or self.on_route5_stop).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Clear", command=self.on_route5_clear).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Validate Run", command=self.on_route5_validate_run).pack(side="left", padx=6, pady=4)
-        tk.Button(actions, text="Analyze V5 Captures", command=self.open_route5_capture_analysis_window).pack(side="left", padx=6, pady=4)
+        tk.Button(actions, text=f"Analyze {label} Captures", command=self.open_route5_capture_analysis_window).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Global Pause All", command=self.on_route5_global_pause_all).pack(side="left", padx=6, pady=4)
         tk.Button(actions, text="Release Movement", command=self.on_route5_release_movement).pack(side="left", padx=6, pady=4)
 
         status = tk.Frame(route)
         status.grid(row=7, column=0, columnspan=6, sticky="ew", padx=6, pady=(0, 4))
+        status.configure(height=132)
+        status.grid_propagate(False)
         status.grid_columnconfigure(1, weight=1)
-        tk.Label(status, textvariable=self.llm_route5_stage_var, anchor="w", wraplength=240, justify="left").grid(row=0, column=0, sticky="w", padx=(0, 12))
-        tk.Label(status, textvariable=self.llm_route5_target_var, anchor="w", wraplength=520, justify="left").grid(row=0, column=1, sticky="ew", padx=(0, 12))
-        tk.Label(status, textvariable=self.llm_route5_error_var, anchor="w", wraplength=360, justify="left").grid(row=0, column=2, sticky="w")
-        tk.Label(status, textvariable=self.llm_route5_payload_var, anchor="w", wraplength=980, justify="left").grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 0))
-        tk.Label(status, textvariable=self.llm_route5_avoidance_status_var, anchor="w", wraplength=980, justify="left").grid(row=2, column=0, columnspan=3, sticky="ew", pady=(2, 0))
-        tk.Label(status, textvariable=self.llm_route5_representation_status_var, anchor="w", wraplength=980, justify="left").grid(row=3, column=0, columnspan=3, sticky="ew", pady=(2, 0))
-        tk.Label(status, textvariable=self.llm_route5_thinking_status_var, anchor="w", wraplength=980, justify="left").grid(row=4, column=0, columnspan=3, sticky="ew", pady=(2, 0))
-        tk.Label(status, textvariable=self.llm_route5_capture_analysis_status_var, anchor="w", wraplength=980, justify="left").grid(row=5, column=0, columnspan=3, sticky="ew", pady=(2, 0))
-        tk.Label(route, textvariable=self.llm_route5_status_var, anchor="w", wraplength=1080, justify="left").grid(row=8, column=0, columnspan=6, sticky="ew", padx=6, pady=(0, 4))
-        preview_frame = tk.Frame(route)
+        status.grid_columnconfigure(0, minsize=250)
+        status.grid_columnconfigure(2, minsize=360)
+        for row_index, minsize in ((0, 24), (1, 20), (2, 20), (3, 20), (4, 38), (5, 20)):
+            status.grid_rowconfigure(row_index, minsize=minsize)
+        self.route5_fixed_status_label(status, self.llm_route5_stage_var, row=0, column=0, width_px=250, height_px=24, padx=(0, 12), sticky="w")
+        self.route5_fixed_status_label(status, self.llm_route5_target_var, row=0, column=1, width_px=520, height_px=24, padx=(0, 12))
+        self.route5_fixed_status_label(status, self.llm_route5_error_var, row=0, column=2, width_px=360, height_px=24, sticky="w")
+        self.route5_fixed_status_label(status, self.llm_route5_payload_var, row=1, column=0, columnspan=3, width_px=1040, height_px=20, pady=(2, 0))
+        self.route5_fixed_status_label(status, self.llm_route5_avoidance_status_var, row=2, column=0, columnspan=3, width_px=1040, height_px=20, pady=(2, 0))
+        self.route5_fixed_status_label(status, self.llm_route5_representation_status_var, row=3, column=0, columnspan=3, width_px=1040, height_px=20, pady=(2, 0))
+        self.route5_fixed_status_label(status, self.llm_route5_thinking_status_var, row=4, column=0, columnspan=3, width_px=1040, height_px=38, pady=(2, 0))
+        self.route5_fixed_status_label(status, self.llm_route5_capture_analysis_status_var, row=5, column=0, columnspan=3, width_px=1040, height_px=20, pady=(2, 0))
+        self.route5_fixed_status_label(route, self.llm_route5_status_var, row=8, column=0, columnspan=6, width_px=1080, height_px=28, padx=6, pady=(0, 4))
+        preview_frame = tk.Frame(route, height=156)
         preview_frame.grid(row=9, column=0, columnspan=6, sticky="nsew", padx=6, pady=(0, 6))
+        preview_frame.grid_propagate(False)
         preview_frame.grid_columnconfigure(0, weight=1)
         preview_frame.grid_rowconfigure(0, weight=1)
         preview_text = tk.Text(preview_frame, height=7, width=96, wrap="none", font=("Consolas", 9))
@@ -6711,6 +7992,494 @@ class Route5FusionControlMixin:
         self.llm_route5_preview_text = preview_text
         setattr(route, "_llm_route5_combo", combo)
         return route
+
+    def route7_update_map_layer_values(self, layers: List[Dict[str, Any]]) -> List[str]:
+        key_fn = getattr(self, "_route6_update_map_layer_key", None)
+        values: List[str] = []
+        for layer in (layers if isinstance(layers, list) else []):
+            if not isinstance(layer, dict):
+                continue
+            if callable(key_fn):
+                values.append(str(key_fn(layer)))
+            else:
+                values.append(f"z_{int(float(layer.get('z_cm', 0) or 0)):03d}")
+        return values
+
+    def route7_select_update_map_layer_key(self, layers: List[Dict[str, Any]]) -> str:
+        values = self.route7_update_map_layer_values(layers)
+        selected = str(self.llm_route7_map_layer_var.get() or "").strip()
+        default_key = self.route7_default_layer_key()
+        if selected in values:
+            return selected
+        if default_key in values:
+            return default_key
+        return values[0] if values else default_key
+
+    def _on_llm_route7_window_mousewheel(self, event: tk.Event):
+        canvas = getattr(self, "llm_route7_window_canvas", None)
+        if canvas is None:
+            return "break"
+        delta = -1 if int(getattr(event, "delta", 0)) > 0 else 1
+        if int(getattr(event, "state", 0)) & 0x0001:
+            canvas.xview_scroll(delta, "units")
+        else:
+            canvas.yview_scroll(delta, "units")
+        return "break"
+
+    def _on_llm_route7_window_mousewheel_linux(self, event: tk.Event):
+        canvas = getattr(self, "llm_route7_window_canvas", None)
+        if canvas is None:
+            return "break"
+        direction = -1 if int(getattr(event, "num", 0)) == 4 else 1
+        canvas.yview_scroll(direction, "units")
+        return "break"
+
+    def _bind_llm_route7_window_mousewheel_tree(self, widget: tk.Widget) -> None:
+        try:
+            if isinstance(widget, tk.Text):
+                self._bind_llm_route5_text_mousewheel(widget)
+                return
+            widget.bind("<MouseWheel>", self._on_llm_route7_window_mousewheel, add="+")
+            widget.bind("<Button-4>", self._on_llm_route7_window_mousewheel_linux, add="+")
+            widget.bind("<Button-5>", self._on_llm_route7_window_mousewheel_linux, add="+")
+            children = widget.winfo_children()
+        except tk.TclError:
+            return
+        for child in children:
+            self._bind_llm_route7_window_mousewheel_tree(child)
+
+    def route7_layered_route_points(self) -> List[Dict[str, Any]]:
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        active = state.get("current_exploration_status", {}) if isinstance(state.get("current_exploration_status"), dict) else {}
+        target_house_id = str(state.get("target_house_id", "") or self.selected_route_target_house_id() or "")
+        points: List[Dict[str, Any]] = []
+        if target_house_id:
+            points.extend(self.route5_observation_overlay_points(target_house_id, active))
+        for point in self.route5_active_map_route_points():
+            item = dict(point if isinstance(point, dict) else {})
+            route_type = str(item.get("route_point_type", "") or "")
+            if route_type in {"current_target", "navigation_waypoint", "target_reset"}:
+                if route_type == "navigation_waypoint" and not item.get("z"):
+                    item["z"] = self.route7_default_exploration_z_cm()
+                points.append(item)
+        seen: set[Tuple[str, str, str]] = set()
+        deduped: List[Dict[str, Any]] = []
+        for item in points:
+            try:
+                float(item.get("x"))
+                float(item.get("y"))
+            except Exception:
+                continue
+            key = (
+                str(item.get("route_point_type", "")),
+                str(item.get("label", item.get("target_id", item.get("scan_id", "")))),
+                f"{float(item.get('x', 0.0) or 0.0):.2f},{float(item.get('y', 0.0) or 0.0):.2f}",
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    def route7_route_point_color(self, point: Dict[str, Any], selected_layer_key: str) -> Tuple[Tuple[int, int, int], bool]:
+        route_type = str((point if isinstance(point, dict) else {}).get("route_point_type", "") or "")
+        z_cm = float((point if isinstance(point, dict) else {}).get("z", self.route7_default_exploration_z_cm()) or self.route7_default_exploration_z_cm())
+        selected_z = float(self.route6_layer_z_from_key(selected_layer_key) if callable(getattr(self, "route6_layer_z_from_key", None)) else 0.0)
+        strong = abs(z_cm - selected_z) <= 25.0
+        palette = {
+            "observation_point": ((21, 101, 192), (170, 205, 235)),
+            "current_target": ((194, 24, 91), (238, 183, 207)),
+            "navigation_waypoint": ((46, 125, 50), (184, 220, 186)),
+            "target_reset": ((239, 108, 0), (247, 199, 150)),
+            "scan_point": ((106, 27, 154), (205, 180, 219)),
+        }
+        strong_color, pale_color = palette.get(route_type, ((55, 65, 81), (190, 195, 205)))
+        return (strong_color if strong else pale_color), strong
+
+    def route7_layer_point_to_pixel(self, point: Dict[str, Any], metadata: Dict[str, Any], *, scale: int = 1) -> Optional[Tuple[int, int]]:
+        try:
+            width = int(metadata.get("width", 0) or 0)
+            height = int(metadata.get("height", 0) or 0)
+            resolution = float(metadata.get("resolution_m", 0.25) or 0.25)
+            origin_x, origin_y = [float(value) for value in metadata.get("origin_standard_m", [0.0, 0.0])]
+            standard_x_m = float(point.get("x", 0.0) or 0.0) / 100.0
+            standard_y_m = -float(point.get("y", 0.0) or 0.0) / 100.0
+        except Exception:
+            return None
+        if width <= 0 or height <= 0 or resolution <= 0:
+            return None
+        col = int(math.floor((standard_x_m - origin_x) / resolution))
+        row = int(math.floor((standard_y_m - origin_y) / resolution))
+        if col < 0 or col >= width or row < 0 or row >= height:
+            return None
+        factor = max(1, int(scale))
+        return int(col * factor + factor / 2), int((height - 1 - row) * factor + factor / 2)
+
+    def route7_draw_layered_route_points(
+        self,
+        image: Image.Image,
+        layer_record: Dict[str, Any],
+        *,
+        selected_layer_key: str,
+        scale: int = 1,
+    ) -> Image.Image:
+        metadata = self.route6_update_map_load_layer_metadata(layer_record) if callable(getattr(self, "route6_update_map_load_layer_metadata", None)) else {}
+        if not metadata:
+            return image
+        draw = ImageDraw.Draw(image)
+        factor = max(1, int(scale))
+        nav_pixels: List[Tuple[int, int]] = []
+        for point in self.route7_layered_route_points():
+            pixel = self.route7_layer_point_to_pixel(point, metadata, scale=factor)
+            if pixel is None:
+                continue
+            color, strong = self.route7_route_point_color(point, selected_layer_key)
+            route_type = str(point.get("route_point_type", "") or "")
+            radius = max(3, 4 * factor if strong else 3 * factor)
+            x_px, y_px = pixel
+            if route_type == "navigation_waypoint":
+                nav_pixels.append(pixel)
+            draw.ellipse(
+                (x_px - radius, y_px - radius, x_px + radius, y_px + radius),
+                fill=color,
+                outline=(20, 20, 20) if strong else color,
+                width=max(1, factor if strong else 1),
+            )
+            label = str(point.get("label", point.get("target_id", point.get("scan_id", ""))) or "")
+            if label and strong:
+                draw.text((x_px + radius + 2, y_px - radius), label[:18], fill=color)
+        if len(nav_pixels) >= 2:
+            for start, end in zip(nav_pixels, nav_pixels[1:]):
+                draw.line((start[0], start[1], end[0], end[1]), fill=(46, 125, 50), width=max(1, 2 * factor))
+        return image
+
+    def refresh_llm_route7_update_map(self, *, build_if_missing: bool = False) -> Dict[str, Any]:
+        self.ensure_route7_state()
+        if callable(getattr(self, "ensure_route6_state", None)):
+            self.ensure_route6_state()
+        try:
+            if callable(getattr(self, "route6_update_map_uav_pose_text", None)):
+                self.route6_update_map_uav_pose_text()
+        except Exception:
+            pass
+        output_dir = self.route7_current_map_output_dir()
+        load_manifest = getattr(self, "route6_update_map_load_manifest", None)
+        manifest = load_manifest(build_if_missing=bool(build_if_missing), output_dir=output_dir) if callable(load_manifest) else {}
+        combo = getattr(self, "llm_route7_update_map_layer_combo", None)
+        preview = getattr(self, "llm_route7_update_map_preview_label", None)
+        if not manifest:
+            self.llm_route7_map_status_var.set("Route V7 Map: no Route 6 Update Map layered artifact yet.")
+            if preview is not None:
+                try:
+                    preview.configure(text="No Route 6 Update Map layered occupancy map available.", image="")
+                except tk.TclError:
+                    pass
+            return {}
+        layers = manifest.get("layers", []) if isinstance(manifest.get("layers", []), list) else []
+        values = self.route7_update_map_layer_values(layers)
+        if combo is not None:
+            try:
+                combo.configure(values=values)
+            except tk.TclError:
+                pass
+        selected = self.route7_select_update_map_layer_key(layers)
+        if selected:
+            self.llm_route7_map_layer_var.set(selected)
+        key_fn = getattr(self, "_route6_update_map_layer_key", None)
+        layer_record = next(
+            (
+                layer
+                for layer in layers
+                if isinstance(layer, dict)
+                and ((str(key_fn(layer)) if callable(key_fn) else f"z_{int(float(layer.get('z_cm', 0) or 0)):03d}") == selected)
+            ),
+            {},
+        )
+        point_count = int((layer_record or {}).get("point_count", 0) or 0)
+        occupied_count = int((layer_record or {}).get("occupied_cell_count", 0) or 0)
+        self.llm_route7_map_status_var.set(
+            f"Route V7 Map: Route 6 Update Map {selected or 'n/a'} points={point_count} occupied={occupied_count}"
+        )
+        if preview is None:
+            return manifest
+        preview_path_fn = getattr(self, "route6_update_map_layer_preview_path", None)
+        preview_path = preview_path_fn(layer_record) if callable(preview_path_fn) else Path(str((layer_record or {}).get("occupancy_preview_path", "") or ""))
+        if not Path(preview_path).is_file():
+            try:
+                preview.configure(text=f"Route 6 Update Map preview missing: {preview_path}", image="")
+            except tk.TclError:
+                pass
+            return manifest
+        try:
+            image = Image.open(preview_path).convert("RGB")
+            width, height = image.size
+            frame = getattr(self, "llm_route7_update_map_frame", None)
+            try:
+                available_w = int(frame.winfo_width() or 1040) if frame is not None else 1040
+            except Exception:
+                available_w = 1040
+            scale = max(1, min(8, int((available_w - 40) / max(1, max(width, height)))))
+            if scale > 1:
+                image = image.resize((width * scale, height * scale), Image.Resampling.NEAREST)
+            overlay_fn = getattr(self, "route6_draw_update_map_uav_overlay", None)
+            if callable(overlay_fn):
+                image = overlay_fn(image, layer_record, scale=scale)
+            image = self.route7_draw_layered_route_points(image, layer_record, selected_layer_key=selected, scale=scale)
+            photo = ImageTk.PhotoImage(image)
+            self.llm_route7_update_map_preview_photo = photo
+            preview.configure(image=photo, text="")
+        except Exception as exc:
+            try:
+                preview.configure(text=f"Route V7 Route 6 Update Map preview failed: {exc}", image="")
+            except tk.TclError:
+                pass
+        return manifest
+
+    def route7_schedule_update_map_refresh(self) -> None:
+        window = getattr(self, "llm_route7_window", None)
+        if window is None:
+            self.llm_route7_update_map_after_id = None
+            return
+        try:
+            self.refresh_llm_route7_update_map(build_if_missing=False)
+            self.llm_route7_update_map_after_id = window.after(1000, self.route7_schedule_update_map_refresh)
+        except tk.TclError:
+            self.llm_route7_update_map_after_id = None
+
+    def close_llm_route_window7(self) -> None:
+        self.ensure_route7_state()
+        after_id = getattr(self, "llm_route7_update_map_after_id", None)
+        if after_id is not None and self.llm_route7_window is not None:
+            try:
+                self.llm_route7_window.after_cancel(after_id)
+            except Exception:
+                pass
+        self.llm_route7_update_map_after_id = None
+        if self.llm_route7_window is not None:
+            try:
+                self.llm_route7_window.destroy()
+            except Exception:
+                pass
+        self.llm_route7_window = None
+        self.llm_route7_window_canvas = None
+        self.llm_route7_window_content = None
+        self.llm_route7_window_content_window = None
+        self.llm_route7_update_map_frame = None
+        self.llm_route7_update_map_preview_label = None
+        self.llm_route7_update_map_preview_photo = None
+        self.llm_route7_update_map_layer_combo = None
+        self.llm_route5_preview_text = None
+        self.llm_route5_analysis_text = None
+        self.llm_route5_rgb_label = None
+        self.llm_route5_rgb_photo = None
+        self.route5_or2_state_label = None
+        self.route5_or2_rgb_label = None
+        self.route5_or2_mask_label = None
+        self.route5_or2_rgb_photo = None
+        self.route5_or2_mask_photo = None
+        self.route5_or2_report_text = None
+        self.stop_route5_or2_monitor()
+        self.cancel_route5_auto_refresh()
+
+    def open_llm_route_window7(self) -> None:
+        self.ensure_route7_state()
+        if self.llm_route7_window is not None and self.llm_route7_window.winfo_exists():
+            self.llm_route7_window.lift()
+            self.llm_route7_window.focus_force()
+            return
+        self.llm_route7_map_layer_var.set(self.route7_default_layer_key())
+        window = tk.Toplevel(self.root)
+        window.title("LLM House Entrance Route V7 Fused Route + Avoidance + Route 6 Update Map")
+        window.geometry("1120x860")
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(0, weight=1)
+        window.protocol("WM_DELETE_WINDOW", self.close_llm_route_window7)
+
+        window_canvas = tk.Canvas(window, highlightthickness=0)
+        v_scrollbar = tk.Scrollbar(window, orient="vertical", command=window_canvas.yview)
+        h_scrollbar = tk.Scrollbar(window, orient="horizontal", command=window_canvas.xview)
+        window_canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
+        window_canvas.grid(row=0, column=0, sticky="nsew")
+        v_scrollbar.grid(row=0, column=1, sticky="ns")
+        h_scrollbar.grid(row=1, column=0, sticky="ew")
+
+        content = tk.Frame(window_canvas)
+        content_window = window_canvas.create_window((0, 0), window=content, anchor="nw")
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(3, weight=1)
+
+        def _sync_scrollregion(_event: tk.Event) -> None:
+            try:
+                window_canvas.configure(scrollregion=window_canvas.bbox("all"))
+            except tk.TclError:
+                pass
+
+        def _sync_content_width(event: tk.Event) -> None:
+            try:
+                window_canvas.itemconfigure(content_window, width=max(1060, int(event.width)))
+            except tk.TclError:
+                pass
+
+        content.bind("<Configure>", _sync_scrollregion)
+        window_canvas.bind("<Configure>", _sync_content_width)
+
+        route = self._build_llm_route5_section(
+            content,
+            route_label="V7",
+            start_command=self.on_route7_start_fused_search,
+            step_command=self.on_route7_step_facade,
+            stop_command=self.on_route7_stop,
+        )
+        route.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+
+        support = tk.Frame(content)
+        support.grid(row=1, column=0, sticky="ew", padx=8, pady=(4, 4))
+        support.grid_columnconfigure(0, weight=0)
+        support.grid_columnconfigure(1, weight=1)
+        rgb_frame = tk.LabelFrame(support, text="Facade RGB")
+        rgb_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=0)
+        self.llm_route5_rgb_label = tk.Canvas(rgb_frame, width=330, height=220, bg="#202020", highlightthickness=0)
+        self.llm_route5_rgb_label.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self.llm_route5_rgb_label.bind("<Configure>", lambda _event: self.refresh_route5_rgb_display(), add="+")
+        analysis_frame = tk.LabelFrame(support, text="Fusion Analysis")
+        analysis_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=0)
+        analysis_frame.grid_columnconfigure(0, weight=1)
+        analysis_frame.grid_rowconfigure(0, weight=1)
+        analysis_text = tk.Text(analysis_frame, height=10, width=64, wrap="none", font=("Consolas", 9))
+        analysis_y = tk.Scrollbar(analysis_frame, orient="vertical", command=analysis_text.yview)
+        analysis_x = tk.Scrollbar(analysis_frame, orient="horizontal", command=analysis_text.xview)
+        analysis_text.configure(yscrollcommand=analysis_y.set, xscrollcommand=analysis_x.set)
+        analysis_text.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=(6, 0))
+        analysis_y.grid(row=0, column=1, sticky="ns", pady=(6, 0))
+        analysis_x.grid(row=1, column=0, sticky="ew", padx=(6, 0), pady=(0, 6))
+        analysis_text.configure(state="disabled")
+        self.llm_route5_analysis_text = analysis_text
+
+        monitor = self.build_route5_or2_monitor_panel(content)
+        monitor.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 4))
+
+        map_frame = tk.LabelFrame(content, text="Route 6 Update Map Layered Occupancy")
+        map_frame.grid(row=3, column=0, sticky="nsew", padx=8, pady=(4, 8))
+        map_frame.grid_columnconfigure(0, weight=1)
+        map_frame.grid_rowconfigure(2, weight=1)
+        toolbar = tk.Frame(map_frame)
+        toolbar.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
+        tk.Label(toolbar, text="Layer").pack(side="left", padx=(0, 4))
+        layer_combo = ttk.Combobox(
+            toolbar,
+            textvariable=self.llm_route7_map_layer_var,
+            values=[f"z_{int(value):03d}" for value in route6_map_builder.DEFAULT_ROUTE6_LAYER_Z_CM],
+            state="readonly",
+            width=10,
+        )
+        layer_combo.pack(side="left", padx=4)
+        layer_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_llm_route7_update_map(build_if_missing=False))
+        tk.Button(toolbar, text="Load Latest Map", command=lambda: self.refresh_llm_route7_update_map(build_if_missing=False)).pack(side="left", padx=6)
+        tk.Button(toolbar, text="Route 6 Update Map", command=self.open_route6_update_map_window).pack(side="left", padx=6)
+        tk.Label(toolbar, textvariable=self.llm_route7_map_status_var, anchor="w").pack(side="left", fill="x", expand=True, padx=8)
+        map_status = tk.Frame(map_frame)
+        map_status.grid(row=1, column=0, sticky="ew", padx=6, pady=(6, 0))
+        map_status.grid_columnconfigure(0, weight=1)
+        tk.Label(map_status, textvariable=self.llm_route5_current_status_var, anchor="w", wraplength=360, justify="left").grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        tk.Label(map_status, textvariable=self.llm_route5_next_status_var, anchor="w", wraplength=300, justify="left").grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        tk.Label(map_status, textvariable=self.llm_route5_progress_text_var, anchor="e", wraplength=220, justify="left").grid(row=0, column=2, sticky="e", padx=(8, 2))
+        ttk.Progressbar(map_status, variable=self.llm_route5_progress_var, maximum=100.0, length=150, mode="determinate").grid(row=0, column=3, sticky="e", padx=(0, 8))
+        preview = tk.Label(map_frame, text="Loading Route 6 Update Map layered occupancy map...", anchor="center", justify="center")
+        preview.grid(row=2, column=0, sticky="nsew", padx=6, pady=6)
+
+        self.llm_route7_window = window
+        self.llm_route7_window_canvas = window_canvas
+        self.llm_route7_window_content = content
+        self.llm_route7_window_content_window = content_window
+        self.llm_route7_update_map_frame = map_frame
+        self.llm_route7_update_map_layer_combo = layer_combo
+        self.llm_route7_update_map_preview_label = preview
+        self._bind_llm_route7_window_mousewheel_tree(content)
+        window_canvas.bind("<MouseWheel>", self._on_llm_route7_window_mousewheel, add="+")
+        window_canvas.bind("<Button-4>", self._on_llm_route7_window_mousewheel_linux, add="+")
+        window_canvas.bind("<Button-5>", self._on_llm_route7_window_mousewheel_linux, add="+")
+        self.refresh_route5_support_views()
+        self.refresh_llm_route7_update_map(build_if_missing=False)
+        self.route7_schedule_update_map_refresh()
+
+    def on_route7_start_fused_search(self) -> None:
+        self.ensure_route7_state()
+        session = self.active_session()
+        if session is None:
+            return
+        selected_target_house_id = self.selected_route_target_house_id()
+        if not selected_target_house_id:
+            self.llm_route5_status_var.set("LLM Route V7: select a target house first.")
+            return
+        if self.llm_route5_thread is not None and self.llm_route5_thread.is_alive():
+            self.llm_route5_status_var.set("LLM Route V7: already running.")
+            return
+        output_dir = self.route7_prepare_new_map_output_dir(selected_target_house_id)
+        if not self.route7_start_update_map_realtime(session, output_dir):
+            self.llm_route5_status_var.set("LLM Route V7: waiting for previous map update to stop.")
+            return
+        self.llm_route5_stop_event.clear()
+        self.llm_route5_pause_event.clear()
+        self.llm_route5_paused_var.set(False)
+        self.llm_route5_thread = threading.Thread(
+            target=lambda: self.route5_full_search_worker(
+                session,
+                single_facade=False,
+                force_new=True,
+                observation_z_cm=self.route7_default_exploration_z_cm(),
+                route_window_label="V7",
+                output_dir_override=output_dir,
+            ),
+            daemon=True,
+        )
+        self.llm_route5_thread.start()
+
+    def on_route7_step_facade(self) -> None:
+        self.ensure_route7_state()
+        self.route5_update_state(route_window_label="V7", observation_z_override_cm=self.route7_default_exploration_z_cm())
+        session = self.active_session()
+        if session is None:
+            return
+        if self.llm_route5_thread is not None and self.llm_route5_thread.is_alive():
+            self.llm_route5_status_var.set("LLM Route V7: wait for current worker.")
+            return
+        self.llm_route5_stop_event.clear()
+        self.llm_route5_pause_event.clear()
+        self.llm_route5_thread = threading.Thread(
+            target=lambda: self.route5_full_search_worker(
+                session,
+                single_facade=True,
+                force_new=False,
+                observation_z_cm=self.route7_default_exploration_z_cm(),
+                route_window_label="V7",
+            ),
+            daemon=True,
+        )
+        self.llm_route5_thread.start()
+
+    def on_route7_stop(self) -> None:
+        self.ensure_route7_state()
+        if callable(getattr(self, "ensure_route6_state", None)):
+            self.ensure_route6_state()
+        self.llm_route5_stop_event.set()
+        self.llm_route5_pause_event.clear()
+        try:
+            self.llm_route5_paused_var.set(False)
+        except Exception:
+            pass
+        if hasattr(self, "route6_update_map_realtime_stop_event"):
+            self.route6_update_map_realtime_stop_event.set()
+        if hasattr(self, "route6_update_map_capture_stop_event"):
+            self.route6_update_map_capture_stop_event.set()
+        session = self.active_session()
+        if session is not None:
+            self.route5_hold(session, output_dir=self.route5_state_output_dir(), reason="route7_stop_button")
+        self.llm_route5_status_var.set("LLM Route V7: stop requested.")
+        try:
+            self.route6_update_map_status_var.set("Route 6 Update Map: V7 stop requested.")
+            self.llm_route7_map_status_var.set("Route V7 Map: stop requested.")
+        except Exception:
+            pass
 
     def open_llm_route_window5(self) -> None:
         self.ensure_route5_state()

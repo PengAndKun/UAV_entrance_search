@@ -1139,8 +1139,10 @@ class Route6ExploreControlMixin:
         metadata: Dict[str, Any],
         records: List[Dict[str, Any]],
     ) -> Image.Image:
-        draw = ImageDraw.Draw(image)
-        colors = [(0, 90, 255), (0, 160, 90), (200, 80, 0), (150, 0, 210)]
+        source = image.convert("RGB")
+        base = Image.new("RGB", source.size, "white")
+        draw = ImageDraw.Draw(base)
+        colors = [(170, 205, 255), (170, 225, 190), (235, 190, 150), (215, 180, 235), (180, 220, 235)]
         for index, record in enumerate(records):
             color = colors[index % len(colors)]
             points = record.get("points", []) if isinstance(record.get("points", []), list) else []
@@ -1158,7 +1160,11 @@ class Route6ExploreControlMixin:
             cy = 0.5 * (float(bbox.get("min_y", 0.0) or 0.0) + float(bbox.get("max_y", 0.0) or 0.0))
             tx, ty = self.route6_unreal_cm_to_layer_pixel(metadata, cx, cy)
             draw.text((tx + 4, ty + 4), f"H{str(record.get('house_id', ''))}", fill=color)
-        return image
+        source_arr = np.asarray(source)
+        base_arr = np.asarray(base).copy()
+        obstacle_mask = np.all(source_arr <= 32, axis=2)
+        base_arr[obstacle_mask] = source_arr[obstacle_mask]
+        return Image.fromarray(base_arr.astype(np.uint8), mode="RGB")
 
     def route6_apply_known_house_polygons_to_update_map(self, output_dir: Optional[Path] = None) -> Dict[str, Any]:
         self.ensure_route6_state()
@@ -1548,7 +1554,7 @@ class Route6ExploreControlMixin:
         size = 720
         image = Image.new("RGB", (size, size), "white")
         draw = ImageDraw.Draw(image)
-        bounds = (-4000.0, 4000.0, -4000.0, 4000.0)
+        bounds = (-5000.0, 5000.0, -5000.0, 5000.0)
 
         def project(x_cm: float, y_cm: float) -> Tuple[int, int]:
             min_x, max_x, min_y, max_y = bounds
@@ -1556,12 +1562,12 @@ class Route6ExploreControlMixin:
             py = int(round((float(y_cm) - min_y) / max(1.0, max_y - min_y) * float(size - 1)))
             return max(0, min(size - 1, px)), max(0, min(size - 1, py))
 
-        for value in range(-4000, 4001, 1000):
-            x0, y0 = project(value, -4000.0)
-            x1, y1 = project(value, 4000.0)
+        for value in range(-5000, 5001, 1000):
+            x0, y0 = project(value, -5000.0)
+            x1, y1 = project(value, 5000.0)
             draw.line((x0, y0, x1, y1), fill=(230, 230, 230), width=1)
-            x0, y0 = project(-4000.0, value)
-            x1, y1 = project(4000.0, value)
+            x0, y0 = project(-5000.0, value)
+            x1, y1 = project(5000.0, value)
             draw.line((x0, y0, x1, y1), fill=(230, 230, 230), width=1)
         pose = self.route6_current_pose()
         ux, uy = project(float(pose.get("x", 0.0) or 0.0), float(pose.get("y", 0.0) or 0.0))

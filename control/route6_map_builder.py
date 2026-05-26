@@ -23,7 +23,7 @@ ROUTE6_COORDINATE_FRAME = {
 DEFAULT_ROUTE6_LAYER_Z_CM = tuple(range(50, 651, 50))
 DEFAULT_ROUTE6_LAYER_BAND_CM = 25.0
 DEFAULT_ROUTE6_LAYER_OCCUPIED_THRESHOLD = 2
-DEFAULT_ROUTE6_FIXED_WORLD_BOUNDS_CM = {"min_x": -4000, "max_x": 4000, "min_y": -4000, "max_y": 4000}
+DEFAULT_ROUTE6_FIXED_WORLD_BOUNDS_CM = {"min_x": -5000, "max_x": 5000, "min_y": -5000, "max_y": 5000}
 DEFAULT_ROUTE6_UPDATE_MAP_VOXEL_SIZE_M = 0.25
 DEFAULT_ROUTE6_UPDATE_MAP_MAX_POINTS = 320000
 
@@ -49,10 +49,10 @@ def _normalize_fixed_world_bounds_cm(bounds: Optional[Dict[str, Any]]) -> Option
     if not isinstance(bounds, dict):
         return None
     result = {
-        "min_x": _as_int(bounds.get("min_x"), -4000),
-        "max_x": _as_int(bounds.get("max_x"), 4000),
-        "min_y": _as_int(bounds.get("min_y"), -4000),
-        "max_y": _as_int(bounds.get("max_y"), 4000),
+        "min_x": _as_int(bounds.get("min_x"), -5000),
+        "max_x": _as_int(bounds.get("max_x"), 5000),
+        "min_y": _as_int(bounds.get("min_y"), -5000),
+        "max_y": _as_int(bounds.get("max_y"), 5000),
     }
     if result["max_x"] <= result["min_x"] or result["max_y"] <= result["min_y"]:
         return None

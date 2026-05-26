@@ -922,6 +922,7 @@ class RunDroneFlightPanel(
             tk.Button(scan, text="Open LLM Route Window 4", command=self.open_llm_route_window4).pack(side="left", padx=6, pady=4)
             tk.Button(scan, text="Open LLM Route Window 5", command=self.open_llm_route_window5).pack(side="left", padx=6, pady=4)
             tk.Button(scan, text="Open LLM Route Window 6", command=self.open_llm_route_window6).pack(side="left", padx=6, pady=4)
+            tk.Button(scan, text="Open LLM Route Window 7", command=self.open_llm_route_window7).pack(side="left", padx=6, pady=4)
             tk.Button(scan, text="Route 6 Update Map", command=self.open_route6_update_map_window).pack(side="left", padx=6, pady=4)
 
         actions = tk.Frame(route)
@@ -1848,6 +1849,26 @@ class RunDroneFlightPanel(
             self.route5_or2_rgb_photo = None
             self.route5_or2_mask_photo = None
             self.route5_or2_report_text = None
+        if getattr(self, "llm_route7_window", None) is not None:
+            after_id = getattr(self, "llm_route7_update_map_after_id", None)
+            if after_id is not None:
+                try:
+                    self.llm_route7_window.after_cancel(after_id)
+                except Exception:
+                    pass
+            self.llm_route7_update_map_after_id = None
+            try:
+                self.llm_route7_window.destroy()
+            except Exception:
+                pass
+            self.llm_route7_window = None
+            self.llm_route7_window_canvas = None
+            self.llm_route7_window_content = None
+            self.llm_route7_window_content_window = None
+            self.llm_route7_update_map_frame = None
+            self.llm_route7_update_map_preview_label = None
+            self.llm_route7_update_map_preview_photo = None
+            self.llm_route7_update_map_layer_combo = None
         if getattr(self, "llm_route6_window", None) is not None:
             try:
                 self.llm_route6_window.destroy()

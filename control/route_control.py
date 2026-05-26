@@ -3052,7 +3052,10 @@ class RouteControlMixin:
         corridor_info = self.scan_corridor_standoff_by_facade(hid, bbox)
         completed = set(getattr(self, "llm_route2_completed_facades", set()) or set()) if skip_completed else set()
         pose_z = self._as_float_or_none(pose.get("z")) if pose else None
-        if pose_z is not None and 80.0 <= float(pose_z) <= 900.0:
+        override_z = self._as_float_or_none(getattr(self, "route_observation_z_override_cm", None))
+        if override_z is not None and 80.0 <= float(override_z) <= 900.0:
+            z_cm = float(override_z)
+        elif pose_z is not None and 80.0 <= float(pose_z) <= 900.0:
             z_cm = max(float(LLM_ROUTE2_OBSERVATION_Z_CM), float(pose_z))
         else:
             z_cm = max(float(LLM_ROUTE2_OBSERVATION_Z_CM), min(max(self.route2_low_z_cm(), 150.0), 300.0))
@@ -9209,4 +9212,3 @@ class RouteControlMixin:
                     self.root.after(0, lambda e=exc: self.llm_route_status_var.set(f"LLM Route: finalize failed: {e}"))
             else:
                 self.root.after(0, lambda: self.llm_route_status_var.set("LLM Route: follow complete."))
-

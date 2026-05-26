@@ -248,7 +248,7 @@ def test_route6_voxel_downsample_reduces_duplicate_points_before_layering() -> N
     builder = load_builder()
     duplicate_a = np.repeat(np.asarray([[0.01, 0.01, 0.50, 10.0, 20.0, 30.0]], dtype=np.float32), 100, axis=0)
     duplicate_b = np.repeat(np.asarray([[0.30, 0.30, 0.50, 40.0, 50.0, 60.0]], dtype=np.float32), 50, axis=0)
-    out_of_bounds = np.asarray([[45.0, 0.0, 0.50, 0.0, 0.0, 0.0]], dtype=np.float32)
+    out_of_bounds = np.asarray([[55.0, 0.0, 0.50, 0.0, 0.0, 0.0]], dtype=np.float32)
     cloud = np.vstack([duplicate_a, duplicate_b, out_of_bounds])
     reduced = builder.voxel_downsample_point_cloud(
         cloud,
@@ -314,8 +314,8 @@ def test_route6_known_house_polygons_overlay_all_layers_and_plan_nav(tmp_dir: Pa
         overlay_path = Path(layer["known_house_overlay_preview_path"])
         assert_true(overlay_path.is_file(), f"each layer should have a known-house overlay: {layer}")
         image = np.asarray(Image.open(overlay_path).convert("RGB"))
-        colored = np.sum((image[:, :, 2] > 120) & (image[:, :, 0] < 120))
-        assert_true(colored > 0, f"known house overlay should draw colored house outlines: {overlay_path}")
+        colored = np.sum(np.any((image > 0) & (image < 245), axis=2) & ~np.all(image < 20, axis=2))
+        assert_true(colored > 0, f"known house overlay should draw pale house outlines: {overlay_path}")
     assert_true(plan["schema"] == "route6_known_house_navigation_plan_v1", f"unexpected nav plan schema: {plan}")
     assert_true(plan["target_house_id"] == "001", f"house 1 should be planned by known coordinates: {plan}")
     assert_true(plan["target_pose_cm"]["x"] < 2800.0, f"navigation point should be outside house 1 bbox, not its center: {plan}")
