@@ -10,6 +10,12 @@ STOP_FORWARD_FRACTION = 0.01
 MOSTLY_STOP_FRACTION = 0.35
 SIDE_BLOCKED_FRACTION = 0.35
 FRONT_STOP_DEPTH_CM = 100.0
+RED_RECOVERY_FRONT_CLEAR_CM = 320.0
+RED_RECOVERY_MIN_TICKS = 4
+RED_RECOVERY_CLEAR_TICKS = 2
+RED_RECOVERY_SIDE_STEP_CM = 45.0
+RED_RECOVERY_BACKOFF_CM = 35.0
+RED_RECOVERY_VERTICAL_CM = 35.0
 
 
 def as_float(value: Any, default: float = 0.0) -> float:
@@ -84,6 +90,47 @@ def _corridor_score(stats: Dict[str, float]) -> float:
     warning_fraction = as_float(stats.get("warning_fraction"))
     clearance_fraction = as_float(stats.get("clearance_fraction"))
     return max(0.0, 1.0 - stop_fraction * 3.0 - warning_fraction * 0.8 - clearance_fraction * 0.25)
+
+
+def deep_red_stop_active(
+    prediction: Dict[str, Any],
+    pointcloud_summary: Dict[str, Any],
+    corridor_risks: Dict[str, Dict[str, float]] | None = None,
+) -> bool:
+    summary = pointcloud_summary if isinstance(pointcloud_summary, dict) else {}
+    stats = corridor_risks if isinstance(corridor_risks, dict) else corridor_risk_stats(prediction)
+    front = stats.get("front_center", {}) if isinstance(stats.get("front_center"), dict) else {}
+    front_min = as_float(summary.get("front_min_depth_cm"))
+    return bool(
+        str(prediction.get("front_risk_state", "") or "").lower() == "must_stop"
+        or as_float(front.get("stop_fraction")) > STOP_FORWARD_FRACTION
+        or (front_min > 0.0 and front_min <= FRONT_STOP_DEPTH_CM)
+    )
+
+
+def red_recovery_clear_enough(
+    prediction: Dict[str, Any],
+    pointcloud_summary: Dict[str, Any],
+    corridor_risks: Dict[str, Dict[str, float]] | None = None,
+) -> bool:
+    summary = pointcloud_summary if isinstance(pointcloud_summary, dict) else {}
+    stats = corridor_risks if isinstance(corridor_risks, dict) else corridor_risk_stats(prediction)
+    front = stats.get("front_center", {}) if isinstance(stats.get("front_center"), dict) else {}
+    front_min = as_float(summary.get("front_min_depth_cm"))
+    return bool(
+        front_min >= RED_RECOVERY_FRONT_CLEAR_CM
+        and as_float(front.get("stop_fraction")) <= STOP_FORWARD_FRACTION
+        and str(prediction.get("front_risk_state", "") or "").lower() != "must_stop"
+    )
+
+
+def choose_red_recovery_direction(rule: Dict[str, Any]) -> str:
+    selected = str(rule.get("selected_direction", "") or "").lower()
+    if selected in {"left", "right", "up", "backoff"}:
+        return selected
+    scores = rule.get("candidate_action_scores") if isinstance(rule.get("candidate_action_scores"), dict) else {}
+    candidates = ("left", "right", "up", "backoff")
+    return max(candidates, key=lambda name: as_float(scores.get(name)))
 
 
 def select_or2_direction(

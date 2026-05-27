@@ -1,4 +1,4 @@
-"""Obstacle Avoidance 3: route episodes driven by OR2 risk-region masks."""
+"""Obstacle Avoidance 3: Route6_entrance_search episodes driven by OR2 risk-region masks."""
 
 from .or2_direction_rule import (
     DEFAULT_METHOD_ID,
@@ -10,6 +10,7 @@ from .plans import (
     load_plans,
     make_default_plans,
     save_plans,
+    sync_oa2_plan_into_oa3,
 )
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "make_default_plans",
     "save_plans",
     "select_or2_direction",
+    "sync_oa2_plan_into_oa3",
 ]

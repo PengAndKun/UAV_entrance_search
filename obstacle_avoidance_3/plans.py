@@ -50,11 +50,14 @@ def timestamp() -> str:
     return datetime.now().isoformat(timespec="milliseconds")
 
 
-def sanitize_id(value: Any, default: str) -> str:
+def sanitize_id(value: Any, default: str, *, max_len: int = 80) -> str:
     text = str(value or "").strip().lower()
     text = re.sub(r"[^a-z0-9_.-]+", "_", text)
     text = text.strip("._-")
-    return text or default
+    text = text or default
+    if max_len > 0 and len(text) > max_len:
+        text = text[:max_len].rstrip("._-") or default
+    return text
 
 
 def coerce_pose(raw: Any) -> List[float]:
@@ -95,6 +98,75 @@ def make_default_episodes() -> List[Dict[str, Any]]:
     return rows
 
 
+def _active_project(data: Dict[str, Any]) -> Dict[str, Any]:
+    projects = data.get("projects") if isinstance(data, dict) else []
+    if not isinstance(projects, list):
+        return {}
+    active_id = str(data.get("active_project_id", "") or "")
+    for project in projects:
+        if isinstance(project, dict) and str(project.get("project_id", "")) == active_id:
+            return project
+    for project in projects:
+        if isinstance(project, dict):
+            return project
+    return {}
+
+
+def oa2_episodes_for_oa3(oa2_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    project = _active_project(oa2_data)
+    raw_episodes = project.get("episodes") if isinstance(project, dict) else []
+    if not isinstance(raw_episodes, list):
+        return []
+    rows: List[Dict[str, Any]] = []
+    for index, raw in enumerate(raw_episodes, start=1):
+        if not isinstance(raw, dict):
+            continue
+        start = raw.get("start_pose") or raw.get("start")
+        goal = raw.get("goal_pose") or raw.get("goal")
+        try:
+            start_pose = coerce_pose(start)
+            goal_pose = coerce_pose(goal)
+        except Exception:
+            continue
+        episode_id = str(raw.get("episode_id") or f"E{index:02d}")
+        rows.append(
+            {
+                "episode_id": episode_id,
+                "enabled": bool(raw.get("enabled", True)),
+                "start_pose": start_pose,
+                "goal_pose": goal_pose,
+                "scenario_id": str(raw.get("scenario_id") or f"oa3_route_{episode_id}"),
+                "environment_id": str(raw.get("environment_id") or project.get("environment_id", DEFAULT_ENVIRONMENT_ID)),
+                "method": DEFAULT_METHOD_ID,
+                "obstacle_hint": str(raw.get("obstacle_hint") or "unknown"),
+                "operator_note": str(raw.get("operator_note") or ""),
+            }
+        )
+    return rows
+
+
+def sync_oa2_plan_into_oa3(oa3_data: Dict[str, Any], oa2_data: Dict[str, Any]) -> Dict[str, Any]:
+    episodes = oa2_episodes_for_oa3(oa2_data)
+    if not episodes:
+        return normalize_plans(oa3_data)
+    synced = normalize_plans(oa3_data)
+    oa2_project = _active_project(oa2_data)
+    projects = synced.setdefault("projects", [])
+    if not projects:
+        projects.append(make_default_plans()["projects"][0])
+    project = projects[0]
+    project["project_id"] = DEFAULT_PROJECT_ID
+    project["name"] = f"OA3 synced from {oa2_project.get('project_id', 'OA2')}"
+    project["environment_id"] = str(oa2_project.get("environment_id") or DEFAULT_ENVIRONMENT_ID)
+    project["default_method"] = DEFAULT_METHOD_ID
+    project["episodes"] = episodes
+    project.setdefault("experiment_defaults", make_default_plans()["projects"][0]["experiment_defaults"])
+    project["experiment_defaults"]["method"] = DEFAULT_METHOD_ID
+    synced["active_project_id"] = DEFAULT_PROJECT_ID
+    synced["updated_at"] = timestamp()
+    return normalize_plans(synced)
+
+
 def make_default_plans() -> Dict[str, Any]:
     return {
         "version": PLAN_SCHEMA_VERSION,
@@ -128,19 +200,21 @@ def normalize_plans(data: Dict[str, Any]) -> Dict[str, Any]:
     normalized = deepcopy(data)
     normalized.setdefault("version", PLAN_SCHEMA_VERSION)
     normalized.setdefault("active_project_id", DEFAULT_PROJECT_ID)
-    normalized.setdefault("environments", deepcopy(DEFAULT_ENVIRONMENTS))
-    normalized.setdefault("methods", deepcopy(DEFAULT_METHODS))
+    if not isinstance(normalized.get("environments"), list) or not normalized.get("environments"):
+        normalized["environments"] = deepcopy(DEFAULT_ENVIRONMENTS)
+    if not isinstance(normalized.get("methods"), list) or not normalized.get("methods"):
+        normalized["methods"] = deepcopy(DEFAULT_METHODS)
     if not isinstance(normalized.get("projects"), list) or not normalized["projects"]:
         normalized["projects"] = deepcopy(default["projects"])
     for project in normalized.get("projects", []):
         if not isinstance(project, dict):
             continue
         project.setdefault("project_id", DEFAULT_PROJECT_ID)
-        project.setdefault("name", "OA3 route obstacle collection")
+        project.setdefault("name", "OA3 Route6_entrance_search obstacle collection")
         project.setdefault("environment_id", DEFAULT_ENVIRONMENT_ID)
         project.setdefault("default_method", DEFAULT_METHOD_ID)
-        if not isinstance(project.get("episodes"), list):
-            project["episodes"] = []
+        if not isinstance(project.get("episodes"), list) or not project.get("episodes"):
+            project["episodes"] = make_default_episodes()
         for episode in project["episodes"]:
             if not isinstance(episode, dict):
                 continue
