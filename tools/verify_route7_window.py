@@ -1211,10 +1211,21 @@ def test_route7_frame_decision_log_and_trajectory_visualization(tmp_dir: Path) -
 def test_window7_source_contract() -> None:
     panel_source = (PROJECT_ROOT / "control" / "panel.py").read_text(encoding="utf-8")
     route5_source = (PROJECT_ROOT / "control" / "route5_fusion_control.py").read_text(encoding="utf-8")
+    route7_planning_path = PROJECT_ROOT / "control" / "route5_route7_planning.py"
+    route7_planning_source = route7_planning_path.read_text(encoding="utf-8") if route7_planning_path.is_file() else ""
+    route7_map_window_path = PROJECT_ROOT / "control" / "route5_route7_map_window.py"
+    route7_map_window_source = route7_map_window_path.read_text(encoding="utf-8") if route7_map_window_path.is_file() else ""
+    route7_combined_source = route5_source + "\n" + route7_planning_source + "\n" + route7_map_window_source
     or3_demo_source = (PROJECT_ROOT / "obstacle_representation_3" / "demo.py").read_text(encoding="utf-8")
 
     assert_true("Open LLM Route Window 7" in panel_source, "main panel should expose Open LLM Route Window 7")
     assert_true("command=self.open_llm_route_window7" in panel_source, "Window 7 button should call open_llm_route_window7")
+    assert_true(route7_planning_path.is_file(), "Route7 planning/occupancy code should be split out of route5_fusion_control.py")
+    assert_true("class Route7PlanningMixin" in route7_planning_source, "Route7 planning module should expose Route7PlanningMixin")
+    assert_true(route7_map_window_path.is_file(), "Route7 map/window code should be split out of route5_fusion_control.py")
+    assert_true("class Route7MapWindowMixin" in route7_map_window_source, "Route7 map/window module should expose Route7MapWindowMixin")
+    assert_true("Route7PlanningMixin" in route5_source, "Route5FusionControlMixin should inherit the Route7 planning mixin")
+    assert_true("Route7MapWindowMixin" in route5_source, "Route5FusionControlMixin should inherit the Route7 map/window mixin")
     assert_true("ObstacleRepresentation3Predictor" in or3_demo_source, "OR3 demo should expose ObstacleRepresentation3Predictor")
     assert_true("front_box_stop_fraction" in or3_demo_source, "OR3 demo should expose projection-box stop fraction")
     assert_true(
@@ -1252,27 +1263,27 @@ def test_window7_source_contract() -> None:
         "def on_route7_start_fused_search",
         "def on_route7_step_facade",
     ):
-        assert_true(token in route5_source, f"Route 5 mixin should define Window 7 contract token: {token}")
+        assert_true(token in route7_combined_source, f"Route 5/7 mixins should define Window 7 contract token: {token}")
 
-    refresh_start = route5_source.find("def refresh_llm_route7_update_map")
-    refresh_end = route5_source.find("def open_llm_route_window7")
-    refresh_block = route5_source[refresh_start:refresh_end]
+    refresh_start = route7_combined_source.find("def refresh_llm_route7_update_map")
+    refresh_end = route7_combined_source.find("def open_llm_route_window7", refresh_start)
+    refresh_block = route7_combined_source[refresh_start:refresh_end]
     assert_true("route6_update_map_load_manifest" in refresh_block, "Window 7 map should read Route 6 Update Map layered manifest")
     assert_true("route6_update_map_layer_preview_path" in refresh_block, "Window 7 map should use Route 6 Update Map layer previews")
     assert_true("route6_draw_update_map_uav_overlay" in refresh_block, "Window 7 map should reuse Route 6 UAV overlay drawing")
 
-    window7_start = route5_source.find("def open_llm_route_window7")
-    window7_end = route5_source.find("def on_route7_start_fused_search")
-    window7_block = route5_source[window7_start:window7_end]
+    window7_start = route7_combined_source.find("def open_llm_route_window7")
+    window7_end = route7_combined_source.find("def on_route7_start_fused_search", window7_start)
+    window7_block = route7_combined_source[window7_start:window7_end]
     assert_true("LLM House Entrance Route V7" in window7_block, "Window 7 title should identify V7")
     assert_true("Route 6 Update Map" in window7_block, "Window 7 map frame should be Route 6 Update Map based")
     assert_true("z_300" in window7_block or "route7_default_layer_key" in window7_block, "Window 7 should default its map layer to 300cm")
 
-    start_block = route5_source[route5_source.find("def on_route7_start_fused_search"):route5_source.find("def on_route7_step_facade")]
+    start_block = route7_combined_source[route7_combined_source.find("def on_route7_start_fused_search"):route7_combined_source.find("def on_route7_step_facade")]
     assert_true("observation_z_cm=self.route7_default_exploration_z_cm()" in start_block, "Window 7 start should force 300cm exploration height")
     assert_true("route7_prepare_new_map_output_dir" in start_block, "Window 7 start should prepare a fresh dedicated map run")
     assert_true("route7_start_update_map_realtime" in start_block, "Window 7 start should start Route 6 Update Map realtime")
-    prepare_block = route5_source[route5_source.find("def route7_prepare_new_map_output_dir"):route5_source.find("def route7_current_map_output_dir")]
+    prepare_block = route7_combined_source[route7_combined_source.find("def route7_prepare_new_map_output_dir"):route7_combined_source.find("def route7_current_map_output_dir")]
     assert_true("route7_static_house_base" in prepare_block, "Window 7 run preparation should freeze house coordinates as the map base")
 
     worker_block = route5_source[route5_source.find("def route5_full_search_worker"):route5_source.find("def refresh_route5_preview")]
@@ -1298,14 +1309,14 @@ def test_window7_source_contract() -> None:
     assert_true("route7_should_use_map_route_planner" in navigate_block, "V7 navigation should choose the map-route planner")
     assert_true("route7_plan_navigation_waypoints_from_map" in navigate_block, "V7 navigation should plan from Route 6 layered occupancy")
     assert_true("route7_update_realtime_navigation_route" in navigate_block, "V7 navigation should keep a realtime route plan updated")
-    assert_true("route7_route_segments" in route5_source, "V7 realtime route should expose layer-colored route segments")
-    assert_true("route7_front_square_deep_red_takeover" in route5_source, "V7 OR should only take over on front-square deep red")
+    assert_true("route7_route_segments" in route7_combined_source, "V7 realtime route should expose layer-colored route segments")
+    assert_true("route7_front_square_deep_red_takeover" in route7_combined_source, "V7 OR should only take over on front-square deep red")
     follow_block = route5_source[route5_source.find("def route5_follow_navigation_waypoint_with_fusion"):route5_source.find("def route5_navigate_to_pose_with_fusion")]
     assert_true("route7_local_3d_replan_decision" in follow_block, "V7 local 3D blocks should be revalidated against map-route distance")
     assert_true("route7_map_route_replan_required" in follow_block, "V7 should replan instead of hard-stopping on soft local 3D blocks")
     assert_true("route7_frame_decision_log.jsonl" in route5_source, "V7 should write a concise per-frame decision log")
-    assert_true("route7_write_navigation_plan_visualization" in route5_source, "V7 should write planned trajectory visualization artifacts")
-    assert_true("route7_yaw_to_nav_point" in route5_source, "V7 forward obstacle handling should yaw q/e toward the navigation point instead of slow-forwarding")
+    assert_true("route7_write_navigation_plan_visualization" in route7_combined_source, "V7 should write planned trajectory visualization artifacts")
+    assert_true("route7_yaw_to_nav_point" in route7_combined_source, "V7 forward obstacle handling should yaw q/e toward the navigation point instead of slow-forwarding")
     route_control_source = (PROJECT_ROOT / "control" / "route_control.py").read_text(encoding="utf-8")
     flight_source = (PROJECT_ROOT / "run_drone_flight.py").read_text(encoding="utf-8")
     assert_true("frames_subdir" in flight_source, "LiDAR stream capture should accept a separate frame stream directory")
@@ -1314,12 +1325,13 @@ def test_window7_source_contract() -> None:
     ui_block = route5_source[route5_source.find("def _build_llm_route5_section"):route5_source.find("def route7_update_map_layer_values")]
     assert_true("route5_fixed_status_label" in ui_block, "Route status labels should use fixed layout containers")
     assert_true("grid_propagate(False)" in ui_block, "Route status/preview frames should not resize as text changes")
-    assert_true("route7_task_switch_visualization_text" in route5_source, "Window 7 should expose a task-switch visualization below the map")
-    assert_true("llm_route7_task_switch_text" in route5_source, "Window 7 should maintain a task-switch visualization widget")
-    assert_true("route7_subtask_switch_records" in route5_source, "Window 7 should expose active-facade subtask visualization records")
-    assert_true("route7_last_drawable_route_plan" in route5_source, "Window 7 should preserve the last drawable path across transient empty route plans")
+    assert_true("route7_task_switch_visualization_text" in route7_combined_source, "Window 7 should expose a task-switch visualization below the map")
+    assert_true("llm_route7_task_switch_text" in route7_combined_source, "Window 7 should maintain a task-switch visualization widget")
+    assert_true("route7_subtask_switch_records" in route7_combined_source, "Window 7 should expose active-facade subtask visualization records")
+    assert_true("route7_last_drawable_route_plan" in route7_combined_source, "Window 7 should preserve the last drawable path across transient empty route plans")
 
-    stop_block = route5_source[route5_source.find("def on_route7_stop"):route5_source.find("def open_llm_route_window5")]
+    stop_source = route7_map_window_source or route7_combined_source
+    stop_block = stop_source[stop_source.find("def on_route7_stop"):]
     assert_true("route6_update_map_realtime_stop_event.set()" in stop_block, "Window 7 stop should stop realtime map updates")
     assert_true("route6_update_map_capture_stop_event.set()" in stop_block, "Window 7 stop should stop update-map capture")
     assert_true("on_route7_stop" in window7_block, "Window 7 stop button should call V7 stop-all handler")
