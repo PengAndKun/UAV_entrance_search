@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import plistlib
+import re
 import select
 import signal
 import socket
@@ -758,6 +759,12 @@ def make_unique_child_dir(root_path: Path, dirname: str) -> Path:
         except FileExistsError:
             continue
     raise FileExistsError(f"Could not create unique directory under {root_path}")
+
+
+def sanitize_frame_stream_name(value: Any, default_value: str = "frames") -> str:
+    text = str(value or default_value).strip().replace("\\", "/").split("/")[-1]
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._")
+    return cleaned or default_value
 
 
 def prepare_observation_rgb(
@@ -2320,7 +2327,15 @@ def postprocess_lidar_stream_capture(
     max_points: int = DEFAULT_LIDAR_RECON_MAX_POINTS,
 ) -> Dict[str, Any]:
     stream_path = Path(stream_dir).resolve()
-    frames_root = stream_path / "frames"
+    default_frames_root = stream_path / "frames"
+    open3d_frames_root = stream_path / "open3d_frames"
+    open3d_frame_dirs = sorted(path for path in open3d_frames_root.glob("frame_*") if path.is_dir()) if open3d_frames_root.exists() else []
+    if open3d_frame_dirs:
+        frames_root = open3d_frames_root
+        frame_stream = "open3d_frames"
+    else:
+        frames_root = default_frames_root
+        frame_stream = "frames"
     started_at = datetime.now().isoformat(timespec="milliseconds")
     frame_dirs = sorted(path for path in frames_root.glob("frame_*") if path.is_dir()) if frames_root.exists() else []
     frame_results: List[Dict[str, Any]] = []
@@ -2462,7 +2477,10 @@ def postprocess_lidar_stream_capture(
         **summary,
         "capture_kind": "stream_capture_lidar",
         "stream_dir": str(stream_path),
-        "frames_dir": str(frames_root),
+        "frames_dir": str(default_frames_root),
+        "open3d_frames_dir": str(open3d_frames_root),
+        "postprocess_frames_dir": str(frames_root),
+        "postprocess_frame_stream": str(frame_stream),
         "reconstruction_dir": str(stream_path / "reconstruction"),
         "frame_count": len(frame_dirs),
         "source_point_count": int(source_point_count),
@@ -4605,10 +4623,12 @@ class DroneFlightSession:
         stream_dir: Any,
         frame_index: int,
         action_detail: Optional[Dict[str, Any]] = None,
+        frames_subdir: str = "frames",
     ) -> Dict[str, Any]:
         env, drone_name = self.require_started()
         stream_path = resolve_project_output_path(stream_dir, DEFAULT_STREAM_CAPTURE_LIDAR_DIR)
-        frames_dir = stream_path / "frames"
+        frame_stream = sanitize_frame_stream_name(frames_subdir, "frames")
+        frames_dir = stream_path / frame_stream
         frame_number = max(0, int(frame_index))
         frame_name = f"frame_{frame_number:06d}"
         capture_dir = make_unique_child_dir(frames_dir, frame_name)
@@ -4624,9 +4644,12 @@ class DroneFlightSession:
                 "capture_kind": "stream_capture_lidar",
                 "frame_index": frame_number,
                 "stream_dir": str(stream_path),
+                "frame_stream": str(frame_stream),
+                "frames_subdir": str(frame_stream),
                 "frames_dir": str(frames_dir),
+                "open3d_frames_dir": str(stream_path / "open3d_frames"),
                 "lidar_capture_processing": processing_mode,
-                "message": f"Stream lidar frame {frame_number} saved: {capture_dir}",
+                "message": f"Stream lidar frame {frame_number} saved in {frame_stream}: {capture_dir}",
             },
             controller_action=action_detail,
             raw_capture_only=(processing_mode == "smooth"),

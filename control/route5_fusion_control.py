@@ -64,11 +64,31 @@ class Route5FusionControlMixin:
     def default_route5_or3_model_path(self) -> Path:
         return PROJECT_ROOT / "obstacle_representation_3_data" / "models" / "a_plus_3_model.pt"
 
+    def default_route7_or31_model_path(self) -> Path:
+        return PROJECT_ROOT / "obstacle_representation_3_data" / "models" / "a_plus_3_1_model.pt"
+
     def default_route5_oa3_plan_path(self) -> Path:
         return PROJECT_ROOT / "obstacle_avoidance_3_data" / "plans" / OA3_DEFAULT_PLAN_FILENAME
 
     def default_route5_representation_model_path(self) -> Path:
         return self.default_route5_or2_model_path()
+
+    def route5_event_is_route7(self, event: Dict[str, Any] | None = None) -> bool:
+        event_dict = event if isinstance(event, dict) else {}
+        label = str(event_dict.get("route_window_label", "") or "").strip().upper()
+        if label == "V7":
+            return True
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        if str(state.get("route_window_label", "") or "").strip().upper() == "V7":
+            return True
+        for key in ("route5_output_dir", "output_dir", "capture_dir"):
+            raw = str(event_dict.get(key, state.get(key, "")) or "").replace("/", "\\").lower()
+            if "llm_route_7_fusion_runs" in raw or "_v7_or3_1_fused_" in raw or "_v7_or2_fused_" in raw:
+                return True
+        return False
+
+    def route5_or3_model_path_for_event(self, event: Dict[str, Any] | None = None) -> Path:
+        return self.default_route7_or31_model_path() if self.route5_event_is_route7(event) else self.default_route5_or3_model_path()
 
     def ensure_route5_state(self) -> None:
         if not hasattr(self, "llm_route5_status_var"):
@@ -227,6 +247,10 @@ class Route5FusionControlMixin:
             self.llm_route7_update_map_preview_label = None
         if not hasattr(self, "llm_route7_update_map_preview_photo"):
             self.llm_route7_update_map_preview_photo = None
+        if not hasattr(self, "llm_route7_task_switch_canvas"):
+            self.llm_route7_task_switch_canvas = None
+        if not hasattr(self, "llm_route7_task_switch_text"):
+            self.llm_route7_task_switch_text = _route5_string_var("Task switch: n/a")
         if not hasattr(self, "llm_route7_update_map_layer_combo"):
             self.llm_route7_update_map_layer_combo = None
         if not hasattr(self, "llm_route7_update_map_after_id"):
@@ -377,11 +401,13 @@ class Route5FusionControlMixin:
         output_dir = self.make_route7_fused_output_dir(target_house_id)
         route7_static_house_base = self.route7_static_house_base_snapshot(target_house_id, output_dir=output_dir)
         self.route5_update_state(
-            mode="route7_llm_route_oa3_or2_fusion",
+            mode="route7_llm_route_oa3_or3_1_fusion",
             route_window_label="V7",
             target_house_id=str(target_house_id or ""),
             output_dir=str(output_dir),
             route7_map_output_dir=str(output_dir),
+            route7_primary_representation="or3_1",
+            or3_1_model_path=str(self.default_route7_or31_model_path()),
             route7_static_house_base=route7_static_house_base,
             observation_z_override_cm=self.route7_default_exploration_z_cm(),
             stage="INIT_RUN",
@@ -615,6 +641,204 @@ class Route5FusionControlMixin:
             return {"status": "ok", "occupied_cell_count": occupied, "free_cell_count": free, "grid_col": col, "grid_row": row}
         except Exception as exc:
             return {"status": "error", "reason": str(exc), "occupied_cell_count": None, "free_cell_count": None}
+
+    def route7_lidar_radius_cm(self) -> float:
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        sensing = state.get("sensing_config", {}) if isinstance(state.get("sensing_config", {}), dict) else {}
+        candidates = [
+            getattr(getattr(self, "args", None), "lidar_depth_max_cm", None),
+            sensing.get("lidar_depth_max_cm"),
+            state.get("lidar_depth_max_cm"),
+            state.get("route7_lidar_radius_cm"),
+        ]
+        for value in candidates:
+            try:
+                radius = float(value)
+            except Exception:
+                continue
+            if math.isfinite(radius) and radius > 0.0:
+                return max(100.0, radius)
+        return 1200.0
+
+    def route7_lidar_edge_observation_formula(self, bbox: Dict[str, Any], facade: str) -> Dict[str, Any]:
+        axis_min, axis_max = self.route2_facade_axis_range(bbox, facade)
+        low, high = sorted((float(axis_min), float(axis_max)))
+        edge_length = max(0.0, high - low)
+        lidar_radius = self.route7_lidar_radius_cm()
+        effective_radius = max(1.0, 0.8 * float(lidar_radius))
+        point_count = max(1, int(math.ceil(edge_length / effective_radius))) if edge_length > 0.0 else 1
+        spacing = edge_length / float(point_count) if point_count > 0 else edge_length
+        upper_standoff = max(50.0, 0.95 * effective_radius)
+        lower_standoff = min(250.0, upper_standoff)
+        standoff = min(max(0.65 * effective_radius, lower_standoff), upper_standoff)
+        axis_values = [low + (float(index) + 0.5) * spacing for index in range(point_count)]
+        return {
+            "schema": "route7_lidar_edge_observation_formula_v1",
+            "facade": str(facade or "").strip().lower(),
+            "axis_min": round(low, 3),
+            "axis_max": round(high, 3),
+            "edge_length_cm": round(edge_length, 3),
+            "lidar_radius_cm": round(float(lidar_radius), 3),
+            "effective_lidar_radius_cm": round(float(effective_radius), 3),
+            "effective_lidar_multiplier": 0.8,
+            "point_count": int(point_count),
+            "spacing_cm": round(float(spacing), 3),
+            "observation_standoff_cm": round(float(standoff), 3),
+            "axis_values": [round(float(value), 3) for value in axis_values],
+            "z_cm": round(float(self.route7_default_exploration_z_cm()), 3),
+            "formula": "N=max(1,ceil(L_edge/(0.8*R_lidar))); axis_i=axis_min+(i+0.5)*(L_edge/N); D_obs=clamp(0.65*(0.8*R_lidar),250,0.95*(0.8*R_lidar))",
+        }
+
+    def route7_adjust_observation_point_to_free_cell(
+        self,
+        point: Dict[str, Any],
+        *,
+        output_dir: Optional[Path] = None,
+        inflation_cells: int = 1,
+    ) -> Dict[str, Any]:
+        adjusted = dict(point)
+        layer_record, layer_key, layer_z, _manifest = self.route7_selected_map_layer_record(output_dir)
+        adjusted["route7_map_layer_key"] = layer_key
+        adjusted["route7_map_layer_z_cm"] = round(float(layer_z), 3)
+        loaded = self.route7_load_layer_occupancy_grid(layer_record)
+        if loaded.get("status") != "ok":
+            adjusted["route7_observation_map_status"] = str(loaded.get("status", "missing_layer_grid") or "missing_layer_grid")
+            adjusted["route7_observation_replan_reason"] = str(loaded.get("reason", adjusted["route7_observation_map_status"]) or "")
+            return adjusted
+        metadata = loaded["metadata"]
+        grid = loaded["grid"]
+        raw_cell = self.route7_pose_to_layer_cell(metadata, adjusted)
+        if raw_cell is None:
+            adjusted["route7_observation_map_status"] = "outside_layer_grid"
+            adjusted["route7_map_cell"] = []
+            return adjusted
+        mask = self.route7_inflated_occupied_mask(grid, inflation_cells=inflation_cells)
+        blocked = self.route7_layer_cell_blocked(mask, raw_cell)
+        adjusted["route7_observation_map_status"] = "blocked" if blocked else "free"
+        adjusted["route7_map_cell"] = [int(raw_cell[0]), int(raw_cell[1])]
+        adjusted["route7_observation_inflation_cells"] = int(inflation_cells)
+        if not blocked:
+            return adjusted
+        nearest = self.route7_nearest_free_layer_cell(mask, raw_cell)
+        adjusted["route7_original_pose"] = self.route5_json_safe(point)
+        adjusted["route7_original_map_cell"] = [int(raw_cell[0]), int(raw_cell[1])]
+        adjusted["route7_observation_replanned_from_blocked"] = True
+        adjusted["route7_observation_replan_reason"] = "route7_observation_point_inside_occupied_cell"
+        if nearest is None:
+            adjusted["status"] = "blocked"
+            adjusted["route7_observation_map_status"] = "blocked_no_nearest_free_cell"
+            return adjusted
+        free_pose = self.route7_layer_cell_to_pose(
+            metadata,
+            nearest,
+            z_cm=float(adjusted.get("z", layer_z) or layer_z),
+            yaw_deg=float(adjusted.get("yaw_deg", adjusted.get("yaw", 0.0)) or 0.0),
+        )
+        adjusted.update(free_pose)
+        adjusted["yaw_deg"] = round(float(free_pose.get("yaw", adjusted.get("yaw_deg", 0.0)) or 0.0), 3)
+        adjusted["route7_map_cell"] = [int(nearest[0]), int(nearest[1])]
+        adjusted["route7_observation_map_status"] = "replanned_to_nearest_free_cell"
+        adjusted["status"] = "planned"
+        return adjusted
+
+    def route7_edge_observation_attempts_for_facade(
+        self,
+        target_house_id: str,
+        facade: str,
+        *,
+        output_dir: Optional[Path] = None,
+        inflation_cells: int = 1,
+    ) -> List[Dict[str, Any]]:
+        hid = str(target_house_id or "").strip()
+        facade = str(facade or "").strip().lower()
+        if not hid or facade not in {"south", "east", "north", "west"}:
+            return []
+        try:
+            bbox = self.house_world_bbox_for_id(hid)
+        except Exception:
+            bbox = {}
+        if not bbox:
+            return []
+        formula = self.route7_lidar_edge_observation_formula(bbox, facade)
+        z_cm = float(formula.get("z_cm", self.route7_default_exploration_z_cm()) or self.route7_default_exploration_z_cm())
+        standoff = float(formula.get("observation_standoff_cm", 300.0) or 300.0)
+        attempts: List[Dict[str, Any]] = []
+        for index, axis in enumerate(formula.get("axis_values", []) if isinstance(formula.get("axis_values", []), list) else [], start=1):
+            pose = self.route2_facade_pose_from_axis(bbox, facade, float(axis), standoff, z_cm)
+            yaw = float(pose.get("yaw_deg", pose.get("yaw", 0.0)) or 0.0)
+            attempt: Dict[str, Any] = {
+                **pose,
+                "yaw": round(yaw, 3),
+                "yaw_deg": round(yaw, 3),
+                "target_house_id": hid,
+                "facade": facade,
+                "target_id": f"{hid}_{facade}_edge_obs_{index:03d}",
+                "label": f"{hid}_{facade}_edge_obs_{index:03d}",
+                "route_point_type": "route7_edge_observation_point",
+                "view_type": "route7_lidar_edge_observation",
+                "observation_attempt_index": index,
+                "observation_attempt_source": "route7_lidar_edge_minimal",
+                "observation_selection_score": round(float(index), 3),
+                "axis_value": round(float(axis), 3),
+                "standoff_cm": round(float(standoff), 3),
+                "route7_observation_formula": self.route5_json_safe(formula),
+                "route7_lidar_radius_cm": formula.get("lidar_radius_cm"),
+                "route7_effective_lidar_radius_cm": formula.get("effective_lidar_radius_cm"),
+                "route7_edge_length_cm": formula.get("edge_length_cm"),
+                "route7_edge_point_count": formula.get("point_count"),
+                "status": "planned",
+            }
+            attempts.append(
+                self.route7_adjust_observation_point_to_free_cell(
+                    attempt,
+                    output_dir=output_dir,
+                    inflation_cells=inflation_cells,
+                )
+            )
+        return attempts
+
+    def route7_edge_observation_candidates_for_house(
+        self,
+        target_house_id: str,
+        *,
+        output_dir: Optional[Path] = None,
+        facades: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        facade_order = [str(item).strip().lower() for item in (facades or self.route5_task_facade_priority()) if str(item).strip().lower()]
+        if not facade_order:
+            facade_order = ["south", "east", "north", "west"]
+        candidates: List[Dict[str, Any]] = []
+        for facade in facade_order:
+            if facade not in {"south", "east", "north", "west"}:
+                continue
+            attempts = self.route7_edge_observation_attempts_for_facade(target_house_id, facade, output_dir=output_dir)
+            if not attempts:
+                candidates.append(
+                    {
+                        "target_house_id": str(target_house_id or ""),
+                        "facade": facade,
+                        "status": "blocked",
+                        "reason": "route7_no_lidar_edge_observation_attempts",
+                        "route7_edge_observation_attempts": [],
+                        "observation_attempts": [],
+                        "observation_attempt_count": 0,
+                    }
+                )
+                continue
+            selected = dict(attempts[0])
+            candidate = {
+                **selected,
+                "target_house_id": str(target_house_id or ""),
+                "facade": facade,
+                "status": "planned",
+                "route7_edge_observation_candidate": True,
+                "route7_edge_observation_attempts": self.route5_json_safe(attempts),
+                "selected_observation_attempt": selected,
+                "observation_attempts": self.route5_json_safe(attempts),
+                "observation_attempt_count": len(attempts),
+            }
+            candidates.append(candidate)
+        return candidates
 
     def route7_load_layer_occupancy_grid(self, layer_record: Dict[str, Any]) -> Dict[str, Any]:
         metadata = self.route6_update_map_load_layer_metadata(layer_record) if callable(getattr(self, "route6_update_map_load_layer_metadata", None)) else {}
@@ -1301,7 +1525,10 @@ class Route5FusionControlMixin:
         }
         plan["route7_realtime_route_state"] = route_state
         try:
-            self.route5_update_state(route7_realtime_route_plan=route_state)
+            if route_state.get("route7_route_segments"):
+                self.route5_update_state(route7_realtime_route_plan=route_state, route7_last_drawable_route_plan=route_state)
+            else:
+                self.route5_update_state(route7_realtime_route_plan=route_state)
         except Exception:
             pass
         try:
@@ -1310,6 +1537,55 @@ class Route5FusionControlMixin:
             self.append_jsonl(map_dir / "route7_realtime_route_plan.jsonl", self.route5_json_safe(route_state))
         except Exception as exc:
             plan["route7_realtime_route_write_error"] = f"{type(exc).__name__}: {exc}"
+        return plan
+
+    def route7_plan_spatial_navigation_path(
+        self,
+        start_pose: Dict[str, float],
+        target_pose: Dict[str, float],
+        *,
+        output_dir: Optional[Path] = None,
+        stage: str = "",
+        target_id: str = "",
+        target_house_id: str = "",
+        update_reason: str = "route7_spatial_astar",
+        inflation_cells: int = 1,
+    ) -> Dict[str, Any]:
+        resolved_output: Optional[Path] = Path(output_dir) if output_dir is not None else self.route7_current_map_output_dir()
+        if resolved_output is None:
+            fallback = self.route3_plan_navigation_waypoints(
+                start_pose,
+                target_pose,
+                target_house_id,
+                grid_cm=float(LLM_ROUTE3_ASTAR_GRID_CM),
+            )
+            fallback = dict(fallback if isinstance(fallback, dict) else {})
+            fallback["planner_source"] = "route7_spatial_occupancy_astar_unavailable_map_fallback"
+            fallback["route7_space_astar"] = False
+            fallback["route7_astar_dimensions"] = ["x_cell", "y_cell"]
+            return fallback
+        plan = self.route7_update_realtime_navigation_route(
+            start_pose,
+            target_pose,
+            output_dir=resolved_output,
+            stage=stage,
+            target_id=target_id,
+            target_house_id=target_house_id,
+            update_reason=update_reason,
+            inflation_cells=inflation_cells,
+        )
+        plan = dict(plan if isinstance(plan, dict) else {})
+        plan["planner_source_original"] = str(plan.get("planner_source", "") or "")
+        plan["planner_source"] = "route7_spatial_occupancy_astar"
+        plan["route7_space_astar"] = True
+        plan["route7_astar_dimensions"] = ["x_cell", "y_cell", "z_layer"]
+        plan["route7_map_route_replan_policy"] = str(plan.get("route7_map_route_replan_policy", "") or "map_first_realtime_multilayer_revalidate")
+        waypoints = [dict(item) for item in plan.get("waypoints", []) if isinstance(item, dict)]
+        for waypoint in waypoints:
+            waypoint.setdefault("route_point_type", "navigation_waypoint")
+            waypoint["route7_space_astar"] = True
+            waypoint.setdefault("route7_map_route_replan_policy", plan["route7_map_route_replan_policy"])
+        plan["waypoints"] = waypoints
         return plan
 
     def route7_realtime_plan_needs_execution_replan(
@@ -1340,7 +1616,7 @@ class Route5FusionControlMixin:
         target_pose: Dict[str, Any],
         target_id: str = "",
     ) -> Dict[str, Any]:
-        if not isinstance(plan, dict) or str(plan.get("planner_source", "") or "") not in {"route7_layered_occupancy_astar", "route7_realtime_multilayer_occupancy_astar"}:
+        if not isinstance(plan, dict) or str(plan.get("planner_source", "") or "") not in {"route7_layered_occupancy_astar", "route7_realtime_multilayer_occupancy_astar", "route7_spatial_occupancy_astar"}:
             return {"status": "skipped", "reason": "not_route7_layered_occupancy_plan"}
         out_path = Path(output_dir)
         layer_record, layer_key, _layer_z_cm, _manifest = self.route7_selected_map_layer_record(out_path)
@@ -1584,7 +1860,7 @@ class Route5FusionControlMixin:
             "target_id": target_id,
         }
         if bool(deep_red.get("active", False)):
-            return {**base, "mode": "hard_avoidance", "reason": "route7_front_square_deep_red_or2_takeover"}
+            return {**base, "mode": "hard_avoidance", "reason": "route7_front_square_deep_red_takeover"}
         route_state = event_dict.get("route7_realtime_route_plan", {}) if isinstance(event_dict.get("route7_realtime_route_plan", {}), dict) else {}
         if route_state:
             base["route7_realtime_route_plan"] = self.route5_json_safe(route_state)
@@ -1884,18 +2160,25 @@ class Route5FusionControlMixin:
     def route5_sensing_config(self) -> Dict[str, Any]:
         self.ensure_route5_state()
         interval_s = self.route5_float_param(self.llm_route5_sensing_interval_s_var, 1.0, min_value=0.2, max_value=30.0)
+        route7_primary = self.route5_event_is_route7({})
+        representation_path = str(self.default_route7_or31_model_path() if route7_primary else self.llm_route5_representation_model_var.get() or "")
         return {
             "sensing_interval_s": float(interval_s),
-            "representation_model_path": str(self.llm_route5_representation_model_var.get() or ""),
+            "representation_model_path": representation_path,
+            "representation_source": "or3_1" if route7_primary else "or2",
             "or2_model_path": str(self.llm_route5_representation_model_var.get() or ""),
+            "or3_1_model_path": str(self.default_route7_or31_model_path()),
             "llm_strategy_mode": LLM_STRATEGY_METHOD_ID,
             "capture_processing": "minimal",
         }
 
     def route5_oa3_config(self) -> Dict[str, Any]:
         self.ensure_route5_state()
+        route7_primary = self.route5_event_is_route7({})
         return {
             "or2_model_path": str(self.llm_route5_representation_model_var.get() or self.default_route5_or2_model_path()),
+            "or3_1_model_path": str(self.default_route7_or31_model_path()),
+            "representation_source": "or3_1" if route7_primary else "or2",
             "oa3_plan_path": str(self.llm_route5_oa3_plan_var.get() or self.default_route5_oa3_plan_path()),
             "method": "obstacle_representation_direction_rule_v1",
             "fallback_policy": "route5_depth_pointcloud_rule_on_or2_unavailable",
@@ -2338,7 +2621,7 @@ class Route5FusionControlMixin:
         root = Path(override) if override is not None else self.resolve_project_path("llm_route_7_fusion_runs")
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
         safe_house = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(target_house_id or "unknown")).strip("_") or "unknown"
-        base_name = f"house_{safe_house}_autosearch_v7_or2_fused_{timestamp}"
+        base_name = f"house_{safe_house}_autosearch_v7_or3_1_fused_{timestamp}"
         root.mkdir(parents=True, exist_ok=True)
         candidate = root / base_name
         suffix = 1
@@ -2494,6 +2777,7 @@ class Route5FusionControlMixin:
         gate = event.get("avoidance_gate", {}) if isinstance(event.get("avoidance_gate"), dict) else {}
         or2_prediction = event.get("or2_prediction", {}) if isinstance(event.get("or2_prediction"), dict) else {}
         or2_rule = event.get("or2_rule", {}) if isinstance(event.get("or2_rule"), dict) else {}
+        representation_source = str(event.get("route7_primary_representation", "") or ("or3_1" if bool(event.get("or3_1_primary", False)) else "or2"))
         selected_reason = str(event.get("selected_action_reason", "") or gate.get("reason", "") or "")
         decision = {
             "schema": "route5_frame_decision_v1",
@@ -2507,6 +2791,8 @@ class Route5FusionControlMixin:
             "lookahead_plan": self.route5_json_safe(event.get("depth_lookahead_plan", {})),
             "pointcloud_summary": self.route5_json_safe(event.get("pointcloud_summary", event.get("depth_obstacle_summary", {}))),
             "representation_prediction": self.route5_json_safe(event.get("representation_prediction", {})),
+            "representation_source": representation_source,
+            "route7_primary_representation": str(event.get("route7_primary_representation", "") or ""),
             "or2": {
                 "front_risk_state": str(or2_prediction.get("front_risk_state", event.get("or2_front_risk_state", "")) or ""),
                 "can_forward": bool(or2_prediction.get("can_forward", event.get("or2_can_forward", False))),
@@ -2609,6 +2895,7 @@ class Route5FusionControlMixin:
                 "front_depth_cm": decision["front_depth_cm"],
                 "distance_to_goal_cm": decision["distance_to_goal_cm"],
                 "risk_state": decision["or2"]["front_risk_state"],
+                "representation_source": decision["representation_source"],
                 "can_forward": decision["or2"]["can_forward"],
                 "must_stop": decision["or2"]["must_stop"],
                 "or2_selected_direction": decision["or2"]["selected_direction"],
@@ -2860,16 +3147,19 @@ class Route5FusionControlMixin:
                 (output_dir / subdir).mkdir(parents=True, exist_ok=True)
             if label == "V7":
                 (output_dir / "map").mkdir(parents=True, exist_ok=True)
+                (output_dir / "open3d_frames").mkdir(parents=True, exist_ok=True)
             self.route5_local_obstacle_map = LocalObstacleMap(self.route5_local_obstacle_config())
             self.route5_local_obstacle_output_dir = output_dir
             self.llm_route5_completed_facades = set()
             self.llm_route5_blocked_facades = set()
             self.llm_route5_state = {
-                "mode": "route7_llm_route_oa3_or2_fusion" if label == "V7" else "route5_llm_route_oa3_or2_fusion",
+                "mode": "route7_llm_route_oa3_or3_1_fusion" if label == "V7" else "route5_llm_route_oa3_or2_fusion",
                 "route_window_label": label,
                 "target_house_id": target_house_id,
                 "output_dir": str(output_dir),
                 "route7_map_output_dir": str(output_dir) if label == "V7" else "",
+                "route7_primary_representation": "or3_1" if label == "V7" else "",
+                "or3_1_model_path": str(self.default_route7_or31_model_path()) if label == "V7" else "",
                 "stage": "INIT_RUN",
                 "nav_config": self.route5_nav_config(),
                 "sensing_config": self.route5_sensing_config(),
@@ -3018,6 +3308,10 @@ class Route5FusionControlMixin:
         start_pose: Optional[Dict[str, float]] = None,
     ) -> List[Dict[str, Any]]:
         current = dict(start_pose or self.route3_current_pose() or self.current_route_pose() or {})
+        route7_mode = self.route5_event_is_route7({})
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        route7_output_dir_raw = str(state.get("route7_map_output_dir", state.get("output_dir", "")) or "")
+        route7_output_dir = Path(route7_output_dir_raw) if route7_output_dir_raw else None
         priority = self.route5_task_facade_priority()
         priority_index = {facade: idx for idx, facade in enumerate(priority)}
         last_completed = self.route5_last_completed_facade(completed)
@@ -3032,7 +3326,19 @@ class Route5FusionControlMixin:
             if facade in completed or facade in blocked:
                 continue
             base = base_by_facade.get(facade, {})
-            attempts = self.route3_observation_attempts_for_facade(target_house_id, facade, base)
+            if route7_mode:
+                route7_attempts = base.get("route7_edge_observation_attempts", []) if isinstance(base.get("route7_edge_observation_attempts", []), list) else []
+                if not route7_attempts:
+                    route7_attempts = base.get("observation_attempts", []) if isinstance(base.get("observation_attempts", []), list) else []
+                attempts = [dict(item) for item in route7_attempts if isinstance(item, dict)]
+                if not attempts:
+                    attempts = self.route7_edge_observation_attempts_for_facade(
+                        target_house_id,
+                        facade,
+                        output_dir=route7_output_dir,
+                    )
+            else:
+                attempts = self.route3_observation_attempts_for_facade(target_house_id, facade, base)
             ranked_attempts: List[Dict[str, Any]] = []
             for attempt in attempts:
                 item = dict(attempt)
@@ -3042,11 +3348,22 @@ class Route5FusionControlMixin:
                     item["route5_navigation_cost_cm"] = float(item.get("observation_selection_score", item.get("distance_to_uav_cm", 0.0)) or 0.0)
                     ranked_attempts.append(item)
                     continue
-                plan = self.route3_plan_navigation_waypoints(current, pose, target_house_id, grid_cm=float(LLM_ROUTE3_ASTAR_GRID_CM))
+                if route7_mode:
+                    plan = self.route7_plan_spatial_navigation_path(
+                        current,
+                        pose,
+                        output_dir=route7_output_dir,
+                        stage="NAV_TO_OBS",
+                        target_id=str(item.get("target_id", item.get("label", "")) or ""),
+                        target_house_id=target_house_id,
+                    )
+                else:
+                    plan = self.route3_plan_navigation_waypoints(current, pose, target_house_id, grid_cm=float(LLM_ROUTE3_ASTAR_GRID_CM))
                 item["route5_navigation_plan"] = plan
                 item["route5_navigation_status"] = str(plan.get("status", "blocked") or "blocked")
                 item["route5_navigation_reason"] = str(plan.get("reason", "") or "")
                 item["route3_navigation_status"] = item["route5_navigation_status"]
+                item["route3_navigation_plan"] = plan
                 if plan.get("status") == "ok":
                     item["route5_navigation_cost_cm"] = round(self.route3_navigation_plan_cost_cm(current, plan), 2)
                     item["status"] = "planned"
@@ -4643,6 +4960,22 @@ class Route5FusionControlMixin:
     def route5_depth_lookahead_stages(self) -> set:
         return {"NAV_TO_OBS", "NAV_TO_SCAN_POINT", "ACTIVE_NBV_NAV_TO_SCAN_POINT"}
 
+    def route7_should_translate_while_yawing(self, target: Dict[str, Any], stage: str) -> bool:
+        if not self.route5_event_is_route7({}):
+            return False
+        stage_name = str(stage or "").strip().upper()
+        if stage_name not in {"NAV_TO_OBS", "NAV_TO_SCAN_POINT", "ACTIVE_NBV_NAV_TO_SCAN_POINT"}:
+            return False
+        if not isinstance(target, dict):
+            return False
+        route_type = str(target.get("route_point_type", "") or "")
+        return bool(
+            target.get("route7_map_layer_key")
+            or target.get("route7_map_cell")
+            or target.get("route7_map_route_replan_policy")
+            or route_type in {"navigation_waypoint", "route7_layer_transition", "map_layer_edge_capture"}
+        )
+
     def route5_payload_blocked_directions_from_depth(
         self,
         summary: Dict[str, Any],
@@ -4795,13 +5128,20 @@ class Route5FusionControlMixin:
         dz = float(target.get("z", current.get("z", 0.0)) or 0.0) - float(current.get("z", 0.0) or 0.0)
         step = float(config["nav_step_cm"])
         up = 0.0 if abs(dz) <= float(config["z_tol_cm"]) else max(-step, min(step, dz))
+        right = 0.0
+        route7_translate_while_yawing = bool(abs(yaw_delta) > 1e-6 and self.route7_should_translate_while_yawing(target, stage_name))
         if abs(yaw_delta) > 1e-6:
-            forward = 0.0
+            if route7_translate_while_yawing:
+                scale = 0.5 if abs(yaw_error) >= 45.0 else 0.75
+                forward = float(payload.get("forward_cm", 0.0) or 0.0) * scale
+                right = float(payload.get("right_cm", 0.0) or 0.0) * scale
+            else:
+                forward = 0.0
         else:
             forward = min(step, dist_xy)
         payload = {
             "forward_cm": round(float(forward), 3),
-            "right_cm": 0.0,
+            "right_cm": round(float(right), 3),
             "up_cm": round(float(up), 3),
             "yaw_delta_deg": round(float(yaw_delta), 3),
             "nominal_body_payload": {
@@ -4812,7 +5152,10 @@ class Route5FusionControlMixin:
             },
         }
         payload["action_name"] = "route5_nav_lookahead" if any(abs(float(payload.get(key, 0.0) or 0.0)) > 1e-6 for key in ("forward_cm", "right_cm", "up_cm", "yaw_delta_deg")) else "hold"
-        payload["yaw_policy"] = "face_waypoint_then_forward"
+        payload["yaw_policy"] = "route7_translate_while_yawing_map_route" if route7_translate_while_yawing else "face_waypoint_then_forward"
+        if route7_translate_while_yawing:
+            payload["route7_translation_while_yawing"] = True
+            payload["route7_yaw_translation_scale"] = round(float(scale), 3)
         payload["look_yaw_deg"] = round(float(look_yaw), 3)
         payload["capture_yaw_deg"] = round(float(target.get("yaw", target.get("yaw_deg", 0.0)) or 0.0), 3)
         return payload
@@ -5043,12 +5386,20 @@ class Route5FusionControlMixin:
         self.ensure_route5_state()
         if ObstacleRepresentation3Predictor is None:
             return {"status": "skipped", "reason": "or3_import_unavailable"}
-        model_path = self.default_route5_or3_model_path()
+        route7_primary = self.route5_event_is_route7(event)
+        model_path = self.route5_or3_model_path_for_event(event)
+        variant = "or3_1" if route7_primary else "or3"
         rgb_path = Path(str(event.get("rgb_path", "") or "")).expanduser()
         if not model_path.is_file():
-            return {"status": "skipped", "reason": "model_not_found", "model_path": str(model_path)}
+            result = {"status": "skipped", "reason": "model_not_found", "model_path": str(model_path), "or3_variant": variant}
+            if route7_primary:
+                result["route7_primary_representation"] = "or3_1"
+            return result
         if not rgb_path.is_file():
-            return {"status": "skipped", "reason": "rgb_not_found", "rgb_path": str(rgb_path)}
+            result = {"status": "skipped", "reason": "rgb_not_found", "rgb_path": str(rgb_path), "or3_variant": variant, "model_path": str(model_path)}
+            if route7_primary:
+                result["route7_primary_representation"] = "or3_1"
+            return result
         try:
             predictor_path = str(model_path)
             if getattr(self, "route5_or3_predictor", None) is None or str(getattr(self, "route5_or3_predictor_path", "")) != predictor_path:
@@ -5060,10 +5411,13 @@ class Route5FusionControlMixin:
             prediction["prediction_latency_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
             prediction["status"] = "ok"
             prediction["model_path"] = str(model_path)
+            prediction["or3_variant"] = variant
+            if route7_primary:
+                prediction["route7_primary_representation"] = "or3_1"
             capture_dir = Path(str(event.get("capture_dir", ""))) if str(event.get("capture_dir", "") or "") else rgb_path.parent
             capture_dir.mkdir(parents=True, exist_ok=True)
-            overlay_path = capture_dir / "or3_risk_overlay.png"
-            prediction_path = capture_dir / "or3_risk_prediction.json"
+            overlay_path = capture_dir / f"{variant}_risk_overlay.png"
+            prediction_path = capture_dir / f"{variant}_risk_prediction.json"
             if render_or3_affordance_overlay is not None:
                 try:
                     rgb_image = np.asarray(Image.open(str(rgb_path)).convert("RGB"), dtype=np.uint8)
@@ -5083,19 +5437,41 @@ class Route5FusionControlMixin:
                     "prediction_latency_ms": prediction.get("prediction_latency_ms"),
                     "risk_overlay_path": prediction.get("risk_overlay_path", ""),
                     "model_path": str(model_path),
+                    "or3_variant": variant,
+                    "route7_primary_representation": prediction.get("route7_primary_representation", ""),
                 },
             )
             return prediction
         except Exception as exc:
-            return {"status": "error", "reason": str(exc), "model_path": str(model_path), "rgb_path": str(rgb_path)}
+            result = {"status": "error", "reason": str(exc), "model_path": str(model_path), "rgb_path": str(rgb_path), "or3_variant": variant}
+            if route7_primary:
+                result["route7_primary_representation"] = "or3_1"
+            return result
 
     def route5_predict_obstacle_representation(self, event: Dict[str, Any]) -> Dict[str, Any]:
         self.ensure_route5_state()
-        model_path = Path(str(self.llm_route5_representation_model_var.get() or "")).expanduser()
+        route7_primary = self.route5_event_is_route7(event)
         rgb_path = Path(str(event.get("rgb_path", "") or "")).expanduser()
         or3_prediction = self.route5_predict_obstacle_representation_3(event)
         if isinstance(or3_prediction, dict) and or3_prediction.get("status") == "ok":
             event["or3_prediction"] = or3_prediction
+            if route7_primary:
+                event["or3_1_prediction"] = or3_prediction
+                return {
+                    **or3_prediction,
+                    "route7_primary_representation": "or3_1",
+                    "or3_variant": "or3_1",
+                    "or2_replaced_by": "or3_1",
+                }
+        if route7_primary:
+            return {
+                **(or3_prediction if isinstance(or3_prediction, dict) else {}),
+                "status": str((or3_prediction if isinstance(or3_prediction, dict) else {}).get("status", "skipped") or "skipped"),
+                "route7_primary_representation": "or3_1",
+                "or3_variant": "or3_1",
+                "or2_replaced_by": "or3_1",
+            }
+        model_path = Path(str(self.llm_route5_representation_model_var.get() or "")).expanduser()
         if not model_path.is_file():
             return {"status": "skipped", "reason": "model_not_found", "model_path": str(model_path)}
         if not rgb_path.is_file():
@@ -5469,7 +5845,22 @@ class Route5FusionControlMixin:
         target_pose: Dict[str, float],
         last_action: Dict[str, Any],
     ) -> Dict[str, Any]:
-        prediction = event.get("or2_prediction", {}) if isinstance(event.get("or2_prediction"), dict) else {}
+        route7_primary_event = self.route5_event_is_route7(event)
+        or2_prediction = event.get("or2_prediction", {}) if isinstance(event.get("or2_prediction"), dict) else {}
+        or3_1_prediction = event.get("or3_1_prediction", {}) if isinstance(event.get("or3_1_prediction"), dict) else {}
+        or3_prediction = event.get("or3_prediction", {}) if isinstance(event.get("or3_prediction"), dict) else {}
+        prediction = or2_prediction
+        route7_or3_1_primary = False
+        if route7_primary_event:
+            if or3_1_prediction.get("front_risk_state"):
+                prediction = or3_1_prediction
+                route7_or3_1_primary = True
+            elif or3_prediction.get("front_risk_state"):
+                prediction = or3_prediction
+                route7_or3_1_primary = True
+            elif str(or2_prediction.get("route7_primary_representation", "") or "") == "or3_1" or str(or2_prediction.get("or3_variant", "") or "") == "or3_1":
+                prediction = or2_prediction
+                route7_or3_1_primary = True
         if str(prediction.get("status", "ok") or "ok") != "ok" or "front_risk_state" not in prediction:
             return self.route5_depth_pointcloud_fallback_decision(event, nominal_payload, config, current_pose, start_pose, target_pose, last_action)
         summary = event.get("pointcloud_summary", {}) if isinstance(event.get("pointcloud_summary"), dict) else {}
@@ -5481,8 +5872,10 @@ class Route5FusionControlMixin:
         front_blocked = bool(rule.get("front_blocked", False))
         active = bool(selected_direction not in {"forward", "slow_forward"} or front_blocked or risk_state in {"must_stop", "obstacle_warning"})
         reason = str(rule.get("reason", "or2_direction_rule"))
+        if route7_or3_1_primary and reason == "or2_direction_rule":
+            reason = "or3_1_direction_rule"
         gate = {
-            "source": "route5_or2_a_plus_2",
+            "source": "route7_or3_1_a_plus_3_1" if route7_or3_1_primary else "route5_or2_a_plus_2",
             "avoidance_active": active,
             "front_risk_state": risk_state,
             "can_forward": bool(prediction.get("can_forward", selected_direction in {"forward", "slow_forward"})),
@@ -5490,6 +5883,7 @@ class Route5FusionControlMixin:
             "front_min_depth_cm": float(front_depth),
             "selected_direction": selected_direction,
             "reason": reason,
+            "route7_primary_representation": "or3_1" if route7_or3_1_primary else "",
         }
         route7_policy = self.route7_or2_soft_obstacle_policy(event, gate, current_pose, target_pose, rule=rule)
         if str(route7_policy.get("mode", "") or "") == "continue_planned_route":
@@ -5549,9 +5943,13 @@ class Route5FusionControlMixin:
         if alternative.get("route7_yaw_error_deg") is not None:
             gate["route7_yaw_error_deg"] = alternative.get("route7_yaw_error_deg")
         selected_action = str(payload.get("action_name", selected_direction))
-        phase = "OR2_AVOIDANCE" if active else "ROUTE_NAVIGATION"
+        phase = "OR3_1_AVOIDANCE" if active and route7_or3_1_primary else ("OR2_AVOIDANCE" if active else "ROUTE_NAVIGATION")
         event_updates = {
             "or2_prediction": prediction,
+            "or3_prediction": prediction if route7_or3_1_primary else event.get("or3_prediction", {}),
+            "or3_1_prediction": prediction if route7_or3_1_primary else event.get("or3_1_prediction", {}),
+            "or3_1_primary": bool(route7_or3_1_primary),
+            "route7_primary_representation": "or3_1" if route7_or3_1_primary else "",
             "or2_rule": rule,
             "or2_front_risk_state": risk_state,
             "or2_can_forward": gate["can_forward"],
@@ -6206,7 +6604,10 @@ class Route5FusionControlMixin:
             goal=target_pose,
             last_action=last_action,
         )
-        event["source"] = "llm_route_v5_or2_fused_navigation"
+        route7_primary = self.route5_event_is_route7(event)
+        if route7_primary:
+            event["route_window_label"] = "V7"
+        event["source"] = "llm_route_v7_or3_1_fused_navigation" if route7_primary else "llm_route_v5_or2_fused_navigation"
         event["route5_stage"] = stage
         event["facade"] = facade
         event["target_id"] = target_id
@@ -6215,10 +6616,22 @@ class Route5FusionControlMixin:
         event["nominal_payload"] = nominal_payload or {}
         prediction = self.route5_predict_obstacle_representation(event)
         event["or2_prediction"] = prediction
+        if route7_primary:
+            event["or3_prediction"] = prediction if isinstance(prediction, dict) else {}
+            event["or3_1_prediction"] = prediction if isinstance(prediction, dict) else {}
+            event["route7_primary_representation"] = "or3_1"
         if isinstance(prediction, dict) and isinstance(prediction.get("or3_prediction"), dict):
             event["or3_prediction"] = prediction.get("or3_prediction", {})
-        event["representation_prediction"] = {"status": "replaced_by_or2", "or2_front_risk_state": prediction.get("front_risk_state", "")}
-        event["representation_obstacle_hint"] = "or2_risk_region"
+        event["representation_prediction"] = (
+            {
+                "status": "replaced_by_or3_1",
+                "route7_primary_representation": "or3_1",
+                "or3_1_front_risk_state": prediction.get("front_risk_state", "") if isinstance(prediction, dict) else "",
+            }
+            if route7_primary
+            else {"status": "replaced_by_or2", "or2_front_risk_state": prediction.get("front_risk_state", "")}
+        )
+        event["representation_obstacle_hint"] = "or3_1_risk_region" if route7_primary else "or2_risk_region"
         try:
             event["local_obstacle_map_update"] = self.update_local_obstacle_map_from_event(
                 event,
@@ -6233,11 +6646,12 @@ class Route5FusionControlMixin:
         self.append_jsonl(
             output_dir / "route5_or2_risk_events.jsonl",
             {
-                "event_type": "or2_prediction",
+                "event_type": "or3_1_prediction" if route7_primary else "or2_prediction",
                 "created_at": datetime.now().isoformat(timespec="milliseconds"),
                 "frame_id": frame_id,
                 "facade": facade,
                 "target_id": target_id,
+                "route7_primary_representation": "or3_1" if route7_primary else "",
                 "prediction": serializable_or2_prediction(prediction) if isinstance(prediction, dict) else {},
                 "or3_prediction": serializable_or2_prediction(event.get("or3_prediction", {})) if isinstance(event.get("or3_prediction"), dict) else {},
                 "risk_overlay_path": str(prediction.get("risk_overlay_path", "") if isinstance(prediction, dict) else ""),
@@ -6248,11 +6662,12 @@ class Route5FusionControlMixin:
             self.append_jsonl(
                 output_dir / "route5_or3_risk_events.jsonl",
                 {
-                    "event_type": "or3_prediction",
+                    "event_type": "or3_1_prediction" if route7_primary else "or3_prediction",
                     "created_at": datetime.now().isoformat(timespec="milliseconds"),
                     "frame_id": frame_id,
                     "facade": facade,
                     "target_id": target_id,
+                    "route7_primary_representation": "or3_1" if route7_primary else "",
                     "prediction": serializable_or2_prediction(event["or3_prediction"]),
                     "risk_overlay_path": str(event["or3_prediction"].get("risk_overlay_path", "")),
                     "prediction_json_path": str(event["or3_prediction"].get("prediction_json_path", "")),
@@ -6272,7 +6687,8 @@ class Route5FusionControlMixin:
                 "last_target_id": target_id,
                 "last_risk_state": risk_state,
                 "last_updated_at": datetime.now().isoformat(timespec="milliseconds"),
-                "model_path": str(self.llm_route5_representation_model_var.get() or ""),
+                "representation_source": "or3_1" if route7_primary else "or2",
+                "model_path": str(self.default_route7_or31_model_path() if route7_primary else self.llm_route5_representation_model_var.get() or ""),
             }
         )
         self.route5_update_state(or2_monitor=self.route5_json_safe(monitor))
@@ -6280,7 +6696,8 @@ class Route5FusionControlMixin:
         try:
             risk = str(prediction.get("front_risk_state", prediction.get("status", "unknown")) or "unknown")
             front = float((event.get("pointcloud_summary", {}) if isinstance(event.get("pointcloud_summary"), dict) else {}).get("front_min_depth_cm", 0.0) or 0.0)
-            self.root.after(0, lambda r=risk, f=front: self.llm_route5_representation_status_var.set(f"OR2: state={r} front={f:.1f}cm"))
+            label = "OR3_1" if route7_primary else "OR2"
+            self.root.after(0, lambda r=risk, f=front, label=label: self.llm_route5_representation_status_var.set(f"{label}: state={r} front={f:.1f}cm"))
         except Exception:
             pass
         return event
@@ -6524,11 +6941,12 @@ class Route5FusionControlMixin:
                         last_action=last_action,
                     )
                     gate = or2_decision["gate"]
+                    representation_label = "OR3_1" if str(gate.get("source", "") or "") == "route7_or3_1_a_plus_3_1" else "OR2"
                     event["llm_strategy"] = {
-                        "strategy_source": "route5_or2_a_plus_2",
+                        "strategy_source": str(gate.get("source", "route5_or2_a_plus_2") or "route5_or2_a_plus_2"),
                         "llm_call_required": False,
                         "strategy_cache_hit": False,
-                        "strategy_cache_reason": "OR2 direction rule, no LLM strategy required for local tick",
+                        "strategy_cache_reason": f"{representation_label} direction rule, no LLM strategy required for local tick",
                     }
                     event.update(or2_decision["event_updates"])
                     payload = dict(or2_decision["payload"])
@@ -6793,7 +7211,7 @@ class Route5FusionControlMixin:
                         target_reset=event.get("target_reset_record", event.get("target_reset_candidate", {})),
                         thinking_status=(
                             f"Thinking: {stage} {decision_status} look waypoint yaw={float(lookahead_plan.get('look_yaw_deg', 0.0)):.1f} "
-                            f"OR2 state={gate.get('front_risk_state', 'fallback')} selected={gate.get('selected_direction', event.get('or2_selected_direction', '--'))} "
+                            f"{representation_label} state={gate.get('front_risk_state', 'fallback')} selected={gate.get('selected_direction', event.get('or2_selected_direction', '--'))} "
                             f"front={float(gate.get('front_min_depth_cm', 0.0)):.1f}cm {gate.get('reason', '')}"
                         ),
                     )
@@ -6801,8 +7219,8 @@ class Route5FusionControlMixin:
                     self.route5_log_event(output_dir, "or2_navigation_decision", decision)
                     self.root.after(
                         0,
-                        lambda d=or2_decision, g=gate: self.llm_route5_avoidance_status_var.set(
-                            f"OR2: state={g.get('front_risk_state', 'fallback')} selected={d.get('selected_direction', '--')} "
+                        lambda d=or2_decision, g=gate, label=representation_label: self.llm_route5_avoidance_status_var.set(
+                            f"{label}: state={g.get('front_risk_state', 'fallback')} selected={d.get('selected_direction', '--')} "
                             f"front={float(g.get('front_min_depth_cm', 0.0)):.1f}cm can_forward={'yes' if g.get('can_forward', False) else 'no'}"
                         ),
                     )
@@ -7321,7 +7739,10 @@ class Route5FusionControlMixin:
                 blocked = set(terminal_failed)
                 if len(completed | terminal_failed) >= 4:
                     break
-                facade_candidates = self.route2_all_facade_observation_candidates(target_house_id, skip_completed=False)
+                if str(route_window_label or "").strip().upper() == "V7":
+                    facade_candidates = self.route7_edge_observation_candidates_for_house(target_house_id, output_dir=output_dir)
+                else:
+                    facade_candidates = self.route2_all_facade_observation_candidates(target_house_id, skip_completed=False)
                 ranked_candidates = self.route5_rank_observation_candidates(target_house_id, facade_candidates, completed, blocked, start_pose=self.route3_current_pose(session))
                 self.route5_update_state(ranked_facade_candidates=ranked_candidates)
                 decision = self.route5_decide_next_facade(target_house_id, ranked_candidates, completed, blocked)
@@ -8323,6 +8744,47 @@ class Route5FusionControlMixin:
             )
         return points
 
+    def route7_observation_overlay_points(self, target_house_id: str, active: Dict[str, Any]) -> List[Dict[str, Any]]:
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        facade = str(active.get("facade", state.get("current_facade", "")) or "").strip().lower()
+        if facade not in {"south", "east", "north", "west"}:
+            return []
+        output_dir = self.route7_current_map_output_dir()
+        attempts: List[Dict[str, Any]] = []
+        for candidate in state.get("ranked_facade_candidates", []) if isinstance(state.get("ranked_facade_candidates", []), list) else []:
+            if not isinstance(candidate, dict) or str(candidate.get("facade", "") or "").strip().lower() != facade:
+                continue
+            raw_attempts = candidate.get("route7_edge_observation_attempts", []) if isinstance(candidate.get("route7_edge_observation_attempts", []), list) else []
+            if not raw_attempts:
+                raw_attempts = candidate.get("observation_attempts", []) if isinstance(candidate.get("observation_attempts", []), list) else []
+            attempts.extend([dict(item) for item in raw_attempts if isinstance(item, dict)])
+            break
+        if not attempts:
+            attempts = self.route7_edge_observation_attempts_for_facade(target_house_id, facade, output_dir=output_dir)
+        active_target = str(active.get("target_id", "") or "")
+        points: List[Dict[str, Any]] = []
+        for idx, item in enumerate(attempts, start=1):
+            try:
+                float(item.get("x"))
+                float(item.get("y"))
+            except Exception:
+                continue
+            target_id = str(item.get("target_id", item.get("label", f"{target_house_id}_{facade}_edge_obs_{idx:03d}")) or "")
+            status = "active" if active_target and target_id == active_target else str(item.get("status", "pending") or "pending")
+            points.append(
+                {
+                    **self.route5_json_safe(item),
+                    **self.route5_map_status_style(status),
+                    "label": target_id or f"{target_house_id}_{facade}_edge_obs_{idx:03d}",
+                    "target_id": target_id or f"{target_house_id}_{facade}_edge_obs_{idx:03d}",
+                    "facade": facade,
+                    "status": status,
+                    "route_point_type": "route7_edge_observation_point",
+                    "overlay": "current_facade_edge_observation_points",
+                }
+            )
+        return points
+
     def route5_facade_capture_overlay_points(self, active: Dict[str, Any]) -> List[Dict[str, Any]]:
         state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
         facade = str(active.get("facade", state.get("current_facade", "")) or "").strip().lower()
@@ -8744,7 +9206,15 @@ class Route5FusionControlMixin:
 
     def route5_or2_monitor_result_from_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
         event = event if isinstance(event, dict) else {}
-        prediction = event.get("or2_prediction", {}) if isinstance(event.get("or2_prediction"), dict) else {}
+        route7_or3_1 = self.route5_event_is_route7(event) and (
+            isinstance(event.get("or3_1_prediction"), dict) or isinstance(event.get("or3_prediction"), dict)
+        )
+        if route7_or3_1 and isinstance(event.get("or3_1_prediction"), dict):
+            prediction = event.get("or3_1_prediction", {})
+        elif route7_or3_1 and isinstance(event.get("or3_prediction"), dict):
+            prediction = event.get("or3_prediction", {})
+        else:
+            prediction = event.get("or2_prediction", {}) if isinstance(event.get("or2_prediction"), dict) else {}
         rule = event.get("or2_rule", {}) if isinstance(event.get("or2_rule"), dict) else {}
         summary = event.get("pointcloud_summary", {}) if isinstance(event.get("pointcloud_summary"), dict) else {}
         if not summary and isinstance(event.get("depth_obstacle_summary"), dict):
@@ -8753,6 +9223,7 @@ class Route5FusionControlMixin:
         mask_image = None
         rgb_path = str(event.get("rgb_path", "") or "")
         overlay_path = str(prediction.get("risk_overlay_path", event.get("or2_risk_overlay_path", "")) or "")
+        representation_label = "OR3_1" if route7_or3_1 else "OR2"
         try:
             if rgb_path and Path(rgb_path).is_file():
                 rgb_image = np.asarray(Image.open(rgb_path).convert("RGB"), dtype=np.uint8)
@@ -8780,6 +9251,8 @@ class Route5FusionControlMixin:
             "or2_selected_direction": rule.get("selected_direction", event.get("or2_selected_direction", "")),
             "or2_candidate_action_scores": rule.get("candidate_action_scores", event.get("or2_candidate_action_scores", {})),
             "pointcloud_summary": summary,
+            "representation_label": representation_label,
+            "route7_primary_representation": "or3_1" if route7_or3_1 else "",
         }
         return {
             "event_record": record,
@@ -8800,14 +9273,15 @@ class Route5FusionControlMixin:
         selected = str(rule.get("selected_direction", record.get("or2_selected_direction", "--")) or "--")
         front = float(summary.get("front_min_depth_cm", record.get("front_min_depth_cm", 0.0)) or 0.0)
         frame_count = int(result.get("frame_count", 0) or 0)
+        representation_label = str(record.get("representation_label", "OR2") or "OR2")
         self.route5_or2_state_var.set(f"State: {risk}")
         self.route5_or2_frame_count_var.set(f"Frames: {frame_count}")
         self.route5_or2_front_depth_var.set(f"Front depth: {front:.1f} cm")
         self.route5_or2_can_forward_var.set(f"Can forward: {'yes' if prediction.get('can_forward', False) else 'no'}")
         self.route5_or2_selected_direction_var.set(f"Selected direction: {selected}")
         self.route5_or2_corridor_var.set(self.route5_or2_corridor_text(rule.get("corridor_risks", {})))
-        self.route5_or2_capture_dir_var.set(f"OR2 capture: {record.get('frame_dir', '--')}")
-        self.llm_route5_representation_status_var.set(f"OR2: state={risk} selected={selected} front={front:.1f}cm")
+        self.route5_or2_capture_dir_var.set(f"{representation_label} capture: {record.get('frame_dir', '--')}")
+        self.llm_route5_representation_status_var.set(f"{representation_label}: state={risk} selected={selected} front={front:.1f}cm")
         self.route5_update_or2_state_color(risk)
         if self.route5_or2_rgb_label is not None and isinstance(result.get("rgb_image"), np.ndarray):
             self.route5_or2_rgb_photo = self.route5_or2_array_to_photo(result["rgb_image"])
@@ -8828,8 +9302,8 @@ class Route5FusionControlMixin:
         self.ensure_route5_state()
         self.route5_or2_monitor_stop_event.set()
 
-    def build_route5_or2_monitor_panel(self, parent: tk.Misc) -> tk.LabelFrame:
-        monitor = tk.LabelFrame(parent, text="OR2 Live Risk Monitor")
+    def build_route5_or2_monitor_panel(self, parent: tk.Misc, *, representation_label: str = "OR2") -> tk.LabelFrame:
+        monitor = tk.LabelFrame(parent, text=f"{representation_label} Live Risk Monitor")
         monitor.grid_columnconfigure(0, weight=1)
         controls = tk.Frame(monitor)
         controls.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 3))
@@ -8859,7 +9333,8 @@ class Route5FusionControlMixin:
         rgb_frame = tk.LabelFrame(image_row, text="RGB", width=380, height=260)
         rgb_frame.pack(side="left", padx=(0, 8), pady=0)
         rgb_frame.pack_propagate(False)
-        mask_frame = tk.LabelFrame(image_row, text="A+2 Risk Overlay", width=380, height=260)
+        overlay_title = "A+3.1 Risk Overlay" if str(representation_label).upper() == "OR3_1" else "A+2 Risk Overlay"
+        mask_frame = tk.LabelFrame(image_row, text=overlay_title, width=380, height=260)
         mask_frame.pack(side="left", padx=(8, 0), pady=0)
         mask_frame.pack_propagate(False)
         self.route5_or2_rgb_label = tk.Label(rgb_frame, text="No RGB yet")
@@ -8913,6 +9388,15 @@ class Route5FusionControlMixin:
     ) -> tk.LabelFrame:
         self.ensure_route5_state()
         label = str(route_label or "V5").strip().upper() or "V5"
+        representation_label = "OR3_1" if label == "V7" else "OR2"
+        representation_default_path = self.default_route7_or31_model_path() if label == "V7" else self.default_route5_representation_model_path()
+        if label == "V7":
+            try:
+                current_model = str(self.llm_route5_representation_model_var.get() or "")
+                if not current_model or current_model == str(self.default_route5_representation_model_path()):
+                    self.llm_route5_representation_model_var.set(str(representation_default_path))
+            except Exception:
+                pass
         route = tk.LabelFrame(parent, text=f"LLM House Entrance Route {label} Fused Route + Avoidance")
         for col in (1, 3, 5):
             route.grid_columnconfigure(col, weight=1)
@@ -8942,9 +9426,9 @@ class Route5FusionControlMixin:
 
         rep = tk.Frame(route)
         rep.grid(row=3, column=0, columnspan=6, sticky="ew", padx=0, pady=(0, 2))
-        tk.Label(rep, text="OR2 Model").pack(side="left", padx=(6, 2), pady=4)
+        tk.Label(rep, text=f"{representation_label} Model").pack(side="left", padx=(6, 2), pady=4)
         tk.Entry(rep, textvariable=self.llm_route5_representation_model_var, width=42).pack(side="left", fill="x", expand=True, padx=(0, 6), pady=4)
-        tk.Button(rep, text="Default", command=lambda: self.llm_route5_representation_model_var.set(str(self.default_route5_representation_model_path()))).pack(side="left", padx=6, pady=4)
+        tk.Button(rep, text="Default", command=lambda path=representation_default_path: self.llm_route5_representation_model_var.set(str(path))).pack(side="left", padx=6, pady=4)
         tk.Label(rep, text="OA3 Plan").pack(side="left", padx=(6, 2), pady=4)
         tk.Entry(rep, textvariable=self.llm_route5_oa3_plan_var, width=34).pack(side="left", fill="x", expand=True, padx=(0, 6), pady=4)
         tk.Label(rep, text="Sense interval s").pack(side="left", padx=(6, 2), pady=4)
@@ -9080,7 +9564,7 @@ class Route5FusionControlMixin:
         target_house_id = str(state.get("target_house_id", "") or self.selected_route_target_house_id() or "")
         points: List[Dict[str, Any]] = []
         if target_house_id:
-            points.extend(self.route5_observation_overlay_points(target_house_id, active))
+            points.extend(self.route7_observation_overlay_points(target_house_id, active))
         for point in self.route5_active_map_route_points():
             item = dict(point if isinstance(point, dict) else {})
             route_type = str(item.get("route_point_type", "") or "")
@@ -9114,6 +9598,7 @@ class Route5FusionControlMixin:
         strong = abs(z_cm - selected_z) <= 25.0
         palette = {
             "observation_point": ((21, 101, 192), (170, 205, 235)),
+            "route7_edge_observation_point": ((21, 101, 192), (170, 205, 235)),
             "current_target": ((194, 24, 91), (238, 183, 207)),
             "navigation_waypoint": ((46, 125, 50), (184, 220, 186)),
             "original_navigation_target": ((2, 132, 199), (186, 230, 253)),
@@ -9144,8 +9629,20 @@ class Route5FusionControlMixin:
         strong = key == selected
         if strong:
             return base, True
-            pale = tuple(int(round(float(channel) * 0.35 + 255.0 * 0.65)) for channel in base)
+        pale = tuple(int(round(float(channel) * 0.35 + 255.0 * 0.65)) for channel in base)
         return pale, False
+
+    def route7_drawable_realtime_route_plan(self) -> Dict[str, Any]:
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        current = state.get("route7_realtime_route_plan", {}) if isinstance(state.get("route7_realtime_route_plan", {}), dict) else {}
+        current_segments = current.get("route7_route_segments", []) if isinstance(current.get("route7_route_segments", []), list) else []
+        if current_segments:
+            return current
+        fallback = state.get("route7_last_drawable_route_plan", {}) if isinstance(state.get("route7_last_drawable_route_plan", {}), dict) else {}
+        fallback_segments = fallback.get("route7_route_segments", []) if isinstance(fallback.get("route7_route_segments", []), list) else []
+        if fallback_segments:
+            return fallback
+        return current
 
     def route7_static_house_base(self) -> Dict[str, Any]:
         state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
@@ -9259,8 +9756,7 @@ class Route5FusionControlMixin:
         metadata = self.route6_update_map_load_layer_metadata(layer_record) if callable(getattr(self, "route6_update_map_load_layer_metadata", None)) else {}
         if not metadata:
             return image
-        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
-        route_plan = state.get("route7_realtime_route_plan", {}) if isinstance(state.get("route7_realtime_route_plan", {}), dict) else {}
+        route_plan = self.route7_drawable_realtime_route_plan()
         segments = route_plan.get("route7_route_segments", []) if isinstance(route_plan.get("route7_route_segments", []), list) else []
         if not segments:
             return image
@@ -9344,6 +9840,276 @@ class Route5FusionControlMixin:
                 draw.line((start[0], start[1], end[0], end[1]), fill=(46, 125, 50), width=max(1, 2 * factor))
         return image
 
+    def route7_observation_formula_text(self, target_house_id: str = "", facade: str = "") -> str:
+        hid = str(target_house_id or self.selected_route_target_house_id() or "").strip()
+        selected_facade = str(facade or "").strip().lower()
+        bbox: Dict[str, Any] = {}
+        if hid:
+            try:
+                bbox = self.house_world_bbox_for_id(hid)
+            except Exception:
+                bbox = {}
+        formula: Dict[str, Any] = {}
+        if bbox and selected_facade in {"south", "east", "north", "west"}:
+            formula = self.route7_lidar_edge_observation_formula(bbox, selected_facade)
+        elif bbox:
+            selected_facade = "south"
+            formula = self.route7_lidar_edge_observation_formula(bbox, selected_facade)
+        lidar_radius = self.route7_lidar_radius_cm()
+        effective_radius = 0.8 * float(lidar_radius)
+        lines = [
+            "Route7 Edge Observation Formula",
+            "",
+            "Minimum facade-edge points:",
+            "  R_lidar = lidar_depth_max_cm",
+            "  R_eff = 0.8 * R_lidar",
+            "  L_edge = abs(axis_max - axis_min)",
+            "  N_edge = max(1, ceil(L_edge / R_eff))",
+            "  spacing = L_edge / N_edge",
+            "  axis_i = axis_min + (i + 0.5) * spacing",
+            "  D_obs = clamp(0.65 * R_eff, 250 cm, 0.95 * R_eff)",
+            "  P_i = facade_pose(axis_i, D_obs, z=300 cm)",
+            "",
+            "Obstacle redesign:",
+            "  c_i = map_cell(P_i, selected_layer)",
+            "  if occupied(inflate(map), c_i):",
+            "      c_i' = nearest_free_cell(inflate(map), c_i)",
+            "      P_i' = cell_center_pose(c_i', z=300 cm, yaw=face_facade)",
+            "",
+            "Spatial A* navigation:",
+            "  route7_spatial_occupancy_astar searches x_cell, y_cell, and z_layer.",
+            "  z_300 is preferred first; alternate layers add vertical transition waypoints.",
+            "",
+            f"Current R_lidar: {lidar_radius:.1f} cm",
+            f"Current R_eff: {effective_radius:.1f} cm",
+        ]
+        if formula:
+            lines.extend(
+                [
+                    f"Current house: {hid}",
+                    f"Current facade: {selected_facade}",
+                    f"L_edge: {float(formula.get('edge_length_cm', 0.0) or 0.0):.1f} cm",
+                    f"N_edge: {int(formula.get('point_count', 0) or 0)}",
+                    f"spacing: {float(formula.get('spacing_cm', 0.0) or 0.0):.1f} cm",
+                    f"D_obs: {float(formula.get('observation_standoff_cm', 0.0) or 0.0):.1f} cm",
+                ]
+            )
+        return "\n".join(lines)
+
+    def open_route7_observation_formula_window(self) -> None:
+        self.ensure_route7_state()
+        try:
+            window = tk.Toplevel(getattr(self, "root", None))
+            window.title("Route7 Observation Formula")
+            window.geometry("760x520")
+            frame = tk.Frame(window)
+            frame.pack(fill="both", expand=True, padx=8, pady=8)
+            text = tk.Text(frame, wrap="word", font=("Consolas", 10))
+            scroll = tk.Scrollbar(frame, orient="vertical", command=text.yview)
+            text.configure(yscrollcommand=scroll.set)
+            text.pack(side="left", fill="both", expand=True)
+            scroll.pack(side="right", fill="y")
+            text.insert("1.0", self.route7_observation_formula_text())
+            text.configure(state="disabled")
+        except Exception as exc:
+            try:
+                self.llm_route7_map_status_var.set(f"Route V7 Formula: failed: {exc}")
+            except Exception:
+                pass
+
+    def route7_task_switch_records(self) -> List[Dict[str, Any]]:
+        self.ensure_route7_state()
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        plan = state.get("task_plan", {}) if isinstance(state.get("task_plan", {}), dict) else {}
+        if not plan:
+            output_dir = self.route7_current_map_output_dir()
+            try:
+                path = Path(output_dir) / "route5_task_plan.json" if output_dir is not None else None
+                payload = json.loads(path.read_text(encoding="utf-8")) if path is not None and path.is_file() else {}
+                plan = payload.get("plan", {}) if isinstance(payload.get("plan", {}), dict) else {}
+            except Exception:
+                plan = {}
+        subtasks = plan.get("subtasks", []) if isinstance(plan.get("subtasks", []), list) else []
+        ordered: List[str] = []
+        for item in subtasks:
+            if not isinstance(item, dict):
+                continue
+            facade = str(item.get("facade", "") or "").strip().lower()
+            if facade and facade not in ordered:
+                ordered.append(facade)
+        if not ordered:
+            ordered = list(plan.get("facade_priority", [])) if isinstance(plan.get("facade_priority", []), list) else []
+            ordered = [str(item).strip().lower() for item in ordered if str(item).strip()]
+        if not ordered:
+            ordered = ["south", "east", "west", "north"]
+        completed = {str(item).strip().lower() for item in (getattr(self, "llm_route5_completed_facades", set()) or set())}
+        completed.update(str(item).strip().lower() for item in state.get("completed_facades", []) if str(item).strip())
+        blocked = {str(item).strip().lower() for item in (getattr(self, "llm_route5_blocked_facades", set()) or set())}
+        blocked.update(str(item).strip().lower() for item in state.get("blocked_facades", []) if str(item).strip())
+        current_facade = str(state.get("current_facade", "") or "").strip().lower()
+        stage = str(state.get("stage", "") or "").strip()
+        records: List[Dict[str, Any]] = []
+        for index, facade in enumerate(ordered, start=1):
+            status = "pending"
+            if facade in completed:
+                status = "completed"
+            elif facade in blocked:
+                status = "blocked"
+            elif facade and facade == current_facade:
+                status = "active"
+            records.append(
+                {
+                    "order": index,
+                    "facade": facade,
+                    "status": status,
+                    "stage": stage if status == "active" else "",
+                    "is_current": bool(facade and facade == current_facade),
+                }
+            )
+        return records
+
+    def route7_subtask_switch_records(self) -> List[Dict[str, Any]]:
+        self.ensure_route7_state()
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        active = state.get("current_exploration_status", {}) if isinstance(state.get("current_exploration_status", {}), dict) else {}
+        facade = str(active.get("facade", state.get("current_facade", "")) or "").strip().lower()
+        stage = str(active.get("stage", state.get("stage", "")) or "").strip().upper()
+        completed_facades = {str(item).strip().lower() for item in (getattr(self, "llm_route5_completed_facades", set()) or set())}
+        completed_facades.update(str(item).strip().lower() for item in state.get("completed_facades", []) if str(item).strip())
+        raw_scan_points: List[Dict[str, Any]] = []
+        for source in (state.get("current_facade_scan_points", []), state.get("facade_scan_points", [])):
+            if isinstance(source, list):
+                raw_scan_points.extend([dict(item) for item in source if isinstance(item, dict)])
+        if not raw_scan_points:
+            route2_state = getattr(self, "llm_route2_state", {}) if isinstance(getattr(self, "llm_route2_state", {}), dict) else {}
+            source = route2_state.get("facade_scan_points", [])
+            if isinstance(source, list):
+                raw_scan_points.extend([dict(item) for item in source if isinstance(item, dict)])
+        scan_points = [
+            item for item in raw_scan_points
+            if not facade or str(item.get("facade", facade) or "").strip().lower() == facade
+        ]
+        completed_scan_ids = self.route5_completed_scan_ids()
+        active_target_id = str(active.get("target_id", active.get("scan_id", "")) or "")
+
+        def phase_status(label: str) -> str:
+            if facade and facade in completed_facades:
+                return "completed"
+            if label == "observe":
+                if stage in {"NAV_TO_OBS", "OBSERVE", "OBSERVATION_CAPTURE"}:
+                    return "active"
+                if stage in {"BUILD_MAP", "NAV_TO_SCAN_POINT", "SCAN", "VALIDATE", "ANALYZE", "COMPLETE_FACADE"} or scan_points:
+                    return "completed"
+            if label == "map":
+                if stage in {"BUILD_MAP", "ROUTE7_BUILD_MAP", "MAP_UPDATE"}:
+                    return "active"
+                if stage in {"NAV_TO_SCAN_POINT", "SCAN", "VALIDATE", "ANALYZE", "COMPLETE_FACADE"} or scan_points:
+                    return "completed"
+            if label == "validate" and stage in {"VALIDATE", "ANALYZE", "COMPLETE_FACADE"}:
+                return "active" if stage != "COMPLETE_FACADE" else "completed"
+            return "pending"
+
+        records: List[Dict[str, Any]] = [
+            {"order": 1, "label": "observe", "status": phase_status("observe"), "facade": facade},
+            {"order": 2, "label": "map", "status": phase_status("map"), "facade": facade},
+        ]
+        scan_start = len(records) + 1
+        for index, point in enumerate(scan_points, start=1):
+            scan_id = str(point.get("scan_id", point.get("target_id", point.get("label", ""))) or "")
+            status = "completed" if scan_id and scan_id in completed_scan_ids else "pending"
+            if stage == "NAV_TO_SCAN_POINT" and active_target_id and scan_id == active_target_id:
+                status = "active"
+            elif stage == "NAV_TO_SCAN_POINT" and not active_target_id and index == 1:
+                status = "active"
+            records.append(
+                {
+                    "order": scan_start + index - 1,
+                    "label": f"scan {index}",
+                    "status": status,
+                    "facade": facade,
+                    "target_id": scan_id,
+                }
+            )
+        records.append({"order": len(records) + 1, "label": "validate", "status": phase_status("validate"), "facade": facade})
+        return records
+
+    def route7_task_switch_visualization_text(self) -> str:
+        records = self.route7_task_switch_records()
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        house_id = str(state.get("target_house_id", "") or "-")
+        parts: List[str] = []
+        for record in records:
+            label = str(record.get("facade", "") or "-")
+            status = str(record.get("status", "") or "pending")
+            stage = str(record.get("stage", "") or "")
+            parts.append(f"{label}:{status}{('/' + stage) if stage else ''}")
+        subparts = [
+            f"{str(record.get('label', '-') or '-')}:{str(record.get('status', 'pending') or 'pending')}"
+            for record in self.route7_subtask_switch_records()
+        ]
+        suffix = (" | Subtasks: " + " -> ".join(subparts)) if subparts else ""
+        return f"Task switch house={house_id} | " + " -> ".join(parts) + suffix
+
+    def refresh_route7_task_switch_visualization(self) -> None:
+        self.ensure_route7_state()
+        text = self.route7_task_switch_visualization_text()
+        try:
+            self.llm_route7_task_switch_text.set(text)
+        except Exception:
+            pass
+        canvas = getattr(self, "llm_route7_task_switch_canvas", None)
+        if canvas is None:
+            return
+        try:
+            canvas.delete("all")
+            width = max(640, int(canvas.winfo_width() or 1000))
+            height = max(68, int(canvas.winfo_height() or 76))
+            records = self.route7_task_switch_records()
+            if not records:
+                canvas.create_text(12, height // 2, text=text, anchor="w", fill="#4a4a4a")
+                return
+            subtask_records = self.route7_subtask_switch_records()
+            colors = {
+                "active": ("#2f6fed", "white"),
+                "completed": ("#3c9b52", "white"),
+                "blocked": ("#b83a3a", "white"),
+                "pending": ("#d8dde6", "#20242a"),
+            }
+            margin = 12
+            gap = 10
+
+            def draw_row(row_records: List[Dict[str, Any]], y0: int, y1: int, *, kind: str) -> None:
+                if not row_records:
+                    return
+                chip_w = max(78 if kind == "subtask" else 96, int((width - margin * 2 - gap * (len(row_records) - 1)) / max(1, len(row_records))))
+                for index, record in enumerate(row_records):
+                    x0 = margin + index * (chip_w + gap)
+                    x1 = x0 + chip_w
+                    status = str(record.get("status", "pending") or "pending")
+                    fill, fg = colors.get(status, colors["pending"])
+                    canvas.create_rectangle(x0, y0, x1, y1, fill=fill, outline="#6b7280", width=1)
+                    if kind == "subtask":
+                        label = str(record.get("label", "") or "-").upper()
+                        bottom = status
+                    else:
+                        facade = str(record.get("facade", "") or "-").upper()
+                        stage = str(record.get("stage", "") or "")
+                        label = f"{int(record.get('order', index + 1))}. {facade}"
+                        bottom = stage or status
+                    canvas.create_text((x0 + x1) / 2, y0 + 13, text=label, fill=fg, font=("Arial", 9, "bold"))
+                    canvas.create_text((x0 + x1) / 2, y0 + 30, text=bottom, fill=fg, font=("Arial", 8))
+                    if index < len(row_records) - 1:
+                        ax = x1 + 2
+                        ay = (y0 + y1) / 2
+                        canvas.create_line(ax, ay, ax + gap - 4, ay, fill="#6b7280", width=2, arrow="last")
+
+            draw_row(records, 10, 50, kind="facade")
+            if subtask_records:
+                canvas.create_text(margin, 66, text="Subtasks", anchor="w", fill="#4b5563", font=("Arial", 8, "bold"))
+                draw_row(subtask_records, 78, min(height - 8, 118), kind="subtask")
+        except tk.TclError:
+            pass
+
     def refresh_llm_route7_update_map(self, *, build_if_missing: bool = False) -> Dict[str, Any]:
         self.ensure_route7_state()
         if callable(getattr(self, "ensure_route6_state", None)):
@@ -9358,6 +10124,10 @@ class Route5FusionControlMixin:
         manifest = load_manifest(build_if_missing=bool(build_if_missing), output_dir=output_dir) if callable(load_manifest) else {}
         combo = getattr(self, "llm_route7_update_map_layer_combo", None)
         preview = getattr(self, "llm_route7_update_map_preview_label", None)
+        try:
+            self.refresh_route7_task_switch_visualization()
+        except Exception:
+            pass
         if not manifest:
             self.llm_route7_map_status_var.set("Route V7 Map: no Route 6 Update Map layered artifact yet.")
             if preview is not None:
@@ -9460,6 +10230,7 @@ class Route5FusionControlMixin:
         self.llm_route7_update_map_preview_label = None
         self.llm_route7_update_map_preview_photo = None
         self.llm_route7_update_map_layer_combo = None
+        self.llm_route7_task_switch_canvas = None
         self.llm_route5_preview_text = None
         self.llm_route5_analysis_text = None
         self.llm_route5_rgb_label = None
@@ -9547,7 +10318,7 @@ class Route5FusionControlMixin:
         analysis_text.configure(state="disabled")
         self.llm_route5_analysis_text = analysis_text
 
-        monitor = self.build_route5_or2_monitor_panel(content)
+        monitor = self.build_route5_or2_monitor_panel(content, representation_label="OR3_1")
         monitor.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 4))
 
         map_frame = tk.LabelFrame(content, text="Route 6 Update Map Layered Occupancy")
@@ -9568,6 +10339,7 @@ class Route5FusionControlMixin:
         layer_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_llm_route7_update_map(build_if_missing=False))
         tk.Button(toolbar, text="Load Latest Map", command=lambda: self.refresh_llm_route7_update_map(build_if_missing=False)).pack(side="left", padx=6)
         tk.Button(toolbar, text="Route 6 Update Map", command=self.open_route6_update_map_window).pack(side="left", padx=6)
+        tk.Button(toolbar, text="Edge Formula", command=self.open_route7_observation_formula_window).pack(side="left", padx=6)
         tk.Label(toolbar, textvariable=self.llm_route7_map_status_var, anchor="w").pack(side="left", fill="x", expand=True, padx=8)
         map_status = tk.Frame(map_frame)
         map_status.grid(row=1, column=0, sticky="ew", padx=6, pady=(6, 0))
@@ -9578,6 +10350,13 @@ class Route5FusionControlMixin:
         ttk.Progressbar(map_status, variable=self.llm_route5_progress_var, maximum=100.0, length=150, mode="determinate").grid(row=0, column=3, sticky="e", padx=(0, 8))
         preview = tk.Label(map_frame, text="Loading Route 6 Update Map layered occupancy map...", anchor="center", justify="center")
         preview.grid(row=2, column=0, sticky="nsew", padx=6, pady=6)
+        task_switch_frame = tk.LabelFrame(map_frame, text="Route7 Task Switch")
+        task_switch_frame.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 6))
+        task_switch_frame.grid_columnconfigure(0, weight=1)
+        tk.Label(task_switch_frame, textvariable=self.llm_route7_task_switch_text, anchor="w").grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 2))
+        task_switch_canvas = tk.Canvas(task_switch_frame, height=128, bg="#f4f6f8", highlightthickness=1, highlightbackground="#c9ced6")
+        task_switch_canvas.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
+        task_switch_canvas.bind("<Configure>", lambda _event: self.refresh_route7_task_switch_visualization(), add="+")
 
         self.llm_route7_window = window
         self.llm_route7_window_canvas = window_canvas
@@ -9586,6 +10365,7 @@ class Route5FusionControlMixin:
         self.llm_route7_update_map_frame = map_frame
         self.llm_route7_update_map_layer_combo = layer_combo
         self.llm_route7_update_map_preview_label = preview
+        self.llm_route7_task_switch_canvas = task_switch_canvas
         self._bind_llm_route7_window_mousewheel_tree(content)
         window_canvas.bind("<MouseWheel>", self._on_llm_route7_window_mousewheel, add="+")
         window_canvas.bind("<Button-4>", self._on_llm_route7_window_mousewheel_linux, add="+")
@@ -9606,6 +10386,10 @@ class Route5FusionControlMixin:
         if self.llm_route5_thread is not None and self.llm_route5_thread.is_alive():
             self.llm_route5_status_var.set("LLM Route V7: already running.")
             return
+        try:
+            self.llm_route5_representation_model_var.set(str(self.default_route7_or31_model_path()))
+        except Exception:
+            pass
         output_dir = self.route7_prepare_new_map_output_dir(selected_target_house_id)
         if not self.route7_start_update_map_realtime(session, output_dir):
             self.llm_route5_status_var.set("LLM Route V7: waiting for previous map update to stop.")

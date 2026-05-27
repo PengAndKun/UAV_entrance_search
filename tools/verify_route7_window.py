@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
+from PIL import Image
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -376,6 +378,35 @@ class Route7TargetHouseBoundaryHarness(Route7MapRouteHarness):
         return {"safe": True, "reason": "verify_route7_map_safe"}
 
 
+class Route7EdgeObservationHarness(Route7MapRouteHarness):
+    def __init__(self, root: Path, *, block_first_point: bool = False) -> None:
+        super().__init__(root)
+        self.args = type("Args", (), {"lidar_depth_max_cm": 400.0, "lidar_depth_min_cm": 60.0})()
+        grid = np.zeros((80, 80), dtype=np.int16)
+        if block_first_point:
+            grid[10, 5] = 100
+        np.save(self.grid_path, grid)
+        metadata = {
+            "width": 80,
+            "height": 80,
+            "resolution_m": 0.25,
+            "origin_standard_m": [0.0, 0.0],
+            "occupied_cell_count": int(np.sum(grid >= 100)),
+        }
+        self.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        self.llm_route5_state.update(
+            {
+                "route_window_label": "V7",
+                "target_house_id": "002",
+                "output_dir": str(self.output_dir),
+                "route7_map_output_dir": str(self.output_dir),
+            }
+        )
+
+    def house_world_bbox_for_id(self, _house_id: str) -> Dict[str, float]:
+        return {"min_x": 0.0, "max_x": 1000.0, "min_y": 0.0, "max_y": 800.0, "center_x": 500.0, "center_y": 400.0}
+
+
 def test_route2_observation_z_override_for_route7() -> None:
     baseline = Route2ZHarness(current_z_cm=450.0)
     baseline_candidates = baseline.route2_safe_observation_candidates("001", skip_completed=False)
@@ -395,7 +426,7 @@ def test_route7_run_directories_are_dedicated_and_fresh(tmp_dir: Path) -> None:
     root = tmp_dir / "llm_route_7_fusion_runs"
     assert_true(first.parent == root, f"V7 run should live under llm_route_7_fusion_runs: {first}")
     assert_true(first != second, f"each V7 start needs a fresh run directory: first={first} second={second}")
-    assert_true(first.name.startswith("house_002_autosearch_v7_or2_fused_"), f"V7 run name should identify v7: {first.name}")
+    assert_true(first.name.startswith("house_002_autosearch_v7_or3_1_fused_"), f"V7 run name should identify OR3_1 v7: {first.name}")
     for subdir in ("frames", "open3d_frames", "reconstruction", "facade_observations", "map"):
         assert_true((first / subdir).is_dir(), f"V7 run should create {subdir}: {first}")
 
@@ -404,6 +435,38 @@ def test_route7_run_directories_are_dedicated_and_fresh(tmp_dir: Path) -> None:
     assert_true(harness.llm_route5_state.get("output_dir") == str(selected), harness.llm_route5_state)
     assert_true(harness.llm_route6_state.get("route6_update_map_output_dir") == str(selected), harness.llm_route6_state)
     assert_true(harness.llm_route6_state.get("output_dir") == str(selected), harness.llm_route6_state)
+    assert_true(harness.llm_route5_state.get("mode") == "route7_llm_route_oa3_or3_1_fusion", harness.llm_route5_state)
+    assert_true(str(harness.llm_route5_state.get("or3_1_model_path", "")).endswith("a_plus_3_1_model.pt"), harness.llm_route5_state)
+
+
+def test_route7_uses_or3_1_as_primary_representation(tmp_dir: Path) -> None:
+    harness = Route7MapRouteHarness(tmp_dir)
+    harness.llm_route5_representation_model_var = HarnessVar(str(tmp_dir / "missing_or2_model.pt"))
+
+    def fake_or3_1(event: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "status": "ok",
+            "front_risk_state": "clearance_warning",
+            "can_forward": True,
+            "must_stop": False,
+            "model_path": str(harness.default_route7_or31_model_path()),
+            "prediction_json_path": str(harness.output_dir / "frame_000001" / "or3_1_risk_prediction.json"),
+            "risk_overlay_path": str(harness.output_dir / "frame_000001" / "or3_1_risk_overlay.png"),
+        }
+
+    harness.route5_predict_obstacle_representation_3 = fake_or3_1
+    prediction = harness.route5_predict_obstacle_representation(
+        {
+            "route_window_label": "V7",
+            "route5_output_dir": str(harness.output_dir),
+            "rgb_path": str(harness.output_dir / "missing_rgb.png"),
+            "capture_dir": str(harness.output_dir / "frame_000001"),
+        }
+    )
+    assert_true(prediction.get("status") == "ok", f"Route7 should not fall through to missing OR2 model: {prediction}")
+    assert_true(prediction.get("route7_primary_representation") == "or3_1", prediction)
+    assert_true(prediction.get("or3_variant") == "or3_1", prediction)
+    assert_true(str(prediction.get("model_path", "")).endswith("a_plus_3_1_model.pt"), prediction)
 
 
 def test_route7_static_house_base_is_frozen_at_run_start(tmp_dir: Path) -> None:
@@ -453,6 +516,70 @@ def test_route7_open3d_frame_stream_indexes_are_separate(tmp_dir: Path) -> None:
     harness.append_jsonl(output_dir / "lidar_capture_log.jsonl", {"frame_index": 7, "frame_stream": "open3d_frames"})
     assert_true(harness.route2_next_frame_index(output_dir, frames_subdir="frames") == 3, "ordinary OR2 frames should keep their own index space")
     assert_true(harness.route2_next_frame_index(output_dir, frames_subdir="open3d_frames") == 8, "Open3D frames should keep their own index space")
+
+
+def test_route7_edge_observation_minimal_points_use_lidar_formula(tmp_dir: Path) -> None:
+    harness = Route7EdgeObservationHarness(tmp_dir)
+    attempts = harness.route7_edge_observation_attempts_for_facade("002", "south", output_dir=harness.output_dir)
+    expected_count = max(1, int(math.ceil(1000.0 / (400.0 * 0.8))))
+    assert_true(len(attempts) == expected_count, f"Route7 should generate the minimum lidar edge points: {attempts}")
+    forbidden_sources = {"center_projection", "left_third_projection", "right_third_projection", "far_center_projection", "elevated_center_projection"}
+    sources = {str(item.get("observation_attempt_source", "")) for item in attempts}
+    assert_true(sources == {"route7_lidar_edge_minimal"}, f"Route7 should not reuse old observation sources: {sources}")
+    assert_true(not (sources & forbidden_sources), f"Old Route3 observation sources should be absent: {sources}")
+    formula = attempts[0].get("route7_observation_formula", {})
+    assert_true(formula.get("point_count") == expected_count, formula)
+    assert_true(round(float(formula.get("effective_lidar_radius_cm", 0.0)), 3) == 320.0, formula)
+    assert_true({round(float(item.get("z", 0.0)), 3) for item in attempts} == {300.0}, attempts)
+
+
+def test_route7_edge_observation_replans_points_inside_obstacles(tmp_dir: Path) -> None:
+    harness = Route7EdgeObservationHarness(tmp_dir, block_first_point=True)
+    attempts = harness.route7_edge_observation_attempts_for_facade("002", "south", output_dir=harness.output_dir)
+    replanned = [item for item in attempts if item.get("route7_observation_replanned_from_blocked")]
+    assert_true(replanned, f"Route7 should redesign an edge observation point that lands inside an occupied cell: {attempts}")
+    first = replanned[0]
+    assert_true(first.get("route7_original_map_cell") == [10, 5], first)
+    assert_true(first.get("route7_map_cell") != [10, 5], first)
+    layer_record, layer_key, _layer_z, _manifest = harness.route7_selected_map_layer_record(harness.output_dir)
+    block_report = harness.route7_layer_pose_block_report(layer_record, first, layer_key=layer_key, inflation_cells=1)
+    assert_true(block_report.get("blocked") is False, f"Redesigned observation point should be free on the selected layer: {block_report}")
+
+
+def test_route7_observation_navigation_uses_spatial_astar(tmp_dir: Path) -> None:
+    harness = Route7EdgeObservationHarness(tmp_dir)
+    attempts = harness.route7_edge_observation_attempts_for_facade("002", "south", output_dir=harness.output_dir)
+    target = attempts[0]
+    plan = harness.route7_plan_spatial_navigation_path(
+        {"x": 50.0, "y": -50.0, "z": 300.0, "yaw": 0.0},
+        target,
+        output_dir=harness.output_dir,
+        stage="NAV_TO_OBS",
+        target_id=str(target.get("target_id", "")),
+        target_house_id="002",
+    )
+    assert_true(plan.get("status") == "ok", f"Route7 spatial A* should plan to the edge observation point: {plan}")
+    assert_true(plan.get("planner_source") == "route7_spatial_occupancy_astar", plan)
+    assert_true(plan.get("route7_space_astar") is True, plan)
+    assert_true("z_layer" in plan.get("route7_astar_dimensions", []), plan)
+
+
+def test_route7_ranked_observation_candidates_discard_old_attempts(tmp_dir: Path) -> None:
+    harness = Route7EdgeObservationHarness(tmp_dir)
+    candidates = harness.route7_edge_observation_candidates_for_house("002", output_dir=harness.output_dir, facades=["south"])
+    ranked = harness.route5_rank_observation_candidates(
+        "002",
+        candidates,
+        completed=set(),
+        blocked={"east", "north", "west"},
+        start_pose={"x": 50.0, "y": -50.0, "z": 300.0, "yaw": 0.0},
+    )
+    assert_true(ranked, f"Route7 should rank edge observation candidates: {ranked}")
+    attempts = ranked[0].get("observation_attempts", [])
+    assert_true(attempts, ranked[0])
+    assert_true({item.get("observation_attempt_source") for item in attempts} == {"route7_lidar_edge_minimal"}, attempts)
+    planners = {item.get("route5_navigation_plan", {}).get("planner_source") for item in attempts if isinstance(item, dict)}
+    assert_true(planners == {"route7_spatial_occupancy_astar"}, f"Route7 observation navigation should use spatial A*: {planners}")
 
 
 def test_route7_map_layer_edge_scan_uses_two_house_edge_points(tmp_dir: Path) -> None:
@@ -732,6 +859,7 @@ def test_route7_or3_hard_gate_marks_route_decision_active(tmp_dir: Path) -> None
     target = {"x": 150.0, "y": -150.0, "z": 300.0, "yaw": 90.0}
     nominal = {"forward_cm": 20.0, "right_cm": 0.0, "up_cm": 0.0, "yaw_delta_deg": 0.0, "action_name": "route5_nav"}
     event = {
+        "route_window_label": "V7",
         "route5_stage": "NAV_TO_SCAN_POINT",
         "target_id": "002_south_z_300_edge_001",
         "route5_output_dir": str(harness.output_dir),
@@ -763,9 +891,11 @@ def test_route7_or3_hard_gate_marks_route_decision_active(tmp_dir: Path) -> None
     updates = decision.get("event_updates", {})
     policy = gate.get("route7_soft_obstacle_policy", {}) if isinstance(gate.get("route7_soft_obstacle_policy", {}), dict) else {}
     assert_true(policy.get("mode") == "hard_avoidance", f"OR3 projection-box deep red should reach hard policy: {decision}")
+    assert_true(gate.get("source") == "route7_or3_1_a_plus_3_1", f"Route7 should use OR3_1 gate source: {decision}")
+    assert_true(bool(updates.get("or3_1_primary", False)), f"Route7 decision updates should mark OR3_1 primary: {decision}")
     assert_true(bool(gate.get("avoidance_active", False)), f"hard policy should mark gate active: {decision}")
     assert_true(bool(updates.get("avoidance_active", False)), f"hard policy should mark event update active: {decision}")
-    assert_true(decision.get("mission_phase") == "OR2_AVOIDANCE", f"hard policy should leave route navigation phase: {decision}")
+    assert_true(decision.get("mission_phase") == "OR3_1_AVOIDANCE", f"hard policy should leave route navigation phase through OR3_1: {decision}")
 
 
 def test_route7_deep_red_policy_applies_to_observation_navigation(tmp_dir: Path) -> None:
@@ -806,6 +936,31 @@ def test_route5_lookahead_keeps_translation_near_observation_goal(tmp_dir: Path)
     translation = abs(float(payload.get("forward_cm", 0.0) or 0.0)) + abs(float(payload.get("right_cm", 0.0) or 0.0)) + abs(float(payload.get("up_cm", 0.0) or 0.0))
     assert_true(translation > 0.5, f"close-range observation approach should not get stuck in yaw-only lookahead: {payload}")
     assert_true(str(payload.get("action_name", "")) != "route5_nav_lookahead" or float(payload.get("forward_cm", 0.0) or 0.0) > 0.0, payload)
+
+
+def test_route7_map_route_lookahead_translates_while_yawing(tmp_dir: Path) -> None:
+    harness = Route7MapRouteHarness(tmp_dir)
+    harness.llm_route5_state["route_window_label"] = "V7"
+    current = {"x": 0.0, "y": 0.0, "z": 300.0, "yaw": 8.632}
+    target = {
+        "x": 350.22,
+        "y": 570.65,
+        "z": 300.0,
+        "yaw": 90.0,
+        "route_point_type": "navigation_waypoint",
+        "route7_map_layer_key": "z_300",
+        "route7_map_route_replan_policy": "map_first_runtime_revalidate",
+    }
+    payload = harness.route5_movement_payload_for_target_with_lookahead(
+        current,
+        target,
+        {"nav_step_cm": 20.0, "reach_tol_cm": 60.0, "z_tol_cm": 40.0, "yaw_tol_deg": 10.0},
+        stage="NAV_TO_OBS",
+    )
+    translation = abs(float(payload.get("forward_cm", 0.0) or 0.0)) + abs(float(payload.get("right_cm", 0.0) or 0.0))
+    assert_true(translation > 0.5, f"Route7 map route should not spend map-clear ticks on pure rotation: {payload}")
+    assert_true(abs(float(payload.get("yaw_delta_deg", 0.0) or 0.0)) > 0.5, f"Route7 should still yaw toward the waypoint while translating: {payload}")
+    assert_true(str(payload.get("yaw_policy", "")) == "route7_translate_while_yawing_map_route", payload)
 
 
 def test_route7_continue_planned_route_does_not_trigger_target_reset(tmp_dir: Path) -> None:
@@ -896,6 +1051,58 @@ def test_route7_overlay_preserves_original_target_after_reset(tmp_dir: Path) -> 
     assert_true(original_points[0].get("target_id") == "002_south_z_300_edge_002", original_points)
 
 
+def test_route7_overlay_uses_current_facade_edge_observation_points_only(tmp_dir: Path) -> None:
+    harness = Route7EdgeObservationHarness(tmp_dir)
+    harness.llm_route5_state.update(
+        {
+            "route_window_label": "V7",
+            "target_house_id": "002",
+            "current_facade": "south",
+            "current_exploration_status": {"facade": "south", "stage": "NAV_TO_OBS", "target_id": "002_south_edge_obs_001"},
+        }
+    )
+    points = harness.route7_layered_route_points()
+    observations = [point for point in points if point.get("route_point_type") in {"observation_point", "route7_edge_observation_point"}]
+    assert_true(observations, f"Route7 map should expose current facade edge observation points: {points}")
+    assert_true({point.get("facade") for point in observations} == {"south"}, observations)
+    assert_true({point.get("observation_attempt_source") for point in observations} == {"route7_lidar_edge_minimal"}, observations)
+    assert_true(not any(point.get("overlay") == "all_observation_points" for point in observations), observations)
+
+
+def test_route7_task_switch_visualizes_active_subtasks(tmp_dir: Path) -> None:
+    harness = Route7MapRouteHarness(tmp_dir)
+    harness.llm_route5_state.update(
+        {
+            "route_window_label": "V7",
+            "target_house_id": "002",
+            "current_facade": "south",
+            "stage": "NAV_TO_SCAN_POINT",
+            "current_exploration_status": {
+                "facade": "south",
+                "stage": "NAV_TO_SCAN_POINT",
+                "target_id": "002_south_z_300_edge_001",
+            },
+            "task_plan": {
+                "subtasks": [
+                    {"order": 1, "facade": "south", "status": "pending"},
+                    {"order": 2, "facade": "east", "status": "pending"},
+                ]
+            },
+            "current_facade_scan_points": [
+                {"scan_id": "002_south_z_300_edge_001", "facade": "south"},
+                {"scan_id": "002_south_z_300_edge_002", "facade": "south"},
+            ],
+        }
+    )
+    records = harness.route7_subtask_switch_records()
+    labels = [record.get("label") for record in records]
+    assert_true("observe" in labels and "scan 1" in labels and "scan 2" in labels, records)
+    active = [record for record in records if record.get("status") == "active"]
+    assert_true(active and active[0].get("label") == "scan 1", records)
+    text = harness.route7_task_switch_visualization_text()
+    assert_true("Subtasks:" in text and "scan 1:active" in text, text)
+
+
 def test_route7_map_refresh_keeps_last_preview_on_missing_frame(tmp_dir: Path) -> None:
     harness = Route7MapRouteHarness(tmp_dir)
     preview = PreviewLabelHarness()
@@ -904,6 +1111,52 @@ def test_route7_map_refresh_keeps_last_preview_on_missing_frame(tmp_dir: Path) -
     assert_true(preview.configs, "refresh should update the preview label state")
     cleared = [config for config in preview.configs if config.get("image", None) == ""]
     assert_true(not cleared, f"Route7 map refresh should keep the last good preview image on transient missing files: {preview.configs}")
+
+
+def test_route7_draw_realtime_route_plan_uses_last_drawable_when_current_empty(tmp_dir: Path) -> None:
+    harness = Route7MapRouteHarness(tmp_dir)
+    layer_record, layer_key, _layer_z, _manifest = harness.route7_selected_map_layer_record(harness.output_dir)
+    last_plan = {
+        "schema": "route7_realtime_route_plan_v1",
+        "status": "ok",
+        "route7_route_segments": [
+            {
+                "kind": "horizontal_route",
+                "layer_key": layer_key,
+                "from_pose": {"x": 50.0, "y": -50.0, "z": 300.0},
+                "to_pose": {"x": 450.0, "y": -450.0, "z": 300.0},
+            }
+        ],
+    }
+    harness.llm_route5_state["route7_realtime_route_plan"] = {"status": "blocked", "route7_route_segments": []}
+    harness.llm_route5_state["route7_last_drawable_route_plan"] = last_plan
+    image = Image.new("RGB", (21 * 8, 21 * 8), "white")
+    drawn = harness.route7_draw_realtime_route_plan(image, layer_record, selected_layer_key=layer_key, scale=8)
+    pixels = np.asarray(drawn)
+    nonwhite = int(np.sum(np.any(pixels != 255, axis=2)))
+    assert_true(nonwhite > 0, "Route7 should keep drawing the last valid path when current realtime plan is transiently empty")
+
+
+def test_route7_spatial_astar_visualization_is_written(tmp_dir: Path) -> None:
+    harness = Route7EdgeObservationHarness(tmp_dir)
+    start = {"x": 50.0, "y": -50.0, "z": 300.0, "yaw": 0.0}
+    target = {"x": 450.0, "y": -450.0, "z": 300.0, "yaw": 90.0}
+    plan = harness.route7_plan_spatial_navigation_path(
+        start,
+        target,
+        output_dir=harness.output_dir,
+        stage="NAV_TO_OBS",
+        target_id="002_south_edge_obs_001",
+        target_house_id="002",
+    )
+    visual = harness.route7_write_navigation_plan_visualization(
+        harness.output_dir,
+        plan,
+        current_pose=start,
+        target_pose=target,
+        target_id="002_south_edge_obs_001",
+    )
+    assert_true(Path(str(visual.get("visualization_path", ""))).is_file(), f"Spatial A* should write trajectory preview: {visual}")
 
 
 def test_route7_frame_decision_log_and_trajectory_visualization(tmp_dir: Path) -> None:
@@ -968,6 +1221,9 @@ def test_window7_source_contract() -> None:
         "obstacle_representation_3_data" in route5_source or "ObstacleRepresentation3Predictor" in route5_source,
         "Route 5 mixin should expose OR3 integration source tokens",
     )
+    assert_true("a_plus_3_1_model.pt" in route5_source, "Route7 should default to the OR3_1 checkpoint")
+    assert_true("route7_llm_route_oa3_or3_1_fusion" in route5_source, "Route7 mode should identify OR3_1 fusion")
+    assert_true("route7_primary_representation" in route5_source, "Route7 predictions should mark OR3_1 as the primary representation")
 
     for token in (
         "def ensure_route7_state",
@@ -980,6 +1236,12 @@ def test_window7_source_contract() -> None:
         "def route7_build_update_map_after_observation",
         "def route7_plan_navigation_waypoints_from_map",
         "def route7_update_realtime_navigation_route",
+        "def route7_lidar_edge_observation_formula",
+        "def route7_edge_observation_attempts_for_facade",
+        "def route7_edge_observation_candidates_for_house",
+        "def route7_plan_spatial_navigation_path",
+        "def route7_observation_formula_text",
+        "def open_route7_observation_formula_window",
         "def route7_draw_realtime_route_plan",
         "def route7_static_house_base_snapshot",
         "def route7_draw_static_house_base",
@@ -1014,6 +1276,7 @@ def test_window7_source_contract() -> None:
     assert_true("route7_static_house_base" in prepare_block, "Window 7 run preparation should freeze house coordinates as the map base")
 
     worker_block = route5_source[route5_source.find("def route5_full_search_worker"):route5_source.find("def refresh_route5_preview")]
+    assert_true("route7_edge_observation_candidates_for_house" in worker_block, "Window 7 should use direct lidar edge observation candidates")
     assert_true("route7_build_update_map_after_observation" in worker_block, "Window 7 should build/update the obstacle map after observation")
     assert_true("route7_plan_facade_map_layer_scan_current" in worker_block, "Window 7 should plan scan captures from the selected map layer")
     high_level_log_index = worker_block.find('self.route5_log_event(output_dir, "high_level_decision", decision)')
@@ -1051,6 +1314,10 @@ def test_window7_source_contract() -> None:
     ui_block = route5_source[route5_source.find("def _build_llm_route5_section"):route5_source.find("def route7_update_map_layer_values")]
     assert_true("route5_fixed_status_label" in ui_block, "Route status labels should use fixed layout containers")
     assert_true("grid_propagate(False)" in ui_block, "Route status/preview frames should not resize as text changes")
+    assert_true("route7_task_switch_visualization_text" in route5_source, "Window 7 should expose a task-switch visualization below the map")
+    assert_true("llm_route7_task_switch_text" in route5_source, "Window 7 should maintain a task-switch visualization widget")
+    assert_true("route7_subtask_switch_records" in route5_source, "Window 7 should expose active-facade subtask visualization records")
+    assert_true("route7_last_drawable_route_plan" in route5_source, "Window 7 should preserve the last drawable path across transient empty route plans")
 
     stop_block = route5_source[route5_source.find("def on_route7_stop"):route5_source.find("def open_llm_route_window5")]
     assert_true("route6_update_map_realtime_stop_event.set()" in stop_block, "Window 7 stop should stop realtime map updates")
@@ -1064,12 +1331,22 @@ def main() -> None:
     test_route2_observation_z_override_for_route7()
     with tempfile.TemporaryDirectory(prefix="route7_verify_") as raw:
         test_route7_run_directories_are_dedicated_and_fresh(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_or31_primary_verify_") as raw:
+        test_route7_uses_or3_1_as_primary_representation(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_static_house_base_verify_") as raw:
         test_route7_static_house_base_is_frozen_at_run_start(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_static_house_legacy_filter_verify_") as raw:
         test_route7_static_house_base_filters_legacy_full_map_snapshots(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_open3d_frames_verify_") as raw:
         test_route7_open3d_frame_stream_indexes_are_separate(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_edge_observation_formula_verify_") as raw:
+        test_route7_edge_observation_minimal_points_use_lidar_formula(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_edge_observation_blocked_verify_") as raw:
+        test_route7_edge_observation_replans_points_inside_obstacles(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_spatial_astar_verify_") as raw:
+        test_route7_observation_navigation_uses_spatial_astar(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_edge_rank_verify_") as raw:
+        test_route7_ranked_observation_candidates_discard_old_attempts(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_scan_verify_") as raw:
         test_route7_map_layer_edge_scan_uses_two_house_edge_points(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_map_route_verify_") as raw:
@@ -1096,14 +1373,24 @@ def main() -> None:
         test_route7_deep_red_policy_applies_to_observation_navigation(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_lookahead_verify_") as raw:
         test_route5_lookahead_keeps_translation_near_observation_goal(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_translate_yaw_verify_") as raw:
+        test_route7_map_route_lookahead_translates_while_yawing(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_target_reset_verify_") as raw:
         test_route7_continue_planned_route_does_not_trigger_target_reset(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_arrival_policy_verify_") as raw:
         test_route7_continue_planned_route_does_not_near_obstacle_arrive(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_overlay_reset_verify_") as raw:
         test_route7_overlay_preserves_original_target_after_reset(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_current_facade_overlay_verify_") as raw:
+        test_route7_overlay_uses_current_facade_edge_observation_points_only(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_subtask_switch_verify_") as raw:
+        test_route7_task_switch_visualizes_active_subtasks(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_map_flicker_verify_") as raw:
         test_route7_map_refresh_keeps_last_preview_on_missing_frame(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_route_line_fallback_verify_") as raw:
+        test_route7_draw_realtime_route_plan_uses_last_drawable_when_current_empty(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_spatial_visual_verify_") as raw:
+        test_route7_spatial_astar_visualization_is_written(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_frame_log_verify_") as raw:
         test_route7_frame_decision_log_and_trajectory_visualization(Path(raw))
     test_window7_source_contract()
