@@ -4746,9 +4746,10 @@ class RouteControlMixin:
         self.route_thread = threading.Thread(target=lambda: self.route2_capture_facade_scan_worker(session), daemon=True)
         self.route_thread.start()
 
-    def route2_next_frame_index(self, output_dir: Path) -> int:
+    def route2_next_frame_index(self, output_dir: Path, *, frames_subdir: str = "frames") -> int:
         frame_indices: List[int] = []
-        frames_dir = output_dir / "frames"
+        frame_stream = str(frames_subdir or "frames").strip() or "frames"
+        frames_dir = output_dir / frame_stream
         if frames_dir.exists():
             for path in frames_dir.glob("frame_*"):
                 if not path.is_dir():
@@ -4761,6 +4762,9 @@ class RouteControlMixin:
                         pass
         for log_name in ("lidar_capture_log.jsonl", "scan_execution_log.jsonl"):
             for row in self.read_jsonl_artifact(output_dir / log_name):
+                row_stream = str(row.get("frame_stream", "frames") or "frames")
+                if row_stream != frame_stream:
+                    continue
                 value = self._as_float_or_none(row.get("frame_index"))
                 if value is not None:
                     frame_indices.append(int(value))
@@ -4770,6 +4774,14 @@ class RouteControlMixin:
                         frame_indices.append(int(item_value))
         return max(frame_indices + [0]) + 1
 
+    def route2_lidar_frame_stream_for_output(self, output_dir: Path) -> str:
+        state = getattr(self, "llm_route5_state", {}) if isinstance(getattr(self, "llm_route5_state", {}), dict) else {}
+        label = str(state.get("route_window_label", "") or "").strip().upper()
+        output_text = str(output_dir).replace("/", "\\")
+        if label == "V7" or "llm_route_7_fusion_runs" in output_text:
+            return "open3d_frames"
+        return "frames"
+
     def route2_write_lidar_summary(self, output_dir: Path, *, running: bool) -> None:
         rows = self.read_jsonl_artifact(output_dir / "lidar_capture_log.jsonl")
         summary = {
@@ -4777,6 +4789,7 @@ class RouteControlMixin:
             "task_title": self.llm_task_text_var.get().strip() or "facade_v2_search",
             "stream_dir": str(output_dir),
             "frames_dir": str(output_dir / "frames"),
+            "open3d_frames_dir": str(output_dir / "open3d_frames"),
             "reconstruction_dir": str(output_dir / "reconstruction"),
             "running": bool(running),
             "frame_count": len(rows),
@@ -6748,10 +6761,11 @@ class RouteControlMixin:
                     "panorama_pose_count": len(poses),
                 }
             )
-            frame_index = self.route2_next_frame_index(output_dir)
+            frame_stream = self.route2_lidar_frame_stream_for_output(output_dir)
+            frame_index = self.route2_next_frame_index(output_dir, frames_subdir=frame_stream)
             capture_result = self.safe(
                 f"Route V3 panorama RGB capture {label}",
-                lambda idx=frame_index, action=action_detail: session.capture_lidar_stream_frame(output_dir, idx, action_detail=action),
+                lambda idx=frame_index, action=action_detail: session.capture_lidar_stream_frame(output_dir, idx, action_detail=action, frames_subdir=frame_stream),
             )
             if not isinstance(capture_result, dict):
                 return {"status": "failed", "reason": "panorama_capture_failed", "label": label}
@@ -6762,6 +6776,8 @@ class RouteControlMixin:
                 "frame_index": int(capture_result.get("frame_index", frame_index)),
                 "capture_time": capture_result.get("capture_time", ""),
                 "capture_kind": "facade_coarse_observation_v3_panorama",
+                "frame_stream": str(capture_result.get("frame_stream", frame_stream) or frame_stream),
+                "frames_dir": str(capture_result.get("frames_dir", output_dir / frame_stream) or (output_dir / frame_stream)),
                 "scan_id": f"{house_id}_{facade}_coarse_observation_{label}",
                 "house_id": house_id,
                 "facade": facade,
@@ -6857,10 +6873,11 @@ class RouteControlMixin:
                 "planned_pose": planned_pose,
             }
         )
-        frame_index = self.route2_next_frame_index(output_dir)
+        frame_stream = self.route2_lidar_frame_stream_for_output(output_dir)
+        frame_index = self.route2_next_frame_index(output_dir, frames_subdir=frame_stream)
         capture_result = self.safe(
             "Route V3 coarse RGB/LiDAR capture",
-            lambda: session.capture_lidar_stream_frame(output_dir, frame_index, action_detail=action_detail),
+            lambda: session.capture_lidar_stream_frame(output_dir, frame_index, action_detail=action_detail, frames_subdir=frame_stream),
         )
         if not isinstance(capture_result, dict):
             return {"status": "failed", "reason": "capture_failed"}
@@ -6886,6 +6903,8 @@ class RouteControlMixin:
             "frame_index": int(capture_result.get("frame_index", frame_index)),
             "capture_time": capture_result.get("capture_time", ""),
             "capture_kind": "facade_coarse_observation_v3",
+            "frame_stream": str(capture_result.get("frame_stream", frame_stream) or frame_stream),
+            "frames_dir": str(capture_result.get("frames_dir", output_dir / frame_stream) or (output_dir / frame_stream)),
             "scan_id": f"{house_id}_{facade}_coarse_observation",
             "house_id": house_id,
             "facade": facade,
@@ -7186,13 +7205,15 @@ class RouteControlMixin:
                     "capture_index": capture_idx,
                 }
             )
-            frame_index = self.route2_next_frame_index(output_dir)
+            frame_stream = self.route2_lidar_frame_stream_for_output(output_dir)
+            frame_index = self.route2_next_frame_index(output_dir, frames_subdir=frame_stream)
             capture_result = self.safe(
                 "Route V3 scan capture",
                 lambda idx=frame_index, action=action_detail: session.capture_lidar_stream_frame(
                     output_dir,
                     idx,
                     action_detail=action,
+                    frames_subdir=frame_stream,
                 ),
             )
             if isinstance(capture_result, dict):
@@ -7204,6 +7225,8 @@ class RouteControlMixin:
                 "frame_index": int(result.get("frame_index", 0) or 0),
                 "capture_time": result.get("capture_time", ""),
                 "capture_kind": "facade_scan_v3",
+                "frame_stream": str(result.get("frame_stream", self.route2_lidar_frame_stream_for_output(output_dir)) or self.route2_lidar_frame_stream_for_output(output_dir)),
+                "frames_dir": str(result.get("frames_dir", output_dir / self.route2_lidar_frame_stream_for_output(output_dir)) or (output_dir / self.route2_lidar_frame_stream_for_output(output_dir))),
                 "scan_id": scan_id,
                 "global_scan_order": point.get("global_scan_order"),
                 "house_id": point.get("house_id"),
@@ -7238,6 +7261,7 @@ class RouteControlMixin:
             "capture_status": capture_status,
             "capture_count": len(capture_results),
             "frame_indices": [int(item.get("frame_index", 0) or 0) for item in capture_results],
+            "frame_stream": self.route2_lidar_frame_stream_for_output(output_dir),
             "capture_dirs": [str(item.get("capture_dir", "") or "") for item in capture_results],
             "point_count": sum(int(item.get("point_count", 0) or 0) for item in capture_results),
             "created_at": datetime.now().isoformat(timespec="milliseconds"),
@@ -8662,6 +8686,7 @@ class RouteControlMixin:
             "task_title": self.llm_task_text_var.get().strip() or "house_search",
             "stream_dir": str(search_dir),
             "frames_dir": str(search_dir / "frames"),
+            "open3d_frames_dir": str(search_dir / "open3d_frames"),
             "reconstruction_dir": str(search_dir / "reconstruction"),
             "running": bool(running),
             "frame_count": len(self.llm_route_lidar_trajectory),

@@ -29,6 +29,15 @@ from obstacle_avoidance_3.or2_direction_rule import select_or2_direction
 from obstacle_avoidance_3.plans import DEFAULT_PLAN_FILENAME as OA3_DEFAULT_PLAN_FILENAME
 from obstacle_representation_2.demo import ObstacleRepresentation2Predictor, render_affordance_overlay
 
+try:
+    from obstacle_representation_3.demo import (
+        ObstacleRepresentation3Predictor,
+        render_affordance_overlay as render_or3_affordance_overlay,
+    )
+except Exception:
+    ObstacleRepresentation3Predictor = None
+    render_or3_affordance_overlay = None
+
 
 class _Route5FallbackVar:
     def __init__(self, value: Any = "") -> None:
@@ -51,6 +60,9 @@ def _route5_string_var(value: str) -> Any:
 class Route5FusionControlMixin:
     def default_route5_or2_model_path(self) -> Path:
         return PROJECT_ROOT / "obstacle_representation_2_data" / "models" / "a_plus_2_model.pt"
+
+    def default_route5_or3_model_path(self) -> Path:
+        return PROJECT_ROOT / "obstacle_representation_3_data" / "models" / "a_plus_3_model.pt"
 
     def default_route5_oa3_plan_path(self) -> Path:
         return PROJECT_ROOT / "obstacle_avoidance_3_data" / "plans" / OA3_DEFAULT_PLAN_FILENAME
@@ -149,6 +161,10 @@ class Route5FusionControlMixin:
             self.route5_or2_predictor = None
         if not hasattr(self, "route5_or2_predictor_path"):
             self.route5_or2_predictor_path = ""
+        if not hasattr(self, "route5_or3_predictor"):
+            self.route5_or3_predictor = None
+        if not hasattr(self, "route5_or3_predictor_path"):
+            self.route5_or3_predictor_path = ""
         if not hasattr(self, "llm_route5_window"):
             self.llm_route5_window = None
         if not hasattr(self, "llm_route5_window_canvas"):
@@ -234,15 +250,139 @@ class Route5FusionControlMixin:
     def route7_default_layer_key(self) -> str:
         return f"z_{int(round(self.route7_default_exploration_z_cm())):03d}"
 
+    def route7_static_house_base_snapshot(self, target_house_id: str, *, output_dir: Optional[Path] = None) -> Dict[str, Any]:
+        target_id = str(target_house_id or "").strip()
+        try:
+            if callable(getattr(self, "load_map_resources", None)):
+                self.load_map_resources(force=not bool(getattr(self, "map_config", {})))
+        except Exception:
+            pass
+        houses_raw = []
+        known_records_fn = getattr(self, "route6_known_house_polygon_records", None)
+        known_records = known_records_fn() if callable(known_records_fn) else []
+        if isinstance(known_records, list) and known_records:
+            for record in known_records[:5]:
+                if not isinstance(record, dict):
+                    continue
+                house_id = str(record.get("house_id", record.get("id", "")) or "").strip()
+                bbox = record.get("bbox", {}) if isinstance(record.get("bbox", {}), dict) else {}
+                try:
+                    min_x = float(bbox["min_x"])
+                    max_x = float(bbox["max_x"])
+                    min_y = float(bbox["min_y"])
+                    max_y = float(bbox["max_y"])
+                except Exception:
+                    points = record.get("points", []) if isinstance(record.get("points", []), list) else []
+                    xs: List[float] = []
+                    ys: List[float] = []
+                    for point in points:
+                        if not isinstance(point, dict):
+                            continue
+                        try:
+                            xs.append(float(point.get("x", 0.0) or 0.0))
+                            ys.append(float(point.get("y", 0.0) or 0.0))
+                        except Exception:
+                            continue
+                    if not xs or not ys:
+                        continue
+                    min_x, max_x, min_y, max_y = min(xs), max(xs), min(ys), max(ys)
+                bbox_world = {
+                    "min_x": min_x,
+                    "max_x": max_x,
+                    "min_y": min_y,
+                    "max_y": max_y,
+                    "center_x": 0.5 * (min_x + max_x),
+                    "center_y": 0.5 * (min_y + max_y),
+                    "source": "route6_operator_known_coordinates",
+                }
+                houses_raw.append(
+                    {
+                        "house_id": house_id,
+                        "label": str(record.get("name", f"H{house_id}") or f"H{house_id}"),
+                        "bbox_world": self.route5_json_safe(bbox_world),
+                        "is_target_house": bool(house_id == target_id),
+                    }
+                )
+        if houses_raw:
+            snapshot = {
+                "schema": "route7_static_house_base_v1",
+                "target_house_id": target_id,
+                "default_layer_key": self.route7_default_layer_key(),
+                "default_z_cm": self.route7_default_exploration_z_cm(),
+                "houses": self.route5_json_safe(houses_raw),
+                "house_count": len(houses_raw),
+                "created_at": datetime.now().isoformat(timespec="milliseconds"),
+                "source": "route6_operator_known_house_polygons_frozen_at_route7_start",
+            }
+            if output_dir is not None:
+                try:
+                    self.write_json_artifact(Path(output_dir) / "map" / "route7_static_house_base.json", snapshot)
+                except Exception:
+                    pass
+            return snapshot
+        map_config = getattr(self, "map_config", {}) if isinstance(getattr(self, "map_config", {}), dict) else {}
+        for house in (map_config.get("houses", []) if isinstance(map_config.get("houses", []), list) else [])[:5]:
+            if not isinstance(house, dict):
+                continue
+            house_id = str(house.get("id", "") or "").strip()
+            if not house_id:
+                continue
+            try:
+                bbox = self.house_world_bbox_for_id(house_id) if callable(getattr(self, "house_world_bbox_for_id", None)) else {}
+            except Exception:
+                bbox = {}
+            if not bbox:
+                continue
+            houses_raw.append(
+                {
+                    "house_id": house_id,
+                    "label": str(house.get("label", house.get("name", f"H{house_id}")) or f"H{house_id}"),
+                    "bbox_world": self.route5_json_safe(bbox),
+                    "is_target_house": bool(house_id == target_id),
+                }
+            )
+        if target_id and not any(str(item.get("house_id", "")) == target_id for item in houses_raw):
+            try:
+                bbox = self.house_world_bbox_for_id(target_id) if callable(getattr(self, "house_world_bbox_for_id", None)) else {}
+            except Exception:
+                bbox = {}
+            if bbox:
+                houses_raw.append(
+                    {
+                        "house_id": target_id,
+                        "label": f"H{target_id}",
+                        "bbox_world": self.route5_json_safe(bbox),
+                        "is_target_house": True,
+                    }
+                )
+        snapshot = {
+            "schema": "route7_static_house_base_v1",
+            "target_house_id": target_id,
+            "default_layer_key": self.route7_default_layer_key(),
+            "default_z_cm": self.route7_default_exploration_z_cm(),
+            "houses": self.route5_json_safe(houses_raw),
+            "house_count": len(houses_raw),
+            "created_at": datetime.now().isoformat(timespec="milliseconds"),
+            "source": "map_config_house_world_bbox_frozen_at_route7_start",
+        }
+        if output_dir is not None:
+            try:
+                self.write_json_artifact(Path(output_dir) / "map" / "route7_static_house_base.json", snapshot)
+            except Exception:
+                pass
+        return snapshot
+
     def route7_prepare_new_map_output_dir(self, target_house_id: str) -> Path:
         self.ensure_route7_state()
         output_dir = self.make_route7_fused_output_dir(target_house_id)
+        route7_static_house_base = self.route7_static_house_base_snapshot(target_house_id, output_dir=output_dir)
         self.route5_update_state(
             mode="route7_llm_route_oa3_or2_fusion",
             route_window_label="V7",
             target_house_id=str(target_house_id or ""),
             output_dir=str(output_dir),
             route7_map_output_dir=str(output_dir),
+            route7_static_house_base=route7_static_house_base,
             observation_z_override_cm=self.route7_default_exploration_z_cm(),
             stage="INIT_RUN",
         )
@@ -339,6 +479,86 @@ class Route5FusionControlMixin:
             except Exception:
                 pass
         return dict(selected_layer), selected_key, float(layer_z), manifest
+
+    def route7_map_layer_key_for_record(self, layer_record: Dict[str, Any]) -> str:
+        key_fn = getattr(self, "_route6_update_map_layer_key", None)
+        if callable(key_fn):
+            try:
+                return str(key_fn(layer_record))
+            except Exception:
+                pass
+        try:
+            return f"z_{int(round(float((layer_record if isinstance(layer_record, dict) else {}).get('z_cm', 0.0) or 0.0))):03d}"
+        except Exception:
+            return self.route7_default_layer_key()
+
+    def route7_available_map_layer_records(self, output_dir: Optional[Path] = None) -> Tuple[List[Tuple[Dict[str, Any], str, float]], Dict[str, Any]]:
+        manifest: Dict[str, Any] = {}
+        load_manifest = getattr(self, "route6_update_map_load_manifest", None)
+        if callable(load_manifest):
+            manifest = load_manifest(build_if_missing=True, output_dir=output_dir) or {}
+        layers = manifest.get("layers", []) if isinstance(manifest.get("layers", []), list) else []
+        records: List[Tuple[Dict[str, Any], str, float]] = []
+        for layer in layers:
+            if not isinstance(layer, dict):
+                continue
+            layer_key = self.route7_map_layer_key_for_record(layer)
+            try:
+                layer_z = float(layer.get("z_cm", self.route7_map_layer_z_cm_from_key(layer_key)) or self.route7_map_layer_z_cm_from_key(layer_key))
+            except Exception:
+                layer_z = self.route7_map_layer_z_cm_from_key(layer_key)
+            records.append((dict(layer), layer_key, float(layer_z)))
+        return records, manifest
+
+    def route7_order_map_layers_for_route(
+        self,
+        layers: List[Tuple[Dict[str, Any], str, float]],
+        *,
+        preferred_layer_key: str = "",
+        target_z_cm: float = 300.0,
+    ) -> List[Tuple[Dict[str, Any], str, float]]:
+        preferred = str(preferred_layer_key or self.route7_default_layer_key()).strip() or self.route7_default_layer_key()
+        default_key = self.route7_default_layer_key()
+
+        def score(item: Tuple[Dict[str, Any], str, float]) -> Tuple[int, float, float, str]:
+            _record, key, z_cm = item
+            if key == preferred:
+                rank = 0
+            elif key == default_key:
+                rank = 1
+            else:
+                rank = 2
+            return rank, abs(float(z_cm) - float(target_z_cm)), abs(float(z_cm) - self.route7_default_exploration_z_cm()), str(key)
+
+        return sorted(list(layers), key=score)
+
+    def route7_layer_pose_block_report(
+        self,
+        layer_record: Dict[str, Any],
+        pose: Dict[str, Any],
+        *,
+        layer_key: str,
+        inflation_cells: int = 1,
+    ) -> Dict[str, Any]:
+        loaded = self.route7_load_layer_occupancy_grid(layer_record)
+        if loaded.get("status") != "ok":
+            return {"status": "unavailable", "reason": str(loaded.get("reason", loaded.get("status", "missing_route7_layer_grid"))), "layer_key": layer_key}
+        metadata = loaded["metadata"]
+        grid = loaded["grid"]
+        raw_cell = self.route7_pose_to_layer_cell(metadata, pose)
+        if raw_cell is None:
+            return {"status": "outside_layer_grid", "reason": "pose_outside_route7_layer_grid", "layer_key": layer_key, "cell": []}
+        mask = self.route7_inflated_occupied_mask(grid, inflation_cells=inflation_cells)
+        blocked = self.route7_layer_cell_blocked(mask, raw_cell)
+        nearest = self.route7_nearest_free_layer_cell(mask, raw_cell)
+        return {
+            "status": "ok",
+            "layer_key": layer_key,
+            "cell": list(raw_cell),
+            "blocked": bool(blocked),
+            "nearest_free_cell": list(nearest) if nearest else [],
+            "inflation_cells": int(inflation_cells),
+        }
 
     def route7_axis_values_near_house_edge(self, bbox: Dict[str, Any], facade: str, safe_intervals: List[Dict[str, Any]]) -> List[float]:
         axis_min, axis_max = self.route2_facade_axis_range(bbox, facade)
@@ -730,6 +950,387 @@ class Route5FusionControlMixin:
             "waypoints": waypoints or [dict(target_pose)],
         }
 
+    def route7_plan_navigation_waypoints_on_layer(
+        self,
+        start_pose: Dict[str, float],
+        target_pose: Dict[str, float],
+        layer_record: Dict[str, Any],
+        layer_key: str,
+        layer_z_cm: float,
+        *,
+        output_dir: Optional[Path] = None,
+        stage: str = "",
+        target_id: str = "",
+        target_house_id: str = "",
+        inflation_cells: int = 1,
+    ) -> Dict[str, Any]:
+        var = getattr(self, "llm_route7_map_layer_var", None)
+        previous_key = ""
+        try:
+            previous_key = str(var.get() or "") if var is not None and hasattr(var, "get") else ""
+        except Exception:
+            previous_key = ""
+        try:
+            if var is not None and hasattr(var, "set"):
+                var.set(str(layer_key))
+            layer_start = dict(start_pose)
+            layer_target = dict(target_pose)
+            layer_start["z"] = round(float(layer_z_cm), 3)
+            layer_target["z"] = round(float(layer_z_cm), 3)
+            plan = self.route7_plan_navigation_waypoints_from_map(
+                layer_start,
+                layer_target,
+                output_dir=output_dir,
+                stage=stage,
+                target_id=target_id,
+                target_house_id=target_house_id,
+                inflation_cells=inflation_cells,
+            )
+        finally:
+            try:
+                if var is not None and hasattr(var, "set") and previous_key:
+                    var.set(previous_key)
+            except Exception:
+                pass
+        start_block = self.route7_layer_pose_block_report(layer_record, start_pose, layer_key=layer_key, inflation_cells=inflation_cells)
+        target_block = self.route7_layer_pose_block_report(layer_record, target_pose, layer_key=layer_key, inflation_cells=inflation_cells)
+        plan = dict(plan if isinstance(plan, dict) else {})
+        plan.update(
+            {
+                "layer_key": str(layer_key),
+                "layer_z_cm": round(float(layer_z_cm), 3),
+                "route7_layer_start_block_report": self.route5_json_safe(start_block),
+                "route7_layer_target_block_report": self.route5_json_safe(target_block),
+                "route7_layer_start_blocked": bool(start_block.get("blocked", False)),
+                "route7_layer_target_blocked": bool(target_block.get("blocked", False)),
+            }
+        )
+        if bool(start_block.get("blocked", False)) or bool(target_block.get("blocked", False)):
+            plan["route7_layer_candidate_blocked"] = True
+            plan["route7_layer_candidate_blocked_reason"] = (
+                "route7_layer_start_blocked" if bool(start_block.get("blocked", False)) else "route7_layer_target_blocked"
+            )
+        return plan
+
+    def route7_make_route_segments(
+        self,
+        start_pose: Dict[str, Any],
+        waypoints: List[Dict[str, Any]],
+        *,
+        default_layer_key: str,
+    ) -> List[Dict[str, Any]]:
+        points = [dict(start_pose if isinstance(start_pose, dict) else {})]
+        points[0].setdefault("route7_map_layer_key", default_layer_key)
+        points.extend(dict(item) for item in waypoints if isinstance(item, dict))
+        segments: List[Dict[str, Any]] = []
+        for idx, (start, end) in enumerate(zip(points, points[1:]), start=1):
+            try:
+                dx = float(end.get("x", 0.0) or 0.0) - float(start.get("x", 0.0) or 0.0)
+                dy = float(end.get("y", 0.0) or 0.0) - float(start.get("y", 0.0) or 0.0)
+                dz = float(end.get("z", 0.0) or 0.0) - float(start.get("z", 0.0) or 0.0)
+            except Exception:
+                dx, dy, dz = 0.0, 0.0, 0.0
+            from_layer = str(start.get("route7_map_layer_key", default_layer_key) or default_layer_key)
+            to_layer = str(end.get("route7_map_layer_key", default_layer_key) or default_layer_key)
+            vertical = abs(dx) <= 1.0 and abs(dy) <= 1.0 and abs(dz) > 5.0
+            layer_key = to_layer if vertical else (to_layer or from_layer or default_layer_key)
+            segments.append(
+                {
+                    "segment_index": idx,
+                    "kind": "vertical_transition" if vertical else "horizontal_route",
+                    "from_layer_key": from_layer,
+                    "to_layer_key": to_layer,
+                    "layer_key": layer_key,
+                    "from_pose": self.route5_json_safe(start),
+                    "to_pose": self.route5_json_safe(end),
+                    "distance_cm": round(math.sqrt(dx * dx + dy * dy + dz * dz), 3),
+                    "horizontal_distance_cm": round(math.hypot(dx, dy), 3),
+                    "vertical_delta_cm": round(dz, 3),
+                }
+            )
+        return segments
+
+    def route7_reindex_route_waypoints(self, waypoints: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        items = [dict(item) for item in waypoints if isinstance(item, dict)]
+        total = len(items)
+        for idx, item in enumerate(items, start=1):
+            item["waypoint_index"] = idx
+            item["waypoint_final"] = bool(idx == total)
+        return items
+
+    def route7_compose_realtime_multilayer_plan(
+        self,
+        selected_plan: Dict[str, Any],
+        *,
+        start_pose: Dict[str, Any],
+        target_pose: Dict[str, Any],
+        selected_layer_key: str,
+        selected_layer_z_cm: float,
+        preferred_layer_key: str,
+        preferred_layer_z_cm: float,
+        preferred_attempt: Dict[str, Any],
+        layer_attempts: List[Dict[str, Any]],
+        stage: str,
+        target_id: str,
+        target_house_id: str,
+    ) -> Dict[str, Any]:
+        selected_plan = dict(selected_plan if isinstance(selected_plan, dict) else {})
+        target_z = float(target_pose.get("z", selected_layer_z_cm) or selected_layer_z_cm)
+        start_z = float(start_pose.get("z", selected_layer_z_cm) or selected_layer_z_cm)
+        waypoints: List[Dict[str, Any]] = []
+        transition_count = 0
+        multilayer = str(selected_layer_key) != str(preferred_layer_key) or abs(float(selected_layer_z_cm) - target_z) > 25.0 or abs(float(selected_layer_z_cm) - start_z) > 25.0
+        selected_start = dict(start_pose)
+        selected_start["z"] = round(float(selected_layer_z_cm), 3)
+        selected_start["route7_map_layer_key"] = str(selected_layer_key)
+        if abs(start_z - float(selected_layer_z_cm)) > 5.0:
+            transition_count += 1
+            waypoints.append(
+                {
+                    "x": round(float(start_pose.get("x", 0.0) or 0.0), 3),
+                    "y": round(float(start_pose.get("y", 0.0) or 0.0), 3),
+                    "z": round(float(selected_layer_z_cm), 3),
+                    "yaw": round(float(start_pose.get("yaw", target_pose.get("yaw", 0.0)) or 0.0), 3),
+                    "route_point_type": "route7_layer_transition",
+                    "route7_map_layer_key": str(selected_layer_key),
+                    "route7_transition_from_layer_key": str(preferred_layer_key),
+                    "route7_transition_to_layer_key": str(selected_layer_key),
+                    "route7_transition_direction": "ascend" if float(selected_layer_z_cm) > start_z else "descend",
+                    "label": f"to {selected_layer_key}",
+                }
+            )
+        horizontal_waypoints = [dict(item) for item in selected_plan.get("waypoints", []) if isinstance(item, dict)]
+        for item in horizontal_waypoints:
+            item.setdefault("route_point_type", "navigation_waypoint")
+            item["route7_map_layer_key"] = str(selected_layer_key)
+            item["z"] = round(float(selected_layer_z_cm), 3)
+            waypoints.append(item)
+        preferred_target_blocked = bool((preferred_attempt.get("route7_layer_target_block_report", {}) if isinstance(preferred_attempt.get("route7_layer_target_block_report", {}), dict) else {}).get("blocked", False))
+        can_return_to_target_layer = not preferred_target_blocked
+        if str(selected_layer_key) != str(preferred_layer_key) and abs(target_z - float(selected_layer_z_cm)) > 5.0 and can_return_to_target_layer:
+            transition_count += 1
+            waypoints.append(
+                {
+                    "x": round(float(target_pose.get("x", 0.0) or 0.0), 3),
+                    "y": round(float(target_pose.get("y", 0.0) or 0.0), 3),
+                    "z": round(target_z, 3),
+                    "yaw": round(float(target_pose.get("yaw", 0.0) or 0.0), 3),
+                    "route_point_type": "route7_layer_transition",
+                    "route7_map_layer_key": str(preferred_layer_key),
+                    "route7_transition_from_layer_key": str(selected_layer_key),
+                    "route7_transition_to_layer_key": str(preferred_layer_key),
+                    "route7_transition_direction": "descend" if target_z < float(selected_layer_z_cm) else "ascend",
+                    "label": f"to {preferred_layer_key}",
+                }
+            )
+        elif str(selected_layer_key) != str(preferred_layer_key) and horizontal_waypoints:
+            waypoints[-1]["route7_target_z_adjusted_by_map"] = True
+            waypoints[-1]["route7_original_target_z_cm"] = round(target_z, 3)
+        waypoints = self.route7_reindex_route_waypoints(waypoints or [dict(target_pose)])
+        segments = self.route7_make_route_segments(start_pose, waypoints, default_layer_key=preferred_layer_key)
+        plan = {
+            **selected_plan,
+            "status": "ok",
+            "reason": "route7_realtime_multilayer_occupancy_path" if multilayer else "route7_realtime_selected_layer_occupancy_path",
+            "planner_source": "route7_realtime_multilayer_occupancy_astar",
+            "route7_map_route_replan_policy": "map_first_realtime_multilayer_revalidate",
+            "route7_realtime_route_plan": True,
+            "route7_multilayer_route": bool(multilayer),
+            "route7_layer_transition_count": int(transition_count),
+            "route7_preferred_layer_key": str(preferred_layer_key),
+            "route7_preferred_layer_z_cm": round(float(preferred_layer_z_cm), 3),
+            "route7_selected_layer_key": str(selected_layer_key),
+            "layer_key": str(selected_layer_key),
+            "layer_z_cm": round(float(selected_layer_z_cm), 3),
+            "stage": str(stage or ""),
+            "target_id": str(target_id or ""),
+            "target_house_id": str(target_house_id or ""),
+            "start_pose": self.route5_json_safe(start_pose),
+            "target_pose": self.route5_json_safe(target_pose),
+            "route7_layer_attempts": self.route5_json_safe(layer_attempts),
+            "route7_route_segments": self.route5_json_safe(segments),
+            "waypoints": waypoints,
+        }
+        plan["route7_route_signature"] = "|".join(
+            f"{item.get('route7_map_layer_key', '')}:{float(item.get('x', 0.0) or 0.0):.1f},{float(item.get('y', 0.0) or 0.0):.1f},{float(item.get('z', 0.0) or 0.0):.1f}"
+            for item in waypoints
+            if isinstance(item, dict)
+        )
+        return plan
+
+    def route7_plan_realtime_navigation_route_from_map(
+        self,
+        start_pose: Dict[str, float],
+        target_pose: Dict[str, float],
+        *,
+        output_dir: Optional[Path] = None,
+        stage: str = "",
+        target_id: str = "",
+        target_house_id: str = "",
+        inflation_cells: int = 1,
+    ) -> Dict[str, Any]:
+        layers, manifest = self.route7_available_map_layer_records(output_dir)
+        if not layers:
+            fallback = self.route7_plan_navigation_waypoints_from_map(
+                start_pose,
+                target_pose,
+                output_dir=output_dir,
+                stage=stage,
+                target_id=target_id,
+                target_house_id=target_house_id,
+                inflation_cells=inflation_cells,
+            )
+            fallback["route7_realtime_route_plan"] = True
+            fallback["route7_multilayer_route"] = False
+            return fallback
+        values = [key for _record, key, _z in layers]
+        preferred_key = self.route7_select_update_map_layer_key([record for record, _key, _z in layers]) if values else self.route7_default_layer_key()
+        target_z = float(target_pose.get("z", self.route7_default_exploration_z_cm()) or self.route7_default_exploration_z_cm())
+        ordered = self.route7_order_map_layers_for_route(layers, preferred_layer_key=preferred_key, target_z_cm=target_z)
+        preferred_z = next((z for _record, key, z in layers if key == preferred_key), self.route7_map_layer_z_cm_from_key(preferred_key))
+        attempts: List[Dict[str, Any]] = []
+        preferred_attempt: Dict[str, Any] = {}
+        selected: Optional[Tuple[Dict[str, Any], str, float, Dict[str, Any]]] = None
+        for layer_record, layer_key, layer_z in ordered:
+            attempt_plan = self.route7_plan_navigation_waypoints_on_layer(
+                start_pose,
+                target_pose,
+                layer_record,
+                layer_key,
+                layer_z,
+                output_dir=output_dir,
+                stage=stage,
+                target_id=target_id,
+                target_house_id=target_house_id,
+                inflation_cells=inflation_cells,
+            )
+            attempt_summary = {
+                "layer_key": layer_key,
+                "layer_z_cm": round(float(layer_z), 3),
+                "status": str(attempt_plan.get("status", "") or ""),
+                "reason": str(attempt_plan.get("reason", "") or ""),
+                "start_blocked": bool(attempt_plan.get("route7_layer_start_blocked", False)),
+                "target_blocked": bool(attempt_plan.get("route7_layer_target_blocked", False)),
+                "waypoint_count": len([item for item in attempt_plan.get("waypoints", []) if isinstance(item, dict)]) if isinstance(attempt_plan.get("waypoints", []), list) else 0,
+            }
+            attempts.append(attempt_summary)
+            if layer_key == preferred_key:
+                preferred_attempt = attempt_plan
+            layer_ok = (
+                str(attempt_plan.get("status", "") or "") == "ok"
+                and not bool(attempt_plan.get("route7_layer_start_blocked", False))
+                and not bool(attempt_plan.get("route7_layer_target_blocked", False))
+            )
+            if layer_ok:
+                selected = (layer_record, layer_key, layer_z, attempt_plan)
+                break
+        if selected is None:
+            last = attempts[-1] if attempts else {}
+            return {
+                "status": "blocked",
+                "reason": "route7_realtime_multilayer_no_free_path",
+                "planner_source": "route7_realtime_multilayer_occupancy_astar",
+                "route7_map_route_replan_policy": "map_first_realtime_multilayer_revalidate",
+                "route7_realtime_route_plan": True,
+                "route7_multilayer_route": False,
+                "route7_preferred_layer_key": preferred_key,
+                "route7_layer_attempts": self.route5_json_safe(attempts),
+                "last_attempt": self.route5_json_safe(last),
+                "manifest_layer_count": len(layers),
+                "manifest": self.route5_json_safe({"schema": manifest.get("schema", ""), "layer_count": len(layers)}),
+                "waypoints": [],
+                "route7_route_segments": [],
+            }
+        _record, selected_key, selected_z, selected_plan = selected
+        return self.route7_compose_realtime_multilayer_plan(
+            selected_plan,
+            start_pose=start_pose,
+            target_pose=target_pose,
+            selected_layer_key=selected_key,
+            selected_layer_z_cm=selected_z,
+            preferred_layer_key=preferred_key,
+            preferred_layer_z_cm=preferred_z,
+            preferred_attempt=preferred_attempt or selected_plan,
+            layer_attempts=attempts,
+            stage=stage,
+            target_id=target_id,
+            target_house_id=target_house_id,
+        )
+
+    def route7_update_realtime_navigation_route(
+        self,
+        current_pose: Dict[str, float],
+        target_pose: Dict[str, float],
+        *,
+        output_dir: Path,
+        stage: str = "",
+        target_id: str = "",
+        target_house_id: str = "",
+        update_reason: str = "runtime_tick",
+        inflation_cells: int = 1,
+    ) -> Dict[str, Any]:
+        plan = self.route7_plan_realtime_navigation_route_from_map(
+            current_pose,
+            target_pose,
+            output_dir=output_dir,
+            stage=stage,
+            target_id=target_id,
+            target_house_id=target_house_id,
+            inflation_cells=inflation_cells,
+        )
+        route_state = {
+            "schema": "route7_realtime_route_plan_v1",
+            "updated_at": datetime.now().isoformat(timespec="milliseconds"),
+            "update_reason": str(update_reason or "runtime_tick"),
+            "stage": str(stage or ""),
+            "target_id": str(target_id or ""),
+            "target_house_id": str(target_house_id or ""),
+            "current_pose": self.route5_json_safe(current_pose),
+            "target_pose": self.route5_json_safe(target_pose),
+            "status": str(plan.get("status", "") or ""),
+            "reason": str(plan.get("reason", "") or ""),
+            "planner_source": str(plan.get("planner_source", "") or ""),
+            "layer_key": str(plan.get("layer_key", plan.get("route7_selected_layer_key", "")) or ""),
+            "route7_preferred_layer_key": str(plan.get("route7_preferred_layer_key", "") or ""),
+            "route7_multilayer_route": bool(plan.get("route7_multilayer_route", False)),
+            "route7_layer_transition_count": int(plan.get("route7_layer_transition_count", 0) or 0),
+            "route7_route_signature": str(plan.get("route7_route_signature", "") or ""),
+            "waypoints": self.route5_json_safe(plan.get("waypoints", [])),
+            "route7_route_segments": self.route5_json_safe(plan.get("route7_route_segments", [])),
+            "route7_layer_attempts": self.route5_json_safe(plan.get("route7_layer_attempts", [])),
+        }
+        plan["route7_realtime_route_state"] = route_state
+        try:
+            self.route5_update_state(route7_realtime_route_plan=route_state)
+        except Exception:
+            pass
+        try:
+            map_dir = Path(output_dir) / "map"
+            self.write_json_artifact(map_dir / "route7_realtime_route_plan.json", route_state)
+            self.append_jsonl(map_dir / "route7_realtime_route_plan.jsonl", self.route5_json_safe(route_state))
+        except Exception as exc:
+            plan["route7_realtime_route_write_error"] = f"{type(exc).__name__}: {exc}"
+        return plan
+
+    def route7_realtime_plan_needs_execution_replan(
+        self,
+        plan: Dict[str, Any],
+        current_waypoint: Dict[str, Any],
+        *,
+        tolerance_cm: float = 90.0,
+    ) -> bool:
+        if str((plan if isinstance(plan, dict) else {}).get("status", "") or "") != "ok":
+            return False
+        waypoints = plan.get("waypoints", []) if isinstance(plan.get("waypoints", []), list) else []
+        first = next((item for item in waypoints if isinstance(item, dict)), None)
+        if not isinstance(first, dict) or not isinstance(current_waypoint, dict):
+            return False
+        try:
+            distance = distance_3d_cm(first, current_waypoint)
+        except Exception:
+            distance = 0.0
+        return bool(distance > float(tolerance_cm))
+
     def route7_write_navigation_plan_visualization(
         self,
         output_dir: Path,
@@ -739,10 +1340,16 @@ class Route5FusionControlMixin:
         target_pose: Dict[str, Any],
         target_id: str = "",
     ) -> Dict[str, Any]:
-        if not isinstance(plan, dict) or str(plan.get("planner_source", "") or "") != "route7_layered_occupancy_astar":
+        if not isinstance(plan, dict) or str(plan.get("planner_source", "") or "") not in {"route7_layered_occupancy_astar", "route7_realtime_multilayer_occupancy_astar"}:
             return {"status": "skipped", "reason": "not_route7_layered_occupancy_plan"}
         out_path = Path(output_dir)
         layer_record, layer_key, _layer_z_cm, _manifest = self.route7_selected_map_layer_record(out_path)
+        plan_layer_key = str(plan.get("layer_key", plan.get("route7_selected_layer_key", "")) or "")
+        if plan_layer_key:
+            layers, _manifest2 = self.route7_available_map_layer_records(out_path)
+            matched = next(((record, key, z_cm) for record, key, z_cm in layers if key == plan_layer_key), None)
+            if matched is not None:
+                layer_record, layer_key, _layer_z_cm = matched
         loaded = self.route7_load_layer_occupancy_grid(layer_record)
         if loaded.get("status") != "ok":
             return {"status": "skipped", "reason": str(loaded.get("reason", loaded.get("status", "missing_layer_grid")))}
@@ -841,7 +1448,58 @@ class Route5FusionControlMixin:
             return False
         stage_text = str(stage or "").upper()
         target_text = str(target_id or "").lower()
-        return stage_text == "NAV_TO_SCAN_POINT" or "_z_" in target_text or "map_layer" in target_text
+        return stage_text in {"NAV_TO_OBS", "NAV_TO_SCAN_POINT", "ACTIVE_NBV_NAV_TO_SCAN_POINT"} or "_z_" in target_text or "map_layer" in target_text
+
+    def route7_navigation_safety_report(
+        self,
+        target_house_id: str,
+        pose: Dict[str, Any],
+        *,
+        stage: str = "",
+        facade: str = "",
+        target_id: str = "",
+        output_dir: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        safety = self.route3_safety_report_for_pose(target_house_id, pose)
+        if bool(safety.get("safe", False)):
+            return safety
+        if not self.route7_should_use_map_route_planner(stage, target_id, output_dir=output_dir):
+            return safety
+        if str(safety.get("reason", "") or "") != "target_house_bbox":
+            return safety
+        corridor = self.route5_pose_facade_corridor_check(
+            target_house_id,
+            facade,
+            pose,
+            axis_margin_cm=250.0,
+            side_margin_cm=180.0,
+        )
+        if not bool(corridor.get("same_facade_corridor", False)):
+            checked = dict(safety)
+            checked["route7_target_house_bbox_allowed"] = False
+            checked["route7_target_house_bbox_recheck"] = {
+                "reason": "not_on_requested_facade_boundary",
+                "facade_corridor": self.route5_json_safe(corridor),
+            }
+            return checked
+        clearance = self.route7_map_route_clearance_report(pose, pose, output_dir=output_dir)
+        if clearance.get("status") == "ok" and not bool(clearance.get("route_blocked", False)):
+            return {
+                "safe": True,
+                "reason": "route7_target_house_boundary_waypoint_allowed",
+                "route7_target_house_bbox_allowed": True,
+                "original_safety": self.route5_json_safe(safety),
+                "facade_corridor": self.route5_json_safe(corridor),
+                "map_route_clearance": self.route5_json_safe(clearance),
+            }
+        checked = dict(safety)
+        checked["route7_target_house_bbox_allowed"] = False
+        checked["route7_target_house_bbox_recheck"] = {
+            "reason": "map_layer_cell_blocked_or_unavailable",
+            "facade_corridor": self.route5_json_safe(corridor),
+            "map_route_clearance": self.route5_json_safe(clearance),
+        }
+        return checked
 
     def route7_local_3d_replan_decision(
         self,
@@ -860,8 +1518,7 @@ class Route5FusionControlMixin:
         must_stop = bool((gate if isinstance(gate, dict) else {}).get("must_stop", False))
         can_forward = bool((gate if isinstance(gate, dict) else {}).get("can_forward", False))
         risk_state = str((gate if isinstance(gate, dict) else {}).get("front_risk_state", "") or "")
-        hard_stop_cm = 140.0
-        if must_stop or risk_state == "must_stop" or (front_min_cm > 0.0 and front_min_cm < hard_stop_cm):
+        if must_stop or risk_state == "must_stop":
             return {
                 "action": "stop",
                 "reason": "route7_hard_obstacle_stop",
@@ -872,7 +1529,7 @@ class Route5FusionControlMixin:
         clearance = self.route7_map_route_clearance_report(current_pose, target_pose, output_dir=output_dir)
         action = "replan"
         reason = "route7_map_route_replan_required"
-        if clearance.get("status") == "ok" and not bool(clearance.get("route_blocked", False)) and can_forward and front_min_cm >= 180.0:
+        if clearance.get("status") == "ok" and not bool(clearance.get("route_blocked", False)) and can_forward:
             action = "continue_cautious"
             reason = "route7_map_route_clear_local_3d_soft_block"
         elif clearance.get("status") == "ok" and bool(clearance.get("route_blocked", False)):
@@ -901,6 +1558,7 @@ class Route5FusionControlMixin:
         target_pose: Dict[str, Any],
         *,
         output_dir: Optional[Path] = None,
+        rule: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         event_dict = event if isinstance(event, dict) else {}
         stage = str(event_dict.get("route5_stage", event_dict.get("stage", "")) or "")
@@ -914,24 +1572,101 @@ class Route5FusionControlMixin:
         front_min = self._as_float_or_none((gate if isinstance(gate, dict) else {}).get("front_min_depth_cm"))
         front_min_cm = float(front_min) if front_min is not None else 0.0
         must_stop = bool((gate if isinstance(gate, dict) else {}).get("must_stop", False))
-        hard_stop_cm = 140.0
+        deep_red = self.route7_front_square_deep_red_takeover(event_dict, gate if isinstance(gate, dict) else {}, rule=rule)
         base = {
             "schema": "route7_soft_obstacle_policy_v1",
             "route7_deep_red_only_avoidance": True,
             "front_min_depth_cm": round(front_min_cm, 3),
             "front_risk_state": risk_state,
             "must_stop": must_stop,
-            "hard_stop_cm": hard_stop_cm,
+            "route7_front_square_deep_red_takeover": self.route5_json_safe(deep_red),
             "stage": stage,
             "target_id": target_id,
         }
-        if must_stop or risk_state == "must_stop" or (front_min_cm > 0.0 and front_min_cm <= hard_stop_cm):
-            return {**base, "mode": "hard_avoidance", "reason": "route7_deep_red_or_hard_stop_obstacle"}
+        if bool(deep_red.get("active", False)):
+            return {**base, "mode": "hard_avoidance", "reason": "route7_front_square_deep_red_or2_takeover"}
+        route_state = event_dict.get("route7_realtime_route_plan", {}) if isinstance(event_dict.get("route7_realtime_route_plan", {}), dict) else {}
+        if route_state:
+            base["route7_realtime_route_plan"] = self.route5_json_safe(route_state)
+            if str(route_state.get("status", "") or "") == "blocked":
+                return {**base, "mode": "replan", "reason": "route7_realtime_route_blocked_replan"}
+            if str(route_state.get("status", "") or "") == "ok":
+                return {**base, "mode": "continue_planned_route", "reason": "route7_realtime_route_clear_continue_planned_route"}
         clearance = self.route7_map_route_clearance_report(current_pose, target_pose, output_dir=output_dir)
         base["map_route_clearance"] = self.route5_json_safe(clearance)
         if clearance.get("status") == "ok" and bool(clearance.get("route_blocked", False)):
             return {**base, "mode": "replan", "reason": "route7_map_route_obstacle_replan"}
         return {**base, "mode": "continue_planned_route", "reason": "route7_soft_obstacle_not_deep_red_continue_planned_route"}
+
+    def route7_front_square_deep_red_takeover(
+        self,
+        event: Dict[str, Any],
+        gate: Dict[str, Any],
+        *,
+        rule: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        event_dict = event if isinstance(event, dict) else {}
+        gate_dict = gate if isinstance(gate, dict) else {}
+        rule_dict = rule if isinstance(rule, dict) else {}
+        corridor_risks = rule_dict.get("corridor_risks") if isinstance(rule_dict.get("corridor_risks"), dict) else {}
+        if not corridor_risks:
+            corridor_risks = event_dict.get("or2_corridor_risks") if isinstance(event_dict.get("or2_corridor_risks"), dict) else {}
+        if not corridor_risks:
+            corridor_risks = gate_dict.get("or2_corridor_risks") if isinstance(gate_dict.get("or2_corridor_risks"), dict) else {}
+        front = corridor_risks.get("front_center", {}) if isinstance(corridor_risks.get("front_center", {}), dict) else {}
+        front_stop = self.route5_event_float(front.get("stop_fraction"), default=0.0)
+        front_warning = self.route5_event_float(front.get("warning_fraction"), default=0.0)
+        risk_state = str(gate_dict.get("front_risk_state", event_dict.get("or2_front_risk_state", "")) or "").strip().lower()
+        must_stop = bool(gate_dict.get("must_stop", event_dict.get("or2_must_stop", False)))
+        has_front_square_stats = bool(front)
+        or3_source = gate_dict
+        if "front_box_stop_fraction" not in or3_source:
+            event_or3 = event_dict.get("or3_prediction", {}) if isinstance(event_dict.get("or3_prediction"), dict) else {}
+            if "front_box_stop_fraction" in event_or3:
+                or3_source = event_or3
+        has_or3_stats = "front_box_stop_fraction" in (or3_source if isinstance(or3_source, dict) else {})
+        if has_or3_stats:
+            front_stop = self.route5_event_float(or3_source.get("front_box_stop_fraction"), default=0.0)
+            front_warning = self.route5_event_float(or3_source.get("front_box_warning_fraction"), default=0.0)
+            front_clearance = self.route5_event_float(or3_source.get("front_box_clearance_fraction"), default=0.0)
+            threshold = self.route5_event_float(or3_source.get("projection_box_stop_threshold"), default=0.01)
+            threshold = threshold if threshold > 0.0 else 0.01
+            projection_box = or3_source.get("projection_box", {}) if isinstance(or3_source.get("projection_box", {}), dict) else {}
+            active = bool(front_stop > threshold)
+            reason = "or3_projection_box_stop_fraction" if active else "or3_projection_box_not_deep_red"
+            return {
+                "schema": "route7_front_square_deep_red_takeover_v2",
+                "active": bool(active),
+                "reason": reason,
+                "front_stop_fraction": round(float(front_stop), 6),
+                "front_warning_fraction": round(float(front_warning), 6),
+                "front_clearance_fraction": round(float(front_clearance), 6),
+                "front_stop_threshold": threshold,
+                "threshold": threshold,
+                "has_front_square_stats": True,
+                "or3_projection_box_gate": True,
+                "projection_box": self.route5_json_safe(projection_box),
+                "projection_box_stop_threshold": threshold,
+                "front_box_stop_fraction": round(float(front_stop), 6),
+                "front_box_warning_fraction": round(float(front_warning), 6),
+                "front_box_clearance_fraction": round(float(front_clearance), 6),
+                "front_risk_state": risk_state,
+                "must_stop": bool(must_stop),
+            }
+        threshold = 0.01
+        active = bool(front_stop > threshold)
+        reason = "front_square_stop_fraction" if active else "front_square_not_deep_red"
+        return {
+            "schema": "route7_front_square_deep_red_takeover_v1",
+            "active": bool(active),
+            "reason": reason,
+            "front_stop_fraction": round(float(front_stop), 6),
+            "front_warning_fraction": round(float(front_warning), 6),
+            "front_stop_threshold": threshold,
+            "has_front_square_stats": bool(has_front_square_stats),
+            "front_risk_state": risk_state,
+            "must_stop": bool(must_stop),
+        }
 
     def route7_select_standoff_for_layer_edge(
         self,
@@ -1610,7 +2345,7 @@ class Route5FusionControlMixin:
         while candidate.exists():
             suffix += 1
             candidate = root / f"{base_name}_{suffix}"
-        for subdir in ("frames", "reconstruction", "facade_observations", "map"):
+        for subdir in ("frames", "open3d_frames", "reconstruction", "facade_observations", "map"):
             (candidate / subdir).mkdir(parents=True, exist_ok=True)
         return candidate
 
@@ -1623,6 +2358,8 @@ class Route5FusionControlMixin:
         path = Path(raw)
         path.mkdir(parents=True, exist_ok=True)
         (path / "frames").mkdir(parents=True, exist_ok=True)
+        if str(state.get("route_window_label", "") or "").strip().upper() == "V7" or "llm_route_7_fusion_runs" in str(path).replace("/", "\\"):
+            (path / "open3d_frames").mkdir(parents=True, exist_ok=True)
         (path / "reconstruction").mkdir(parents=True, exist_ok=True)
         (path / "facade_observations").mkdir(parents=True, exist_ok=True)
         return path
@@ -1835,6 +2572,11 @@ class Route5FusionControlMixin:
             "repair_reason": str(event.get("repair_reason", "") or ""),
             "route7_soft_obstacle_policy": self.route5_json_safe(event.get("route7_soft_obstacle_policy", {})),
             "route7_map_route_replan_request": bool(event.get("route7_map_route_replan_request", False)),
+            "route7_navigation_point_reset_request": bool(event.get("route7_navigation_point_reset_request", False)),
+            "forward_blocked": bool(event.get("route7_forward_blocked", event.get("forward_blocked", False))),
+            "yaw_error_deg": self.route5_event_float(event.get("route7_yaw_error_deg", event.get("yaw_error_deg", 0.0)), default=0.0),
+            "route7_realtime_route_plan": self.route5_json_safe(event.get("route7_realtime_route_plan", {})),
+            "route7_route_decision_reason": str(event.get("route7_route_decision_reason", "") or ""),
             "nominal_payload": self.route5_json_safe(event.get("nominal_action", event.get("nominal_payload", {}))),
             "selected_action_payload": self.route5_json_safe(event.get("selected_action_payload", {})),
             "final_payload": self.route5_json_safe(final_payload if isinstance(final_payload, dict) else event.get("selected_action_payload", {})),
@@ -1879,6 +2621,11 @@ class Route5FusionControlMixin:
                 "safe_alternative_action": decision["safe_alternative_action"],
                 "route7_soft_obstacle_policy": decision["route7_soft_obstacle_policy"],
                 "route7_map_route_replan_request": decision["route7_map_route_replan_request"],
+                "route7_navigation_point_reset_request": decision["route7_navigation_point_reset_request"],
+                "forward_blocked": decision["forward_blocked"],
+                "yaw_error_deg": decision["yaw_error_deg"],
+                "route7_realtime_route_plan": decision["route7_realtime_route_plan"],
+                "route7_route_decision_reason": decision["route7_route_decision_reason"],
                 "collision_state": decision["collision_state"],
             }
             self.append_jsonl(output_dir / "route7_frame_decision_log.jsonl", concise)
@@ -2539,6 +3286,7 @@ class Route5FusionControlMixin:
             "movement_failed",
             "navigation_plan_failed",
             "nav_timeout",
+            "route7_map_route_replan_required",
             "target_reset_failed",
             "target_reset_limit_exhausted",
         }
@@ -3416,6 +4164,24 @@ class Route5FusionControlMixin:
     def route5_max_facade_retry_count(self) -> int:
         return 3
 
+    def route5_final_status_for_task_lock(self, status: str) -> str:
+        final_status = str(status or "").strip() or "done"
+        if final_status != "done":
+            return final_status
+        terminal_failed = set(self.llm_route5_blocked_facades)
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        terminal_failed.update(
+            str(item).strip().lower()
+            for item in (state.get("terminal_failed_facades", []) if isinstance(state.get("terminal_failed_facades", []), list) else [])
+            if str(item).strip().lower()
+        )
+        if not terminal_failed:
+            return final_status
+        route_label = str(state.get("route_window_label", "") or "").strip().upper()
+        if route_label == "V7":
+            return "blocked_selected_house_incomplete"
+        return "done_with_blocked"
+
     def route5_rewrite_jsonl_artifact(self, path: Path, rows: List[Dict[str, Any]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", encoding="utf-8") as fh:
@@ -4016,6 +4782,13 @@ class Route5FusionControlMixin:
         dist_xy = float(math.hypot(dx, dy))
         if dist_xy <= float(config["reach_tol_cm"]):
             return payload
+        final_approach_radius = float(config["reach_tol_cm"]) + max(5.0, float(config["nav_step_cm"]))
+        if dist_xy <= final_approach_radius:
+            payload["yaw_policy"] = "close_range_final_approach"
+            payload["lookahead_suppressed_reason"] = "within_final_approach_radius"
+            payload["look_yaw_deg"] = round(float(self.route5_navigation_travel_yaw_deg(current, target)), 3)
+            payload["capture_yaw_deg"] = round(float(target.get("yaw", target.get("yaw_deg", 0.0)) or 0.0), 3)
+            return payload
         look_yaw = self.route5_navigation_travel_yaw_deg(current, target)
         yaw_error = self._normalize_angle_deg(float(look_yaw) - float(current.get("yaw", 0.0)))
         yaw_delta = 0.0 if abs(yaw_error) <= float(config["yaw_tol_deg"]) else max(-30.0, min(30.0, float(yaw_error)))
@@ -4266,10 +5039,63 @@ class Route5FusionControlMixin:
             vertical_step_cm=max(float(DEFAULT_ROUTE_VERTICAL_STEP_CM), float(config.get("nav_step_cm", 20.0))),
         )
 
+    def route5_predict_obstacle_representation_3(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        self.ensure_route5_state()
+        if ObstacleRepresentation3Predictor is None:
+            return {"status": "skipped", "reason": "or3_import_unavailable"}
+        model_path = self.default_route5_or3_model_path()
+        rgb_path = Path(str(event.get("rgb_path", "") or "")).expanduser()
+        if not model_path.is_file():
+            return {"status": "skipped", "reason": "model_not_found", "model_path": str(model_path)}
+        if not rgb_path.is_file():
+            return {"status": "skipped", "reason": "rgb_not_found", "rgb_path": str(rgb_path)}
+        try:
+            predictor_path = str(model_path)
+            if getattr(self, "route5_or3_predictor", None) is None or str(getattr(self, "route5_or3_predictor_path", "")) != predictor_path:
+                self.route5_or3_predictor = ObstacleRepresentation3Predictor(model_path)
+                self.route5_or3_predictor_path = predictor_path
+            predictor = self.route5_or3_predictor
+            started = time.perf_counter()
+            prediction = predictor.predict(str(rgb_path), event)
+            prediction["prediction_latency_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+            prediction["status"] = "ok"
+            prediction["model_path"] = str(model_path)
+            capture_dir = Path(str(event.get("capture_dir", ""))) if str(event.get("capture_dir", "") or "") else rgb_path.parent
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            overlay_path = capture_dir / "or3_risk_overlay.png"
+            prediction_path = capture_dir / "or3_risk_prediction.json"
+            if render_or3_affordance_overlay is not None:
+                try:
+                    rgb_image = np.asarray(Image.open(str(rgb_path)).convert("RGB"), dtype=np.uint8)
+                    overlay = render_or3_affordance_overlay(rgb_image, prediction)
+                    Image.fromarray(overlay).save(overlay_path)
+                    prediction["risk_overlay_path"] = str(overlay_path)
+                except Exception as exc:
+                    prediction["overlay_error"] = str(exc)
+                    prediction["risk_overlay_path"] = ""
+            else:
+                prediction["risk_overlay_path"] = ""
+            prediction["prediction_json_path"] = str(prediction_path)
+            self.write_json_artifact(
+                prediction_path,
+                {
+                    **serializable_or2_prediction(prediction),
+                    "prediction_latency_ms": prediction.get("prediction_latency_ms"),
+                    "risk_overlay_path": prediction.get("risk_overlay_path", ""),
+                    "model_path": str(model_path),
+                },
+            )
+            return prediction
+        except Exception as exc:
+            return {"status": "error", "reason": str(exc), "model_path": str(model_path), "rgb_path": str(rgb_path)}
+
     def route5_predict_obstacle_representation(self, event: Dict[str, Any]) -> Dict[str, Any]:
         self.ensure_route5_state()
         model_path = Path(str(self.llm_route5_representation_model_var.get() or "")).expanduser()
         rgb_path = Path(str(event.get("rgb_path", "") or "")).expanduser()
+        or3_prediction = self.route5_predict_obstacle_representation_3(event)
+        if isinstance(or3_prediction, dict) and or3_prediction.get("status") == "ok":
+            event["or3_prediction"] = or3_prediction
         if not model_path.is_file():
             return {"status": "skipped", "reason": "model_not_found", "model_path": str(model_path)}
         if not rgb_path.is_file():
@@ -4285,6 +5111,8 @@ class Route5FusionControlMixin:
             prediction["prediction_latency_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
             prediction["status"] = "ok"
             prediction["model_path"] = str(model_path)
+            if isinstance(or3_prediction, dict) and or3_prediction.get("status") == "ok":
+                prediction["or3_prediction"] = or3_prediction
             capture_dir = Path(str(event.get("capture_dir", ""))) if str(event.get("capture_dir", "") or "") else rgb_path.parent
             capture_dir.mkdir(parents=True, exist_ok=True)
             overlay_path = capture_dir / "or2_risk_overlay.png"
@@ -4302,6 +5130,7 @@ class Route5FusionControlMixin:
                 prediction_path,
                 {
                     **serializable_or2_prediction(prediction),
+                    "or3_prediction": serializable_or2_prediction(or3_prediction) if isinstance(or3_prediction, dict) else {},
                     "prediction_latency_ms": prediction.get("prediction_latency_ms"),
                     "risk_overlay_path": prediction.get("risk_overlay_path", ""),
                     "model_path": str(model_path),
@@ -4317,6 +5146,40 @@ class Route5FusionControlMixin:
             payload[key] = round(float(payload.get(key, 0.0) or 0.0) * float(factor), 3)
         payload["action_name"] = action_name
         return payload
+
+    def route7_yaw_to_nav_point_payload(
+        self,
+        current_pose: Dict[str, Any],
+        target_pose: Dict[str, Any],
+        config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        look_yaw = self.route5_navigation_travel_yaw_deg(current_pose, target_pose)
+        current_yaw = self.route5_event_float((current_pose if isinstance(current_pose, dict) else {}).get("yaw"), default=0.0)
+        yaw_error = self._normalize_angle_deg(float(look_yaw) - float(current_yaw))
+        yaw_tol = max(1.0, self.route5_event_float((config if isinstance(config, dict) else {}).get("yaw_tol_deg"), default=10.0))
+        yaw_delta = 0.0 if abs(yaw_error) <= yaw_tol else max(-30.0, min(30.0, float(yaw_error)))
+        if yaw_delta < -1e-6:
+            action_name = "route7_yaw_to_nav_point_q"
+            key_hint = "q"
+        elif yaw_delta > 1e-6:
+            action_name = "route7_yaw_to_nav_point_e"
+            key_hint = "e"
+        else:
+            action_name = "route7_navigation_point_reset_required"
+            key_hint = "aligned"
+        return {
+            "forward_cm": 0.0,
+            "right_cm": 0.0,
+            "up_cm": 0.0,
+            "yaw_delta_deg": round(float(yaw_delta), 3),
+            "action_name": action_name,
+            "route7_avoidance_policy": "forward_block_only_yaw_to_navigation_point",
+            "route7_keyboard_hint": key_hint,
+            "look_yaw_deg": round(float(look_yaw), 3),
+            "current_yaw_deg": round(float(current_yaw), 3),
+            "yaw_error_deg": round(float(yaw_error), 3),
+            "yaw_tolerance_deg": round(float(yaw_tol), 3),
+        }
 
     def route5_or2_direction_payload(self, selected_direction: str, nominal_payload: Dict[str, Any], config: Dict[str, float]) -> Dict[str, Any]:
         direction = str(selected_direction or "hold").strip().lower()
@@ -4400,7 +5263,7 @@ class Route5FusionControlMixin:
         output_dir = Path(str(output_dir_value)) if output_dir_value else getattr(self, "route5_local_obstacle_output_dir", None)
         route7_policy = gate.get("route7_soft_obstacle_policy", {}) if isinstance(gate.get("route7_soft_obstacle_policy", {}), dict) else {}
         if not route7_policy or str(route7_policy.get("mode", "") or "") == "not_route7_map_route":
-            route7_policy = self.route7_or2_soft_obstacle_policy(event, gate, current_pose, target_pose, output_dir=output_dir)
+            route7_policy = self.route7_or2_soft_obstacle_policy(event, gate, current_pose, target_pose, output_dir=output_dir, rule=rule)
         route7_policy_mode = str(route7_policy.get("mode", "") or "")
         if route7_policy_mode == "replan":
             return {
@@ -4468,13 +5331,18 @@ class Route5FusionControlMixin:
                     and direction in {"forward", "slow_forward"}
                     and selected_rejected_reason
                 ):
-                    continue_direction = "slow_forward" if direction == "forward" else direction
-                    continue_payload = self.route5_or2_direction_payload(continue_direction, nominal_payload, config)
+                    continue_payload = self.route7_yaw_to_nav_point_payload(current_pose, target_pose, config)
+                    yaw_error = self.route5_event_float(continue_payload.get("yaw_error_deg"), default=0.0)
+                    yaw_aligned = abs(float(yaw_error)) <= self.route5_event_float(continue_payload.get("yaw_tolerance_deg"), default=10.0)
+                    continue_direction = str(continue_payload.get("action_name", "route7_yaw_to_nav_point") or "route7_yaw_to_nav_point")
+                    reset_request = bool(yaw_aligned)
                     reason_suffix = (
                         f"; {route7_policy.get('reason', 'route7_soft_obstacle_not_deep_red_continue_planned_route')} "
                         f"selected_or2_action={selected or 'unknown'} soft_rejected={selected_rejected_reason} "
-                        f"continue={continue_direction}"
+                        f"forward_blocked=True continue={continue_direction}"
                     )
+                    if reset_request:
+                        reason_suffix += " route7_navigation_point_reset_request=True"
                     return {
                         "direction": continue_direction,
                         "payload": continue_payload,
@@ -4484,6 +5352,10 @@ class Route5FusionControlMixin:
                         "safe_alternative_action": "" if continue_direction == selected else continue_direction,
                         "or2_selected_action_rejected_reason": selected_rejected_reason,
                         "route7_soft_obstacle_policy": self.route5_json_safe(route7_policy),
+                        "route7_forward_blocked": True,
+                        "route7_yaw_error_deg": round(float(yaw_error), 3),
+                        "route7_navigation_point_reset_request": reset_request,
+                        "avoidance_active": True,
                     }
             if safe and risk_ok:
                 if route7_policy_mode == "continue_planned_route" and direction not in {"forward", "slow_forward", selected}:
@@ -4619,9 +5491,12 @@ class Route5FusionControlMixin:
             "selected_direction": selected_direction,
             "reason": reason,
         }
-        route7_policy = self.route7_or2_soft_obstacle_policy(event, gate, current_pose, target_pose)
+        route7_policy = self.route7_or2_soft_obstacle_policy(event, gate, current_pose, target_pose, rule=rule)
         if str(route7_policy.get("mode", "") or "") == "continue_planned_route":
             active = False
+            selected_direction = "forward"
+            payload = dict(nominal_payload if isinstance(nominal_payload, dict) else payload)
+            payload["action_name"] = str(payload.get("action_name", "route7_planned_route_forward") or "route7_planned_route_forward")
             gate["avoidance_active"] = False
             gate["route7_deep_red_only_avoidance"] = True
             gate["route7_soft_obstacle_policy"] = self.route5_json_safe(route7_policy)
@@ -4633,8 +5508,13 @@ class Route5FusionControlMixin:
             gate["route7_soft_obstacle_policy"] = self.route5_json_safe(route7_policy)
             gate["reason"] = f"{reason}; {route7_policy.get('reason', 'route7_map_route_replan_required')}"
         elif str(route7_policy.get("mode", "") or "") == "hard_avoidance":
+            active = True
+            gate["avoidance_active"] = True
+            gate["can_forward"] = False
             gate["route7_deep_red_only_avoidance"] = True
+            gate["route7_hard_avoidance_request"] = True
             gate["route7_soft_obstacle_policy"] = self.route5_json_safe(route7_policy)
+            gate["reason"] = f"{reason}; {route7_policy.get('reason', 'route7_front_square_deep_red_takeover')}"
         alternative = self.route5_apply_or2_safe_alternative(
             event=event,
             gate=gate,
@@ -4648,6 +5528,8 @@ class Route5FusionControlMixin:
         )
         selected_direction = str(alternative.get("direction", selected_direction) or selected_direction)
         payload = dict(alternative.get("payload", payload) if isinstance(alternative.get("payload", payload), dict) else payload)
+        if "avoidance_active" in alternative:
+            active = bool(alternative.get("avoidance_active", active))
         if alternative.get("reason_suffix"):
             reason = f"{reason}{alternative.get('reason_suffix')}"
             gate["reason"] = reason
@@ -4660,6 +5542,12 @@ class Route5FusionControlMixin:
             gate["route7_soft_obstacle_policy"] = self.route5_json_safe(alternative.get("route7_soft_obstacle_policy", {}))
         if alternative.get("route7_map_route_replan_request"):
             gate["route7_map_route_replan_request"] = True
+        if alternative.get("route7_navigation_point_reset_request"):
+            gate["route7_navigation_point_reset_request"] = True
+        if alternative.get("route7_forward_blocked"):
+            gate["route7_forward_blocked"] = True
+        if alternative.get("route7_yaw_error_deg") is not None:
+            gate["route7_yaw_error_deg"] = alternative.get("route7_yaw_error_deg")
         selected_action = str(payload.get("action_name", selected_direction))
         phase = "OR2_AVOIDANCE" if active else "ROUTE_NAVIGATION"
         event_updates = {
@@ -4677,6 +5565,9 @@ class Route5FusionControlMixin:
             "candidate_safety_scores": self.route5_json_safe(alternative.get("candidate_safety_scores", {})),
             "route7_soft_obstacle_policy": self.route5_json_safe(alternative.get("route7_soft_obstacle_policy", gate.get("route7_soft_obstacle_policy", {}))),
             "route7_map_route_replan_request": bool(alternative.get("route7_map_route_replan_request", gate.get("route7_map_route_replan_request", False))),
+            "route7_navigation_point_reset_request": bool(alternative.get("route7_navigation_point_reset_request", gate.get("route7_navigation_point_reset_request", False))),
+            "route7_forward_blocked": bool(alternative.get("route7_forward_blocked", gate.get("route7_forward_blocked", False))),
+            "route7_yaw_error_deg": alternative.get("route7_yaw_error_deg", gate.get("route7_yaw_error_deg")),
             "or2_risk_overlay_path": str(prediction.get("risk_overlay_path", "") or ""),
             "or2_prediction_json_path": str(prediction.get("prediction_json_path", "") or ""),
             "avoidance_gate": gate,
@@ -4744,6 +5635,16 @@ class Route5FusionControlMixin:
         selected = str(gate.get("selected_direction", event.get("or2_selected_direction", rule.get("selected_direction", ""))) or "").strip().lower()
         risk = str(gate.get("front_risk_state", prediction.get("front_risk_state", event.get("or2_front_risk_state", ""))) or "").strip().lower()
         active = bool(gate.get("avoidance_active", False)) or risk in {"obstacle_warning", "must_stop"}
+        route7_policy = gate.get("route7_soft_obstacle_policy", {}) if isinstance(gate.get("route7_soft_obstacle_policy", {}), dict) else {}
+        if not route7_policy:
+            route7_policy = event.get("route7_soft_obstacle_policy", {}) if isinstance(event.get("route7_soft_obstacle_policy", {}), dict) else {}
+        route7_policy_mode = str(route7_policy.get("mode", "") or "").strip().lower()
+        route7_reset_request = bool(gate.get("route7_navigation_point_reset_request", False)) or bool(event.get("route7_navigation_point_reset_request", False))
+        route7_continue_planned_route = route7_policy_mode == "continue_planned_route" and not route7_reset_request
+        if route7_continue_planned_route:
+            active = False
+        if route7_reset_request:
+            active = True
         distance = self.route5_event_float(event.get("distance_to_goal_cm", error.get("dist_xy_cm", 0.0)), default=0.0)
         cross_track = self.route5_event_float(
             event.get("route_cross_track_cm", event.get("path_deviation_cm", event.get("post_route_cross_track_cm", 0.0))),
@@ -4771,6 +5672,8 @@ class Route5FusionControlMixin:
         tracker["last_direction"] = selected
         tracker["last_front_depth_cm"] = float(front_depth)
         tracker["last_risk_state"] = risk
+        tracker["last_route7_policy_mode"] = route7_policy_mode
+        tracker["route7_navigation_point_reset_request"] = bool(route7_reset_request)
         tracker["candidate_action_scores"] = self.route5_json_safe(rule.get("candidate_action_scores", event.get("or2_candidate_action_scores", {})))
         directions = dict(tracker.get("direction_counts", {}) if isinstance(tracker.get("direction_counts"), dict) else {})
         if selected:
@@ -4785,7 +5688,9 @@ class Route5FusionControlMixin:
             tracker["consecutive_avoidance_ticks"] = int(tracker.get("consecutive_avoidance_ticks", 0) or 0) + 1
         else:
             tracker["consecutive_avoidance_ticks"] = 0
-        if risk == "must_stop":
+        if route7_continue_planned_route:
+            tracker["route7_continue_planned_route_tick_count"] = int(tracker.get("route7_continue_planned_route_tick_count", 0) or 0) + 1
+        if risk == "must_stop" and not route7_continue_planned_route:
             tracker["consecutive_must_stop_ticks"] = int(tracker.get("consecutive_must_stop_ticks", 0) or 0) + 1
         else:
             tracker["consecutive_must_stop_ticks"] = 0
@@ -4796,6 +5701,8 @@ class Route5FusionControlMixin:
                 "risk": risk,
                 "selected_direction": selected,
                 "avoidance_active": active,
+                "route7_policy_mode": route7_policy_mode,
+                "route7_navigation_point_reset_request": bool(route7_reset_request),
                 "front_min_depth_cm": float(front_depth),
                 "distance_to_goal_cm": float(distance),
                 "cross_track_cm": float(cross_track),
@@ -4811,6 +5718,8 @@ class Route5FusionControlMixin:
         error = error if isinstance(error, dict) else {}
         if bool(error.get("reached", False)):
             return {"should_reset": False, "reason": "target_reached"}
+        if bool(tracker.get("route7_navigation_point_reset_request", False)):
+            return {"should_reset": True, "reason": "route7_navigation_point_reset_request", "value": True}
         consecutive = int(tracker.get("consecutive_avoidance_ticks", 0) or 0)
         must_stop = int(tracker.get("consecutive_must_stop_ticks", 0) or 0)
         total = int(tracker.get("avoidance_tick_count", 0) or 0)
@@ -5075,12 +5984,18 @@ class Route5FusionControlMixin:
         distance = self.route5_event_float(event.get("distance_to_goal_cm", error.get("dist_3d_cm", error.get("dist_xy_cm", 0.0))), default=0.0)
         front_depth = self.route5_event_float(gate.get("front_min_depth_cm", summary.get("front_min_depth_cm", 0.0)), default=0.0)
         risk = str(gate.get("front_risk_state", event.get("or2_front_risk_state", "")) or "").strip().lower()
+        route7_policy = gate.get("route7_soft_obstacle_policy", {}) if isinstance(gate.get("route7_soft_obstacle_policy", {}), dict) else {}
+        if not route7_policy:
+            route7_policy = event.get("route7_soft_obstacle_policy", {}) if isinstance(event.get("route7_soft_obstacle_policy", {}), dict) else {}
+        route7_policy_mode = str(route7_policy.get("mode", "") or "").strip().lower()
         forward_clear = bool(summary.get("forward_swept_clear", True))
         obstacle_confirmed = bool(
             risk in {"obstacle_warning", "must_stop"}
             or (front_depth > 0.0 and front_depth <= 300.0 and not forward_clear)
             or bool(gate.get("must_stop", False))
         )
+        if route7_policy_mode == "continue_planned_route":
+            obstacle_confirmed = False
         if bool(error.get("reached", False)):
             policy = "standard_reach_tolerance"
             near_reached = False
@@ -5104,6 +6019,7 @@ class Route5FusionControlMixin:
             "distance_to_goal_cm": round(float(distance), 3),
             "arrival_reason": reason,
             "near_obstacle_confirmed": obstacle_confirmed,
+            "route7_policy_mode": route7_policy_mode,
             "near_obstacle_arrival_threshold_cm": 150.0,
             "near_obstacle_caution_threshold_cm": 300.0,
         }
@@ -5299,6 +6215,8 @@ class Route5FusionControlMixin:
         event["nominal_payload"] = nominal_payload or {}
         prediction = self.route5_predict_obstacle_representation(event)
         event["or2_prediction"] = prediction
+        if isinstance(prediction, dict) and isinstance(prediction.get("or3_prediction"), dict):
+            event["or3_prediction"] = prediction.get("or3_prediction", {})
         event["representation_prediction"] = {"status": "replaced_by_or2", "or2_front_risk_state": prediction.get("front_risk_state", "")}
         event["representation_obstacle_hint"] = "or2_risk_region"
         try:
@@ -5321,10 +6239,25 @@ class Route5FusionControlMixin:
                 "facade": facade,
                 "target_id": target_id,
                 "prediction": serializable_or2_prediction(prediction) if isinstance(prediction, dict) else {},
+                "or3_prediction": serializable_or2_prediction(event.get("or3_prediction", {})) if isinstance(event.get("or3_prediction"), dict) else {},
                 "risk_overlay_path": str(prediction.get("risk_overlay_path", "") if isinstance(prediction, dict) else ""),
                 "prediction_json_path": str(prediction.get("prediction_json_path", "") if isinstance(prediction, dict) else ""),
             },
         )
+        if isinstance(event.get("or3_prediction"), dict) and event["or3_prediction"].get("status") == "ok":
+            self.append_jsonl(
+                output_dir / "route5_or3_risk_events.jsonl",
+                {
+                    "event_type": "or3_prediction",
+                    "created_at": datetime.now().isoformat(timespec="milliseconds"),
+                    "frame_id": frame_id,
+                    "facade": facade,
+                    "target_id": target_id,
+                    "prediction": serializable_or2_prediction(event["or3_prediction"]),
+                    "risk_overlay_path": str(event["or3_prediction"].get("risk_overlay_path", "")),
+                    "prediction_json_path": str(event["or3_prediction"].get("prediction_json_path", "")),
+                },
+            )
         monitor = dict(self.llm_route5_state.get("or2_monitor", {}) if isinstance(self.llm_route5_state.get("or2_monitor"), dict) else {})
         state_counts = dict(monitor.get("state_counts", {}) if isinstance(monitor.get("state_counts"), dict) else {})
         risk_state = str(prediction.get("front_risk_state", prediction.get("status", "unknown")) if isinstance(prediction, dict) else "unknown")
@@ -5406,7 +6339,14 @@ class Route5FusionControlMixin:
         max_plan_repairs = 2
         original_planned_target_pose = dict(target_pose)
         reset_tracker = self.route5_new_target_reset_tracker(target_id, target_pose, original_planned_target_pose)
-        target_safety = self.route3_safety_report_for_pose(target_house_id, target_pose)
+        target_safety = self.route7_navigation_safety_report(
+            target_house_id,
+            target_pose,
+            stage=stage,
+            facade=facade,
+            target_id=target_id,
+            output_dir=output_dir,
+        )
         if not bool(target_safety.get("safe", False)):
             self.route5_hold(session, output_dir=output_dir, reason="unsafe_waypoint")
             return {"status": "blocked", "reason": "unsafe_waypoint", "safety": target_safety}
@@ -5477,11 +6417,52 @@ class Route5FusionControlMixin:
                     "elapsed_s": round(time.time() - started_at, 3),
                     "current_pose": current,
                 }
+            route7_runtime_plan: Dict[str, Any] = {}
+            if self.route7_should_use_map_route_planner(stage, target_id, output_dir=output_dir):
+                route7_runtime_plan = self.route7_update_realtime_navigation_route(
+                    current,
+                    target_pose,
+                    output_dir=output_dir,
+                    stage=stage,
+                    target_id=target_id,
+                    target_house_id=target_house_id,
+                    update_reason=f"movement_tick_{step_index}",
+                )
+                if str(route7_runtime_plan.get("status", "") or "") == "blocked":
+                    reason = "route7_realtime_route_blocked"
+                    self.route5_hold(session, output_dir=output_dir, reason=reason)
+                    self.route5_log_event(
+                        output_dir,
+                        "route7_realtime_route_blocked",
+                        {
+                            "stage": stage,
+                            "facade": facade,
+                            "target_id": target_id,
+                            "current_pose": current,
+                            "target_pose": target_pose,
+                            "route7_realtime_route_plan": self.route5_json_safe(route7_runtime_plan),
+                        },
+                    )
+                    return {
+                        "status": "blocked",
+                        "reason": reason,
+                        "stage": stage,
+                        "facade": facade,
+                        "target_id": target_id,
+                        "final_target_id": target_id,
+                        "final_target_pose": target_pose,
+                        "target_reset_count": reset_count,
+                        "pose_error": error,
+                        "route7_realtime_route_plan": self.route5_json_safe(route7_runtime_plan),
+                        "current_pose": current,
+                    }
             payload = self.route5_movement_payload_for_target_with_lookahead(current, target_pose, config, stage=stage)
             event: Dict[str, Any] = {}
             force_depth_precheck = self.route5_should_precheck_depth_before_payload(stage, payload)
             should_sense = force_depth_precheck or step_index == 0 or (time.time() - last_sense_at) >= sensing_interval_s
             lookahead_plan = self.route5_depth_lookahead_plan(current, target_pose, stage=stage, facade=facade, target_id=target_id)
+            if route7_runtime_plan:
+                lookahead_plan["route7_realtime_route_plan"] = self.route5_json_safe(route7_runtime_plan.get("route7_realtime_route_state", route7_runtime_plan))
             if force_depth_precheck:
                 align_result = self.route5_align_to_navigation_depth_yaw(
                     session,
@@ -5529,6 +6510,9 @@ class Route5FusionControlMixin:
                         lookahead_plan=lookahead_plan,
                         nominal_payload=payload,
                     )
+                    if route7_runtime_plan:
+                        event["route7_realtime_route_plan"] = self.route5_json_safe(route7_runtime_plan.get("route7_realtime_route_state", route7_runtime_plan))
+                        event["route7_route_decision_reason"] = str(route7_runtime_plan.get("reason", "") or "")
                     last_sense_at = time.time()
                     or2_decision = self.route5_or2_decision_for_event(
                         event,
@@ -5717,6 +6701,8 @@ class Route5FusionControlMixin:
                         event["reset_reason"] = str(candidate.get("reset_reason", reset_trigger.get("reason", "")) or "")
                         if candidate.get("status") == "ok":
                             reset_record = self.route5_record_target_reset(output_dir, candidate)
+                            if str(candidate.get("reset_reason", "") or "") == "route7_navigation_point_reset_request":
+                                self.route5_log_event(output_dir, "route7_navigation_point_reset", reset_record)
                             reset_count += 1
                             target_pose = dict(candidate.get("reset_target_pose", target_pose))
                             target_id = str(candidate.get("reset_target_id", f"{target_id}_reset_{reset_count}") or f"{target_id}_reset_{reset_count}")
@@ -5854,7 +6840,14 @@ class Route5FusionControlMixin:
                     self.route5_log_event(output_dir, "obstacle_sensing_failed", {"error": str(exc), "stage": stage, "target_id": target_id})
                     self.root.after(0, lambda e=exc: self.llm_route5_avoidance_status_var.set(f"Avoidance: fallback navigation ({e})"))
             predicted = self.route3_predict_next_pose(current, payload)
-            safety = self.route3_safety_report_for_pose(target_house_id, predicted)
+            safety = self.route7_navigation_safety_report(
+                target_house_id,
+                predicted,
+                stage=stage,
+                facade=facade,
+                target_id=target_id,
+                output_dir=output_dir,
+            )
             local_3d_safety = self.query_local_3d_safety(
                 current,
                 payload,
@@ -5879,6 +6872,7 @@ class Route5FusionControlMixin:
                 "predicted_pose": predicted,
                 "safety": safety,
                 "local_3d_safety": local_3d_safety,
+                "route7_realtime_route_plan": self.route5_json_safe(route7_runtime_plan.get("route7_realtime_route_state", route7_runtime_plan)) if route7_runtime_plan else {},
                 "obstacle_event_frame_id": event.get("frame_id") if event else None,
                 "created_at": datetime.now().isoformat(timespec="milliseconds"),
             }
@@ -6075,17 +7069,27 @@ class Route5FusionControlMixin:
                     "elapsed_s": round(time.time() - started_at, 3),
                 }
             if self.route7_should_use_map_route_planner(stage, target_id, output_dir=output_dir):
-                route7_plan = self.route7_plan_navigation_waypoints_from_map(
+                route7_plan = self.route7_update_realtime_navigation_route(
                     current,
                     target_pose,
                     output_dir=output_dir,
                     stage=stage,
                     target_id=target_id,
                     target_house_id=target_house_id,
+                    update_reason=f"navigation_plan_replan_{replan_count}",
                 )
                 if route7_plan.get("status") == "fallback":
+                    legacy_route7_plan = self.route7_plan_navigation_waypoints_from_map(
+                        current,
+                        target_pose,
+                        output_dir=output_dir,
+                        stage=stage,
+                        target_id=target_id,
+                        target_house_id=target_house_id,
+                    )
                     plan = self.route3_plan_navigation_waypoints(current, target_pose, target_house_id, grid_cm=float(LLM_ROUTE3_ASTAR_GRID_CM))
                     plan["route7_map_plan_fallback"] = self.route5_json_safe(route7_plan)
+                    plan["route7_legacy_layer_plan"] = self.route5_json_safe(legacy_route7_plan)
                 else:
                     plan = route7_plan
             else:
@@ -6145,12 +7149,15 @@ class Route5FusionControlMixin:
                         "replan_count": replan_count,
                         "elapsed_s": round(time.time() - started_at, 3),
                     }
-                waypoint_pose = {
-                    "x": float(waypoint.get("x", target_pose["x"])),
-                    "y": float(waypoint.get("y", target_pose["y"])),
-                    "z": float(waypoint.get("z", target_pose["z"])),
-                    "yaw": float(waypoint.get("yaw", target_pose["yaw"])),
-                }
+                waypoint_pose = dict(waypoint)
+                waypoint_pose.update(
+                    {
+                        "x": float(waypoint.get("x", target_pose["x"])),
+                        "y": float(waypoint.get("y", target_pose["y"])),
+                        "z": float(waypoint.get("z", target_pose["z"])),
+                        "yaw": float(waypoint.get("yaw", target_pose["yaw"])),
+                    }
+                )
                 segment_config = dict(base_config)
                 is_escape_waypoint = isinstance(waypoint.get("escape_from_obstacle"), dict)
                 if is_escape_waypoint:
@@ -6319,6 +7326,9 @@ class Route5FusionControlMixin:
                 self.route5_update_state(ranked_facade_candidates=ranked_candidates)
                 decision = self.route5_decide_next_facade(target_house_id, ranked_candidates, completed, blocked)
                 self.route5_log_event(output_dir, "high_level_decision", decision)
+                if self.llm_route5_stop_event.is_set():
+                    status = "stopped"
+                    break
                 if decision.get("next_action") == "done" or decision.get("stop_condition_met"):
                     break
                 facade = str(decision.get("target_facade", "") or "").strip().lower()
@@ -6424,6 +7434,9 @@ class Route5FusionControlMixin:
                                 }
                             )
                         break
+                if self.llm_route5_stop_event.is_set():
+                    status = "stopped"
+                    break
                 if nav_result.get("status") != "ok":
                     degraded_observation = self.route5_degraded_observation_candidate(
                         target_house_id=target_house_id,
@@ -6821,9 +7834,8 @@ class Route5FusionControlMixin:
                 self.route5_set_stage("DECIDE_NEXT", output_dir=output_dir, facade=facade, message=f"{facade} complete; deciding next facade")
             if self.llm_route5_stop_event.is_set():
                 status = "stopped"
-            if status == "done" and self.llm_route5_blocked_facades:
-                status = "done_with_blocked"
-            final_stage = "DONE" if status == "done" else ("DONE_WITH_BLOCKED" if status == "done_with_blocked" else "DECIDE_NEXT")
+            status = self.route5_final_status_for_task_lock(status)
+            final_stage = "DONE" if status == "done" else ("DONE_WITH_BLOCKED" if status == "done_with_blocked" else ("BLOCKED_SELECTED_HOUSE" if status == "blocked_selected_house_incomplete" else "DECIDE_NEXT"))
             self.route5_set_stage(final_stage, output_dir=output_dir, message=f"fused autosearch {status}")
             summary = self.route5_run_summary(output_dir, status=status)
             self.route5_log_event(output_dir, "summary", summary)
@@ -7407,8 +8419,22 @@ class Route5FusionControlMixin:
         reset = state.get("last_target_reset", {}) if isinstance(state.get("last_target_reset"), dict) else {}
         reset_target = str(reset.get("target_id", "") or "")
         reset_pose = reset.get("reset_target_pose", {}) if isinstance(reset.get("reset_target_pose"), dict) else {}
+        original_pose = reset.get("original_target_pose", {}) if isinstance(reset.get("original_target_pose"), dict) else {}
         reset_id = str(reset.get("reset_target_id", "") or "")
         if reset_pose and (not target_id or reset_target == target_id or (target_id and reset_id.startswith(target_id))):
+            if original_pose:
+                route_points.append(
+                    {
+                        **self.route5_json_safe(original_pose),
+                        "label": reset_target or f"{target_id}_original",
+                        "route_point_type": "original_navigation_target",
+                        "stage": str(reset.get("stage", stage) or stage),
+                        "facade": str(reset.get("facade", facade) or facade),
+                        "target_id": reset_target or target_id,
+                        "reset_target_id": reset_id,
+                        **self.route5_map_status_style("pending"),
+                    }
+                )
             route_points.append(
                 {
                     **self.route5_json_safe(reset_pose),
@@ -8058,8 +9084,8 @@ class Route5FusionControlMixin:
         for point in self.route5_active_map_route_points():
             item = dict(point if isinstance(point, dict) else {})
             route_type = str(item.get("route_point_type", "") or "")
-            if route_type in {"current_target", "navigation_waypoint", "target_reset"}:
-                if route_type == "navigation_waypoint" and not item.get("z"):
+            if route_type in {"current_target", "navigation_waypoint", "target_reset", "original_navigation_target"}:
+                if route_type in {"navigation_waypoint", "original_navigation_target"} and not item.get("z"):
                     item["z"] = self.route7_default_exploration_z_cm()
                 points.append(item)
         seen: set[Tuple[str, str, str]] = set()
@@ -8084,17 +9110,181 @@ class Route5FusionControlMixin:
     def route7_route_point_color(self, point: Dict[str, Any], selected_layer_key: str) -> Tuple[Tuple[int, int, int], bool]:
         route_type = str((point if isinstance(point, dict) else {}).get("route_point_type", "") or "")
         z_cm = float((point if isinstance(point, dict) else {}).get("z", self.route7_default_exploration_z_cm()) or self.route7_default_exploration_z_cm())
-        selected_z = float(self.route6_layer_z_from_key(selected_layer_key) if callable(getattr(self, "route6_layer_z_from_key", None)) else 0.0)
+        selected_z = float(self.route6_layer_z_from_key(selected_layer_key) if callable(getattr(self, "route6_layer_z_from_key", None)) else self.route7_map_layer_z_cm_from_key(selected_layer_key))
         strong = abs(z_cm - selected_z) <= 25.0
         palette = {
             "observation_point": ((21, 101, 192), (170, 205, 235)),
             "current_target": ((194, 24, 91), (238, 183, 207)),
             "navigation_waypoint": ((46, 125, 50), (184, 220, 186)),
+            "original_navigation_target": ((2, 132, 199), (186, 230, 253)),
             "target_reset": ((239, 108, 0), (247, 199, 150)),
             "scan_point": ((106, 27, 154), (205, 180, 219)),
         }
         strong_color, pale_color = palette.get(route_type, ((55, 65, 81), (190, 195, 205)))
         return (strong_color if strong else pale_color), strong
+
+    def route7_layer_route_color(self, layer_key: str, selected_layer_key: str) -> Tuple[Tuple[int, int, int], bool]:
+        key = str(layer_key or selected_layer_key or self.route7_default_layer_key())
+        selected = str(selected_layer_key or self.route7_default_layer_key())
+        palette = {
+            "z_250": (37, 99, 235),
+            "z_300": (22, 101, 52),
+            "z_350": (194, 65, 12),
+            "z_400": (126, 34, 206),
+            "z_450": (8, 145, 178),
+        }
+        base = palette.get(key)
+        if base is None:
+            try:
+                z_cm = self.route7_map_layer_z_cm_from_key(key)
+            except Exception:
+                z_cm = self.route7_default_exploration_z_cm()
+            hue = int(abs(z_cm) // 50) % 4
+            base = ((22, 101, 52), (37, 99, 235), (194, 65, 12), (126, 34, 206))[hue]
+        strong = key == selected
+        if strong:
+            return base, True
+            pale = tuple(int(round(float(channel) * 0.35 + 255.0 * 0.65)) for channel in base)
+        return pale, False
+
+    def route7_static_house_base(self) -> Dict[str, Any]:
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        base = state.get("route7_static_house_base", {}) if isinstance(state.get("route7_static_house_base", {}), dict) else {}
+        if base:
+            return self.route7_filter_static_house_base(base)
+        output_dir = self.route7_current_map_output_dir()
+        if output_dir is not None:
+            try:
+                path = Path(output_dir) / "map" / "route7_static_house_base.json"
+                payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+                if isinstance(payload, dict):
+                    return self.route7_filter_static_house_base(payload)
+            except Exception:
+                return {}
+        return {}
+
+    def route7_current_house_base_ids(self) -> List[str]:
+        known_records_fn = getattr(self, "route6_known_house_polygon_records", None)
+        known_records = known_records_fn() if callable(known_records_fn) else []
+        ids: List[str] = []
+        if isinstance(known_records, list):
+            for record in known_records[:5]:
+                if not isinstance(record, dict):
+                    continue
+                house_id = str(record.get("house_id", record.get("id", "")) or "").strip()
+                if house_id and house_id not in ids:
+                    ids.append(house_id)
+        return ids or ["001", "002", "003", "004", "005"]
+
+    def route7_filter_static_house_base(self, base: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(base, dict):
+            return {}
+        houses = base.get("houses", []) if isinstance(base.get("houses", []), list) else []
+        if not houses:
+            return base
+        allowed = set(self.route7_current_house_base_ids())
+        filtered = [
+            house
+            for house in houses
+            if isinstance(house, dict) and str(house.get("house_id", house.get("id", "")) or "").strip() in allowed
+        ]
+        if not filtered:
+            return base
+        if len(filtered) == len(houses):
+            return base
+        payload = dict(base)
+        payload["houses"] = self.route5_json_safe(filtered)
+        payload["house_count"] = len(filtered)
+        payload["route7_static_house_base_filter"] = "current_five_operator_house_coordinates"
+        return payload
+
+    def route7_draw_static_house_base(
+        self,
+        image: Image.Image,
+        layer_record: Dict[str, Any],
+        *,
+        selected_layer_key: str,
+        scale: int = 1,
+    ) -> Image.Image:
+        metadata = self.route6_update_map_load_layer_metadata(layer_record) if callable(getattr(self, "route6_update_map_load_layer_metadata", None)) else {}
+        if not metadata:
+            return image
+        base = self.route7_static_house_base()
+        houses = base.get("houses", []) if isinstance(base.get("houses", []), list) else []
+        if not houses:
+            return image
+        draw = ImageDraw.Draw(image)
+        factor = max(1, int(scale))
+        for house in houses:
+            if not isinstance(house, dict):
+                continue
+            bbox = house.get("bbox_world", {}) if isinstance(house.get("bbox_world", {}), dict) else {}
+            try:
+                min_x = float(bbox["min_x"])
+                max_x = float(bbox["max_x"])
+                min_y = float(bbox["min_y"])
+                max_y = float(bbox["max_y"])
+            except Exception:
+                continue
+            corners = [
+                self.route7_layer_point_to_pixel({"x": min_x, "y": min_y}, metadata, scale=factor),
+                self.route7_layer_point_to_pixel({"x": max_x, "y": min_y}, metadata, scale=factor),
+                self.route7_layer_point_to_pixel({"x": max_x, "y": max_y}, metadata, scale=factor),
+                self.route7_layer_point_to_pixel({"x": min_x, "y": max_y}, metadata, scale=factor),
+            ]
+            if any(point is None for point in corners):
+                continue
+            is_target = bool(house.get("is_target_house", False))
+            outline = (89, 155, 235) if is_target else (180, 190, 202)
+            fill = (89, 155, 235, 20) if is_target else (180, 190, 202, 12)
+            points = [(int(point[0]), int(point[1])) for point in corners if point is not None]
+            if len(points) >= 4:
+                draw.polygon(points, outline=outline, fill=fill if image.mode == "RGBA" else None)
+                draw.line(points + [points[0]], fill=outline, width=max(1, 2 * factor if is_target else factor))
+                label = str(house.get("label", house.get("house_id", "")) or "")
+                if label:
+                    cx = sum(point[0] for point in points) / len(points)
+                    cy = sum(point[1] for point in points) / len(points)
+                    draw.text((cx - 16 * factor, cy - 6 * factor), label[:10], fill=outline)
+        return image
+
+    def route7_draw_realtime_route_plan(
+        self,
+        image: Image.Image,
+        layer_record: Dict[str, Any],
+        *,
+        selected_layer_key: str,
+        scale: int = 1,
+    ) -> Image.Image:
+        metadata = self.route6_update_map_load_layer_metadata(layer_record) if callable(getattr(self, "route6_update_map_load_layer_metadata", None)) else {}
+        if not metadata:
+            return image
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        route_plan = state.get("route7_realtime_route_plan", {}) if isinstance(state.get("route7_realtime_route_plan", {}), dict) else {}
+        segments = route_plan.get("route7_route_segments", []) if isinstance(route_plan.get("route7_route_segments", []), list) else []
+        if not segments:
+            return image
+        draw = ImageDraw.Draw(image)
+        factor = max(1, int(scale))
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            from_pose = segment.get("from_pose", {}) if isinstance(segment.get("from_pose", {}), dict) else {}
+            to_pose = segment.get("to_pose", {}) if isinstance(segment.get("to_pose", {}), dict) else {}
+            start = self.route7_layer_point_to_pixel(from_pose, metadata, scale=factor)
+            end = self.route7_layer_point_to_pixel(to_pose, metadata, scale=factor)
+            if start is None or end is None:
+                continue
+            color, strong = self.route7_layer_route_color(str(segment.get("layer_key", "") or ""), selected_layer_key)
+            width = max(2, 4 * factor if strong else 2 * factor)
+            kind = str(segment.get("kind", "") or "")
+            if kind == "vertical_transition":
+                radius = max(4, 3 * factor)
+                draw.ellipse((end[0] - radius, end[1] - radius, end[0] + radius, end[1] + radius), outline=color, width=max(1, factor))
+                draw.line((start[0], start[1], end[0], end[1]), fill=color, width=max(1, factor))
+            else:
+                draw.line((start[0], start[1], end[0], end[1]), fill=color, width=width)
+        return image
 
     def route7_layer_point_to_pixel(self, point: Dict[str, Any], metadata: Dict[str, Any], *, scale: int = 1) -> Optional[Tuple[int, int]]:
         try:
@@ -8126,6 +9316,7 @@ class Route5FusionControlMixin:
         metadata = self.route6_update_map_load_layer_metadata(layer_record) if callable(getattr(self, "route6_update_map_load_layer_metadata", None)) else {}
         if not metadata:
             return image
+        image = self.route7_draw_realtime_route_plan(image, layer_record, selected_layer_key=selected_layer_key, scale=scale)
         draw = ImageDraw.Draw(image)
         factor = max(1, int(scale))
         nav_pixels: List[Tuple[int, int]] = []
@@ -8137,7 +9328,7 @@ class Route5FusionControlMixin:
             route_type = str(point.get("route_point_type", "") or "")
             radius = max(3, 4 * factor if strong else 3 * factor)
             x_px, y_px = pixel
-            if route_type == "navigation_waypoint":
+            if route_type in {"navigation_waypoint", "original_navigation_target"}:
                 nav_pixels.append(pixel)
             draw.ellipse(
                 (x_px - radius, y_px - radius, x_px + radius, y_px + radius),
@@ -8171,7 +9362,7 @@ class Route5FusionControlMixin:
             self.llm_route7_map_status_var.set("Route V7 Map: no Route 6 Update Map layered artifact yet.")
             if preview is not None:
                 try:
-                    preview.configure(text="No Route 6 Update Map layered occupancy map available.", image="")
+                    preview.configure(text="No Route 6 Update Map layered occupancy map available.")
                 except tk.TclError:
                     pass
             return {}
@@ -8206,7 +9397,7 @@ class Route5FusionControlMixin:
         preview_path = preview_path_fn(layer_record) if callable(preview_path_fn) else Path(str((layer_record or {}).get("occupancy_preview_path", "") or ""))
         if not Path(preview_path).is_file():
             try:
-                preview.configure(text=f"Route 6 Update Map preview missing: {preview_path}", image="")
+                preview.configure(text=f"Route 6 Update Map preview missing: {preview_path}")
             except tk.TclError:
                 pass
             return manifest
@@ -8221,6 +9412,7 @@ class Route5FusionControlMixin:
             scale = max(1, min(8, int((available_w - 40) / max(1, max(width, height)))))
             if scale > 1:
                 image = image.resize((width * scale, height * scale), Image.Resampling.NEAREST)
+            image = self.route7_draw_static_house_base(image, layer_record, selected_layer_key=selected, scale=scale)
             overlay_fn = getattr(self, "route6_draw_update_map_uav_overlay", None)
             if callable(overlay_fn):
                 image = overlay_fn(image, layer_record, scale=scale)
@@ -8230,7 +9422,7 @@ class Route5FusionControlMixin:
             preview.configure(image=photo, text="")
         except Exception as exc:
             try:
-                preview.configure(text=f"Route V7 Route 6 Update Map preview failed: {exc}", image="")
+                preview.configure(text=f"Route V7 Route 6 Update Map preview failed: {exc}")
             except tk.TclError:
                 pass
         return manifest
