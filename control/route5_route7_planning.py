@@ -21,6 +21,200 @@ class Route7PlanningMixin:
     def route7_default_layer_key(self) -> str:
         return f"z_{int(round(self.route7_default_exploration_z_cm())):03d}"
 
+    def route7_normalize_house_bbox(self, bbox: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(bbox, dict) or not bbox:
+            return {}
+        try:
+            min_x = float(bbox["min_x"])
+            max_x = float(bbox["max_x"])
+            min_y = float(bbox["min_y"])
+            max_y = float(bbox["max_y"])
+        except Exception:
+            points = bbox.get("points", []) if isinstance(bbox.get("points", []), list) else []
+            xs: List[float] = []
+            ys: List[float] = []
+            for point in points:
+                if not isinstance(point, dict):
+                    continue
+                try:
+                    xs.append(float(point.get("x", 0.0) or 0.0))
+                    ys.append(float(point.get("y", 0.0) or 0.0))
+                except Exception:
+                    continue
+            if not xs or not ys:
+                return {}
+            min_x, max_x, min_y, max_y = min(xs), max(xs), min(ys), max(ys)
+        low_x, high_x = sorted((float(min_x), float(max_x)))
+        low_y, high_y = sorted((float(min_y), float(max_y)))
+        normalized = dict(bbox)
+        normalized.update(
+            {
+                "min_x": low_x,
+                "max_x": high_x,
+                "min_y": low_y,
+                "max_y": high_y,
+                "center_x": float(bbox.get("center_x", 0.5 * (low_x + high_x)) or 0.5 * (low_x + high_x)),
+                "center_y": float(bbox.get("center_y", 0.5 * (low_y + high_y)) or 0.5 * (low_y + high_y)),
+            }
+        )
+        return normalized
+
+    def route7_static_house_bbox_for_id(self, house_id: str, *, output_dir: Optional[Path] = None) -> Dict[str, Any]:
+        hid = str(house_id or "").strip()
+        if not hid:
+            return {}
+        bases: List[Dict[str, Any]] = []
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        state_base = state.get("route7_static_house_base", {}) if isinstance(state.get("route7_static_house_base", {}), dict) else {}
+        if state_base:
+            bases.append(state_base)
+        if output_dir is not None:
+            try:
+                path = Path(output_dir) / "map" / "route7_static_house_base.json"
+                payload = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+                if isinstance(payload, dict) and payload:
+                    bases.append(payload)
+            except Exception:
+                pass
+        static_base_fn = getattr(self, "route7_static_house_base", None)
+        if callable(static_base_fn):
+            try:
+                payload = static_base_fn()
+                if isinstance(payload, dict) and payload:
+                    bases.append(payload)
+            except Exception:
+                pass
+        for base in bases:
+            houses = base.get("houses", []) if isinstance(base.get("houses", []), list) else []
+            for house in houses:
+                if not isinstance(house, dict):
+                    continue
+                record_id = str(house.get("house_id", house.get("id", "")) or "").strip()
+                if record_id != hid:
+                    continue
+                raw_bbox = house.get("bbox_world", {}) if isinstance(house.get("bbox_world", {}), dict) else {}
+                if not raw_bbox:
+                    raw_bbox = house.get("bbox", {}) if isinstance(house.get("bbox", {}), dict) else {}
+                bbox = self.route7_normalize_house_bbox(raw_bbox)
+                if not bbox:
+                    continue
+                bbox["route7_house_bbox_source"] = "route7_static_house_base"
+                bbox["route7_static_house_base_source"] = str(base.get("source", "") or "")
+                bbox["route7_static_house_label"] = str(house.get("label", house.get("name", "")) or "")
+                return bbox
+        return {}
+
+    def route7_house_bbox_for_id(self, house_id: str, *, output_dir: Optional[Path] = None) -> Dict[str, Any]:
+        bbox = self.route7_static_house_bbox_for_id(house_id, output_dir=output_dir)
+        if bbox:
+            return bbox
+        try:
+            fallback = self.house_world_bbox_for_id(str(house_id or "")) if callable(getattr(self, "house_world_bbox_for_id", None)) else {}
+        except Exception:
+            fallback = {}
+        bbox = self.route7_normalize_house_bbox(fallback)
+        if bbox:
+            bbox["route7_house_bbox_source"] = str(bbox.get("source", "") or "house_world_bbox_for_id")
+        return bbox
+
+    def route7_observation_facade_corridor_report(
+        self,
+        pose: Dict[str, Any],
+        bbox: Dict[str, Any],
+        facade: str,
+        *,
+        axis_margin_cm: float = 250.0,
+        side_margin_cm: float = 150.0,
+        expected_standoff_cm: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        facade_name = str(facade or "").strip().lower()
+        pose = pose if isinstance(pose, dict) else {}
+        bbox = self.route7_normalize_house_bbox(bbox)
+        if facade_name not in {"south", "east", "north", "west"} or not bbox:
+            return {
+                "same_facade_corridor": True,
+                "enforced": False,
+                "reason": "facade_bbox_unavailable",
+                "facade": facade_name,
+                "pose": self.route5_json_safe(pose),
+            }
+        try:
+            x = float(pose.get("x", 0.0) or 0.0)
+            y = float(pose.get("y", 0.0) or 0.0)
+            min_x = float(bbox["min_x"])
+            max_x = float(bbox["max_x"])
+            min_y = float(bbox["min_y"])
+            max_y = float(bbox["max_y"])
+        except Exception:
+            return {
+                "same_facade_corridor": True,
+                "enforced": False,
+                "reason": "pose_or_bbox_invalid",
+                "facade": facade_name,
+                "pose": self.route5_json_safe(pose),
+                "bbox": self.route5_json_safe(bbox),
+            }
+        axis_margin = max(0.0, float(axis_margin_cm))
+        side_margin = max(0.0, float(side_margin_cm))
+        if facade_name == "east":
+            side_ok = x >= max_x - side_margin
+            axis_ok = min_y - axis_margin <= y <= max_y + axis_margin
+            side_distance_cm = x - max_x
+            axis_value = y
+            axis_min, axis_max = min_y, max_y
+        elif facade_name == "west":
+            side_ok = x <= min_x + side_margin
+            axis_ok = min_y - axis_margin <= y <= max_y + axis_margin
+            side_distance_cm = min_x - x
+            axis_value = y
+            axis_min, axis_max = min_y, max_y
+        elif facade_name == "north":
+            side_ok = y >= max_y - side_margin
+            axis_ok = min_x - axis_margin <= x <= max_x + axis_margin
+            side_distance_cm = y - max_y
+            axis_value = x
+            axis_min, axis_max = min_x, max_x
+        else:
+            side_ok = y <= min_y + side_margin
+            axis_ok = min_x - axis_margin <= x <= max_x + axis_margin
+            side_distance_cm = min_y - y
+            axis_value = x
+            axis_min, axis_max = min_x, max_x
+        standoff_ok = True
+        max_side_distance_cm: Optional[float] = None
+        if expected_standoff_cm is not None:
+            expected = max(0.0, float(expected_standoff_cm))
+            max_side_distance_cm = expected + max(300.0, expected * 0.5)
+            standoff_ok = side_distance_cm <= max_side_distance_cm
+        same = bool(side_ok and axis_ok and standoff_ok)
+        if not axis_ok:
+            reason = "axis_outside_target_house_bounds"
+        elif not side_ok:
+            reason = "wrong_target_facade_side"
+        elif not standoff_ok:
+            reason = "outside_expected_standoff_band"
+        else:
+            reason = "ok"
+        return {
+            "same_facade_corridor": same,
+            "enforced": True,
+            "reason": reason,
+            "facade": facade_name,
+            "pose": self.route5_json_safe(pose),
+            "bbox": self.route5_json_safe(bbox),
+            "side_ok": bool(side_ok),
+            "axis_ok": bool(axis_ok),
+            "standoff_ok": bool(standoff_ok),
+            "side_distance_cm": round(float(side_distance_cm), 3),
+            "axis_value_cm": round(float(axis_value), 3),
+            "axis_min_cm": round(float(axis_min), 3),
+            "axis_max_cm": round(float(axis_max), 3),
+            "axis_margin_cm": float(axis_margin),
+            "side_margin_cm": float(side_margin),
+            "expected_standoff_cm": None if expected_standoff_cm is None else round(float(expected_standoff_cm), 3),
+            "max_side_distance_cm": None if max_side_distance_cm is None else round(float(max_side_distance_cm), 3),
+        }
+
     def route7_static_house_base_snapshot(self, target_house_id: str, *, output_dir: Optional[Path] = None) -> Dict[str, Any]:
         target_id = str(target_house_id or "").strip()
         try:
@@ -500,13 +694,13 @@ class Route7PlanningMixin:
         facade = str(facade or "").strip().lower()
         if not hid or facade not in {"south", "east", "north", "west"}:
             return []
-        try:
-            bbox = self.house_world_bbox_for_id(hid)
-        except Exception:
-            bbox = {}
+        bbox = self.route7_house_bbox_for_id(hid, output_dir=output_dir)
         if not bbox:
             return []
+        bbox_source = str(bbox.get("route7_house_bbox_source", bbox.get("source", "house_world_bbox_for_id")) or "house_world_bbox_for_id")
         formula = self.route7_lidar_edge_observation_formula(bbox, facade)
+        formula["bbox_source"] = bbox_source
+        formula["bbox_world"] = self.route5_json_safe(bbox)
         z_cm = float(formula.get("z_cm", self.route7_default_exploration_z_cm()) or self.route7_default_exploration_z_cm())
         standoff = float(formula.get("observation_standoff_cm", 300.0) or 300.0)
         attempts: List[Dict[str, Any]] = []
@@ -533,15 +727,27 @@ class Route7PlanningMixin:
                 "route7_effective_lidar_radius_cm": formula.get("effective_lidar_radius_cm"),
                 "route7_edge_length_cm": formula.get("edge_length_cm"),
                 "route7_edge_point_count": formula.get("point_count"),
+                "route7_house_bbox_source": bbox_source,
+                "route7_house_bbox": self.route5_json_safe(bbox),
                 "status": "planned",
             }
-            attempts.append(
-                self.route7_adjust_observation_point_to_free_cell(
-                    attempt,
-                    output_dir=output_dir,
-                    inflation_cells=inflation_cells,
-                )
+            adjusted = self.route7_adjust_observation_point_to_free_cell(
+                attempt,
+                output_dir=output_dir,
+                inflation_cells=inflation_cells,
             )
+            corridor = self.route7_observation_facade_corridor_report(
+                adjusted,
+                bbox,
+                facade,
+                expected_standoff_cm=standoff,
+            )
+            adjusted["route7_observation_facade_corridor"] = self.route5_json_safe(corridor)
+            if not bool(corridor.get("same_facade_corridor", True)):
+                adjusted["status"] = "blocked"
+                adjusted["route7_observation_map_status"] = "outside_target_facade_corridor"
+                adjusted["route7_observation_replan_reason"] = "route7_observation_point_outside_target_facade_corridor"
+            attempts.append(adjusted)
         return attempts
 
     def route7_edge_observation_candidates_for_house(
@@ -572,7 +778,33 @@ class Route7PlanningMixin:
                     }
                 )
                 continue
-            selected = dict(attempts[0])
+            valid_attempts = [
+                dict(item)
+                for item in attempts
+                if isinstance(item, dict)
+                and str(item.get("status", "") or "").strip().lower() != "blocked"
+                and bool(
+                    (
+                        item.get("route7_observation_facade_corridor", {})
+                        if isinstance(item.get("route7_observation_facade_corridor", {}), dict)
+                        else {}
+                    ).get("same_facade_corridor", True)
+                )
+            ]
+            if not valid_attempts:
+                candidates.append(
+                    {
+                        "target_house_id": str(target_house_id or ""),
+                        "facade": facade,
+                        "status": "blocked",
+                        "reason": "route7_no_valid_lidar_edge_observation_attempts",
+                        "route7_edge_observation_attempts": self.route5_json_safe(attempts),
+                        "observation_attempts": self.route5_json_safe(attempts),
+                        "observation_attempt_count": len(attempts),
+                    }
+                )
+                continue
+            selected = dict(valid_attempts[0])
             candidate = {
                 **selected,
                 "target_house_id": str(target_house_id or ""),

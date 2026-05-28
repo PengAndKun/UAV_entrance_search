@@ -924,6 +924,7 @@ class RunDroneFlightPanel(
             tk.Button(scan, text="Open LLM Route Window 6", command=self.open_llm_route_window6).pack(side="left", padx=6, pady=4)
             tk.Button(scan, text="Open LLM Route Window 7", command=self.open_llm_route_window7).pack(side="left", padx=6, pady=4)
             tk.Button(scan, text="Route 6 Update Map", command=self.open_route6_update_map_window).pack(side="left", padx=6, pady=4)
+            tk.Button(scan, text="Route 6 Test Planner", command=self.open_route6_test_planner_window).pack(side="left", padx=6, pady=4)
 
         actions = tk.Frame(route)
         actions.grid(row=4, column=0, columnspan=6, sticky="ew", padx=0, pady=(0, 4))

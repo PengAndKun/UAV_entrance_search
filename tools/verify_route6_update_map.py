@@ -248,7 +248,7 @@ def test_route6_voxel_downsample_reduces_duplicate_points_before_layering() -> N
     builder = load_builder()
     duplicate_a = np.repeat(np.asarray([[0.01, 0.01, 0.50, 10.0, 20.0, 30.0]], dtype=np.float32), 100, axis=0)
     duplicate_b = np.repeat(np.asarray([[0.30, 0.30, 0.50, 40.0, 50.0, 60.0]], dtype=np.float32), 50, axis=0)
-    out_of_bounds = np.asarray([[55.0, 0.0, 0.50, 0.0, 0.0, 0.0]], dtype=np.float32)
+    out_of_bounds = np.asarray([[65.0, 0.0, 0.50, 0.0, 0.0, 0.0]], dtype=np.float32)
     cloud = np.vstack([duplicate_a, duplicate_b, out_of_bounds])
     reduced = builder.voxel_downsample_point_cloud(
         cloud,
@@ -357,7 +357,7 @@ def test_route6_layered_map_uses_fixed_bounds_and_black_obstacle_preview() -> No
         [
             [0.0, 0.0, 0.50, 0.0, 0.0, 0.0],
             [49.9, 49.9, 0.50, 0.0, 0.0, 0.0],
-            [55.0, 0.0, 0.50, 0.0, 0.0, 0.0],
+            [65.0, 0.0, 0.50, 0.0, 0.0, 0.0],
         ],
         dtype=np.float32,
     )
@@ -370,9 +370,9 @@ def test_route6_layered_map_uses_fixed_bounds_and_black_obstacle_preview() -> No
     )
     occupancy = layered["layers"][0]["occupancy"]
     grid = np.asarray(occupancy["grid"])
-    assert_true(occupancy["fixed_world_bounds_cm"] == {"min_x": -5000, "max_x": 5000, "min_y": -5000, "max_y": 5000}, f"fixed cm bounds should be recorded: {occupancy}")
-    assert_true(occupancy["origin_standard_m"] == [-50.0, -50.0], f"origin should map -5000cm to -50m: {occupancy}")
-    assert_true(occupancy["width"] == 400 and occupancy["height"] == 400, f"100m at 0.25m should produce 400x400 grid: {occupancy}")
+    assert_true(occupancy["fixed_world_bounds_cm"] == {"min_x": -6000, "max_x": 6000, "min_y": -6000, "max_y": 6000}, f"fixed cm bounds should be recorded: {occupancy}")
+    assert_true(occupancy["origin_standard_m"] == [-60.0, -60.0], f"origin should map -6000cm to -60m: {occupancy}")
+    assert_true(occupancy["width"] == 480 and occupancy["height"] == 480, f"120m at 0.25m should produce 480x480 grid: {occupancy}")
     assert_true(occupancy["in_bounds_point_count"] == 2, f"out-of-bounds points should be ignored for fixed map: {occupancy}")
     assert_true(occupancy["out_of_bounds_point_count"] == 1, f"out-of-bounds count should be visible: {occupancy}")
     assert_true(int(np.sum(grid >= 100)) == 2, f"two small occupied cells should be marked: {occupancy}")

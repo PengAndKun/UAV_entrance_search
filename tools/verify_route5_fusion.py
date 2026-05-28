@@ -320,6 +320,21 @@ def main() -> None:
     assert plan_path == PROJECT_ROOT / "obstacle_avoidance_3_data" / "plans" / "obstacle_avoidance_3_plans.json"
     assert (PROJECT_ROOT / "obstacle_representation_2_data" / ".gitignore").read_text(encoding="utf-8") == "*\n!.gitignore\n"
     route5_source = (PROJECT_DIR / "control" / "route5_fusion_control.py").read_text(encoding="utf-8")
+    house_memory_path = PROJECT_DIR / "control" / "route5_house_memory.py"
+    capture_guard_path = PROJECT_DIR / "control" / "route5_capture_guard.py"
+    avoidance_decision_path = PROJECT_DIR / "control" / "route5_avoidance_decision.py"
+    house_memory_source = house_memory_path.read_text(encoding="utf-8") if house_memory_path.is_file() else ""
+    capture_guard_source = capture_guard_path.read_text(encoding="utf-8") if capture_guard_path.is_file() else ""
+    avoidance_decision_source = avoidance_decision_path.read_text(encoding="utf-8") if avoidance_decision_path.is_file() else ""
+    assert house_memory_path.is_file(), "Route5 house memory code should be split out of route5_fusion_control.py"
+    assert capture_guard_path.is_file(), "Route5 capture guard/completion code should be split out of route5_fusion_control.py"
+    assert avoidance_decision_path.is_file(), "Route5 local obstacle and OR decision code should be split out of route5_fusion_control.py"
+    assert "class Route5HouseMemoryMixin" in house_memory_source
+    assert "class Route5CaptureGuardMixin" in capture_guard_source
+    assert "class Route5AvoidanceDecisionMixin" in avoidance_decision_source
+    assert "Route5HouseMemoryMixin" in route5_source
+    assert "Route5CaptureGuardMixin" in route5_source
+    assert "Route5AvoidanceDecisionMixin" in route5_source
     assert "Global Pause All" in route5_source
     assert "Release Movement" in route5_source
     assert "Analyze V5 Captures" in route5_source
@@ -1093,6 +1108,67 @@ def main() -> None:
         assert harness.llm_call_payloads and "timeout_s" not in harness.llm_call_payloads[-1], harness.llm_call_payloads[-1]
         assert "system_prompt" in harness.llm_call_payloads[-1] and "user_prompt" in harness.llm_call_payloads[-1], harness.llm_call_payloads[-1]
         harness.fake_llm_api_key = ""
+
+        route7_obs_tracker = harness.route5_new_target_reset_tracker(
+            "003_south_obs_attempt_1",
+            {"x": -1076.6, "y": 411.55, "z": 300.0, "yaw": 90.0},
+        )
+        route7_obs_tracker["z_deviation_tick_count"] = 3
+        obs_repair = harness.route5_plan_deviation_repair_decision(
+            output_dir,
+            target_house_id="003",
+            stage="NAV_TO_OBS",
+            facade="south",
+            target_id="003_south_obs_attempt_1",
+            current_pose={"x": 0.0, "y": 0.0, "z": 471.862, "yaw": 51.787},
+            target_pose={"x": -1076.6, "y": 411.55, "z": 300.0, "yaw": 90.0},
+            tracker=route7_obs_tracker,
+            error={"reached": False, "dist_xy_cm": 1152.58},
+            event={"distance_to_goal_cm": 1165.333, "route_cross_track_cm": 60.704},
+            repair_index=1,
+        )
+        assert obs_repair["status"] == "ok", obs_repair
+        assert obs_repair["repair_target_pose"]["x"] == -1076.6, obs_repair
+        assert obs_repair["repair_target_pose"]["y"] == 411.55, obs_repair
+        assert obs_repair["repair_target_pose"]["z"] == 300.0, obs_repair
+
+        low_z_tracker = harness.route5_new_target_reset_tracker(
+            "003_south_obs_attempt_1_layer_transition",
+            {"x": 0.0, "y": 0.0, "z": 300.0, "yaw": 0.234},
+        )
+        low_z_tracker["z_deviation_tick_count"] = 3
+        low_z_repair = harness.route5_plan_deviation_repair_decision(
+            output_dir,
+            target_house_id="003",
+            stage="NAV_TO_OBS",
+            facade="south",
+            target_id="003_south_obs_attempt_1_layer_transition",
+            current_pose={"x": 0.0, "y": 0.0, "z": 127.567, "yaw": 0.234},
+            target_pose={"x": 0.0, "y": 0.0, "z": 300.0, "yaw": 0.234},
+            tracker=low_z_tracker,
+            error={"reached": False, "dist_xy_cm": 0.0},
+            event={"distance_to_goal_cm": 172.433, "route_cross_track_cm": 0.0},
+            repair_index=1,
+        )
+        assert low_z_repair["status"] == "ok", low_z_repair
+        assert low_z_repair["repair_target_pose"]["z"] == 300.0, low_z_repair
+
+        guard_output = output_dir / "capture_guard_nameerror_verify"
+        guard_record = {
+            "stage": "NAV_TO_OBS",
+            "facade": "south",
+            "target_id": "003_south_obs_attempt_1",
+            "reason": "facade_corridor_mismatch",
+            "runtime_target_pose": {"x": 0.0, "y": 0.0, "z": 420.0, "yaw": 90.0},
+            "original_target_pose": {"x": -1076.6, "y": 411.55, "z": 300.0, "yaw": 90.0},
+            "capture_pose": {"x": 0.0, "y": 0.0, "z": 399.626, "yaw": 80.897},
+        }
+        guard_decision = harness.route5_write_capture_guard_blocked_decision(
+            guard_output,
+            guard_record,
+            current_pose={"x": 0.0, "y": 0.0, "z": 399.626, "yaw": 80.897},
+        )
+        assert guard_decision["selected_action_payload"]["action_name"] == "hold", guard_decision
 
         far_blocked_nav = {
             "status": "blocked",

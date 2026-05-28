@@ -136,16 +136,116 @@ class Route7MapWindowMixin:
         pale = tuple(int(round(float(channel) * 0.35 + 255.0 * 0.65)) for channel in base)
         return pale, False
 
+    def route7_current_route_visualization_context(self) -> Dict[str, str]:
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        current = state.get("route7_realtime_route_plan", {}) if isinstance(state.get("route7_realtime_route_plan", {}), dict) else {}
+        active = state.get("current_exploration_status", {}) if isinstance(state.get("current_exploration_status"), dict) else {}
+        return {
+            "stage": str(current.get("stage") or active.get("stage") or state.get("stage") or "").strip(),
+            "target_id": str(current.get("target_id") or active.get("target_id") or state.get("target_id") or "").strip(),
+            "target_house_id": str(current.get("target_house_id") or state.get("target_house_id") or active.get("target_house_id") or "").strip(),
+        }
+
+    def route7_route_plan_context_mismatches(self, plan: Dict[str, Any], context: Dict[str, str]) -> List[str]:
+        if not isinstance(plan, dict):
+            return ["plan:not_dict"]
+        mismatches: List[str] = []
+        for key in ("target_id", "target_house_id"):
+            expected = str((context or {}).get(key, "") or "").strip()
+            if not expected:
+                continue
+            actual = str(plan.get(key, "") or "").strip()
+            if not actual:
+                mismatches.append(f"{key}:missing")
+            elif actual != expected:
+                mismatches.append(f"{key}:{actual}!={expected}")
+        expected_stage = str((context or {}).get("stage", "") or "").strip()
+        actual_stage = str(plan.get("stage", "") or "").strip()
+        if expected_stage and actual_stage and actual_stage != expected_stage:
+            mismatches.append(f"stage:{actual_stage}!={expected_stage}")
+        return mismatches
+
+    def route7_set_route_visualization_status(
+        self,
+        status: str,
+        *,
+        context: Optional[Dict[str, str]] = None,
+        current: Optional[Dict[str, Any]] = None,
+        fallback: Optional[Dict[str, Any]] = None,
+        mismatches: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "status": str(status or ""),
+            "context": dict(context or {}),
+            "mismatches": list(mismatches or []),
+        }
+        if isinstance(current, dict):
+            payload["current_status"] = str(current.get("status", "") or "")
+            payload["current_reason"] = str(current.get("reason", "") or "")
+            payload["current_target_id"] = str(current.get("target_id", "") or "")
+            payload["current_segment_count"] = len(current.get("route7_route_segments", []) if isinstance(current.get("route7_route_segments", []), list) else [])
+        if isinstance(fallback, dict):
+            payload["fallback_status"] = str(fallback.get("status", "") or "")
+            payload["fallback_reason"] = str(fallback.get("reason", "") or "")
+            payload["fallback_target_id"] = str(fallback.get("target_id", "") or "")
+            payload["fallback_segment_count"] = len(fallback.get("route7_route_segments", []) if isinstance(fallback.get("route7_route_segments", []), list) else [])
+        try:
+            if isinstance(getattr(self, "llm_route5_state", None), dict):
+                self.llm_route5_state["route7_route_visualization_status"] = payload
+        except Exception:
+            pass
+        return payload
+
+    def route7_route_visualization_status_suffix(self) -> str:
+        state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        payload = state.get("route7_route_visualization_status", {}) if isinstance(state.get("route7_route_visualization_status", {}), dict) else {}
+        status = str(payload.get("status", "") or "")
+        if not status:
+            return ""
+        if status == "current_route_segments_ok":
+            return " route=current"
+        if status == "using_matching_last_drawable_route_plan":
+            return " route=fallback"
+        if status == "last_drawable_target_mismatch":
+            return " route=hidden target_mismatch"
+        if status == "current_empty_no_matching_fallback":
+            current_status = str(payload.get("current_status", "") or "")
+            current_reason = str(payload.get("current_reason", "") or "")
+            if current_status or current_reason:
+                detail = ":".join(part for part in (current_status, current_reason) if part)
+                return f" route=hidden {detail[:48]}"
+            return " route=hidden no_plan"
+        return f" route={status[:48]}"
+
     def route7_drawable_realtime_route_plan(self) -> Dict[str, Any]:
         state = self.llm_route5_state if isinstance(getattr(self, "llm_route5_state", None), dict) else {}
+        context = self.route7_current_route_visualization_context()
         current = state.get("route7_realtime_route_plan", {}) if isinstance(state.get("route7_realtime_route_plan", {}), dict) else {}
         current_segments = current.get("route7_route_segments", []) if isinstance(current.get("route7_route_segments", []), list) else []
         if current_segments:
+            self.route7_set_route_visualization_status("current_route_segments_ok", context=context, current=current)
             return current
         fallback = state.get("route7_last_drawable_route_plan", {}) if isinstance(state.get("route7_last_drawable_route_plan", {}), dict) else {}
         fallback_segments = fallback.get("route7_route_segments", []) if isinstance(fallback.get("route7_route_segments", []), list) else []
         if fallback_segments:
+            mismatches = self.route7_route_plan_context_mismatches(fallback, context)
+            if mismatches:
+                self.route7_set_route_visualization_status(
+                    "last_drawable_target_mismatch",
+                    context=context,
+                    current=current,
+                    fallback=fallback,
+                    mismatches=mismatches,
+                )
+                return current
+            self.route7_set_route_visualization_status(
+                "using_matching_last_drawable_route_plan",
+                context=context,
+                current=current,
+                fallback=fallback,
+            )
             return fallback
+        self.route7_set_route_visualization_status("current_empty_no_matching_fallback", context=context, current=current)
         return current
 
     def route7_static_house_base(self) -> Dict[str, Any]:
@@ -319,7 +419,6 @@ class Route7MapWindowMixin:
         image = self.route7_draw_realtime_route_plan(image, layer_record, selected_layer_key=selected_layer_key, scale=scale)
         draw = ImageDraw.Draw(image)
         factor = max(1, int(scale))
-        nav_pixels: List[Tuple[int, int]] = []
         for point in self.route7_layered_route_points():
             pixel = self.route7_layer_point_to_pixel(point, metadata, scale=factor)
             if pixel is None:
@@ -328,8 +427,6 @@ class Route7MapWindowMixin:
             route_type = str(point.get("route_point_type", "") or "")
             radius = max(3, 4 * factor if strong else 3 * factor)
             x_px, y_px = pixel
-            if route_type in {"navigation_waypoint", "original_navigation_target"}:
-                nav_pixels.append(pixel)
             draw.ellipse(
                 (x_px - radius, y_px - radius, x_px + radius, y_px + radius),
                 fill=color,
@@ -339,9 +436,6 @@ class Route7MapWindowMixin:
             label = str(point.get("label", point.get("target_id", point.get("scan_id", ""))) or "")
             if label and strong:
                 draw.text((x_px + radius + 2, y_px - radius), label[:18], fill=color)
-        if len(nav_pixels) >= 2:
-            for start, end in zip(nav_pixels, nav_pixels[1:]):
-                draw.line((start[0], start[1], end[0], end[1]), fill=(46, 125, 50), width=max(1, 2 * factor))
         return image
 
     def route7_observation_formula_text(self, target_house_id: str = "", facade: str = "") -> str:
@@ -350,7 +444,10 @@ class Route7MapWindowMixin:
         bbox: Dict[str, Any] = {}
         if hid:
             try:
-                bbox = self.house_world_bbox_for_id(hid)
+                if callable(getattr(self, "route7_house_bbox_for_id", None)):
+                    bbox = self.route7_house_bbox_for_id(hid, output_dir=self.route7_current_map_output_dir())
+                if not bbox:
+                    bbox = self.house_world_bbox_for_id(hid)
             except Exception:
                 bbox = {}
         formula: Dict[str, Any] = {}
@@ -662,9 +759,8 @@ class Route7MapWindowMixin:
         )
         point_count = int((layer_record or {}).get("point_count", 0) or 0)
         occupied_count = int((layer_record or {}).get("occupied_cell_count", 0) or 0)
-        self.llm_route7_map_status_var.set(
-            f"Route V7 Map: Route 6 Update Map {selected or 'n/a'} points={point_count} occupied={occupied_count}"
-        )
+        status_prefix = f"Route V7 Map: Route 6 Update Map {selected or 'n/a'} points={point_count} occupied={occupied_count}"
+        self.llm_route7_map_status_var.set(status_prefix + self.route7_route_visualization_status_suffix())
         if preview is None:
             return manifest
         preview_path_fn = getattr(self, "route6_update_map_layer_preview_path", None)
@@ -691,6 +787,7 @@ class Route7MapWindowMixin:
             if callable(overlay_fn):
                 image = overlay_fn(image, layer_record, scale=scale)
             image = self.route7_draw_layered_route_points(image, layer_record, selected_layer_key=selected, scale=scale)
+            self.llm_route7_map_status_var.set(status_prefix + self.route7_route_visualization_status_suffix())
             photo = ImageTk.PhotoImage(image)
             self.llm_route7_update_map_preview_photo = photo
             preview.configure(image=photo, text="")

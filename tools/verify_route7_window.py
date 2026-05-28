@@ -407,6 +407,64 @@ class Route7EdgeObservationHarness(Route7MapRouteHarness):
         return {"min_x": 0.0, "max_x": 1000.0, "min_y": 0.0, "max_y": 800.0, "center_x": 500.0, "center_y": 400.0}
 
 
+class Route7StaticBboxObservationHarness(Route7EdgeObservationHarness):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.llm_route5_state.update(
+            {
+                "target_house_id": "004",
+                "route7_static_house_base": {
+                    "schema": "route7_static_house_base_v1",
+                    "target_house_id": "004",
+                    "houses": [
+                        {
+                            "house_id": "004",
+                            "label": "house_4",
+                            "bbox_world": {
+                                "min_x": -3600.0,
+                                "max_x": -1100.0,
+                                "min_y": -2400.0,
+                                "max_y": -1550.0,
+                                "center_x": -2350.0,
+                                "center_y": -1975.0,
+                                "source": "route6_operator_known_coordinates",
+                            },
+                            "is_target_house": True,
+                        },
+                        {
+                            "house_id": "005",
+                            "label": "house_5",
+                            "bbox_world": {
+                                "min_x": -300.0,
+                                "max_x": 1700.0,
+                                "min_y": -2350.0,
+                                "max_y": -1400.0,
+                                "center_x": 700.0,
+                                "center_y": -1875.0,
+                                "source": "route6_operator_known_coordinates",
+                            },
+                            "is_target_house": False,
+                        },
+                    ],
+                    "house_count": 2,
+                },
+            }
+        )
+
+    def house_world_bbox_for_id(self, house_id: str) -> Dict[str, float]:
+        if str(house_id or "").strip() == "004":
+            return {
+                "min_x": -434.951,
+                "max_x": 1717.682,
+                "min_y": -2200.0,
+                "max_y": -1307.11,
+                "center_x": 641.3655,
+                "center_y": -1753.555,
+                "source": "stale_map_bbox_image_affine",
+            }
+        return super().house_world_bbox_for_id(house_id)
+
+
 def test_route2_observation_z_override_for_route7() -> None:
     baseline = Route2ZHarness(current_z_cm=450.0)
     baseline_candidates = baseline.route2_safe_observation_candidates("001", skip_completed=False)
@@ -544,6 +602,17 @@ def test_route7_edge_observation_replans_points_inside_obstacles(tmp_dir: Path) 
     layer_record, layer_key, _layer_z, _manifest = harness.route7_selected_map_layer_record(harness.output_dir)
     block_report = harness.route7_layer_pose_block_report(layer_record, first, layer_key=layer_key, inflation_cells=1)
     assert_true(block_report.get("blocked") is False, f"Redesigned observation point should be free on the selected layer: {block_report}")
+
+
+def test_route7_edge_observation_prefers_static_house_base_bbox(tmp_dir: Path) -> None:
+    harness = Route7StaticBboxObservationHarness(tmp_dir)
+    attempts = harness.route7_edge_observation_attempts_for_facade("004", "north", output_dir=harness.output_dir)
+    assert_true(attempts, "Route7 should generate H004 north observation attempts")
+    first = attempts[0]
+    formula = first.get("route7_observation_formula", {})
+    assert_true(formula.get("axis_min") == -3600.0 and formula.get("axis_max") == -1100.0, formula)
+    assert_true(-3600.0 <= float(first.get("x", 0.0)) <= -1100.0, f"H004 observation x should stay on H004 bbox, not H005: {first}")
+    assert_true(str(first.get("route7_house_bbox_source", "")) == "route7_static_house_base", first)
 
 
 def test_route7_observation_navigation_uses_spatial_astar(tmp_dir: Path) -> None:
@@ -1137,6 +1206,136 @@ def test_route7_draw_realtime_route_plan_uses_last_drawable_when_current_empty(t
     assert_true(nonwhite > 0, "Route7 should keep drawing the last valid path when current realtime plan is transiently empty")
 
 
+def test_route7_draw_realtime_route_plan_rejects_stale_target_fallback(tmp_dir: Path) -> None:
+    harness = Route7MapRouteHarness(tmp_dir)
+    layer_record, layer_key, _layer_z, _manifest = harness.route7_selected_map_layer_record(harness.output_dir)
+    stale_plan = {
+        "schema": "route7_realtime_route_plan_v1",
+        "status": "ok",
+        "stage": "NAV_TO_SCAN_POINT",
+        "target_id": "002_south_old",
+        "target_house_id": "002",
+        "route7_route_segments": [
+            {
+                "kind": "horizontal_route",
+                "layer_key": layer_key,
+                "from_pose": {"x": 50.0, "y": -50.0, "z": 300.0},
+                "to_pose": {"x": 450.0, "y": -450.0, "z": 300.0},
+            }
+        ],
+    }
+    harness.llm_route5_state["current_exploration_status"] = {
+        "stage": "NAV_TO_SCAN_POINT",
+        "target_id": "002_south_new",
+        "facade": "south",
+    }
+    harness.llm_route5_state["route7_realtime_route_plan"] = {
+        "status": "blocked",
+        "stage": "NAV_TO_SCAN_POINT",
+        "target_id": "002_south_new",
+        "target_house_id": "002",
+        "route7_route_segments": [],
+    }
+    harness.llm_route5_state["route7_last_drawable_route_plan"] = stale_plan
+    image = Image.new("RGB", (21 * 8, 21 * 8), "white")
+    drawn = harness.route7_draw_realtime_route_plan(image, layer_record, selected_layer_key=layer_key, scale=8)
+    pixels = np.asarray(drawn)
+    nonwhite = int(np.sum(np.any(pixels != 255, axis=2)))
+    status = harness.llm_route5_state.get("route7_route_visualization_status", {})
+    assert_true(nonwhite == 0, "Route7 should not draw the previous target's route at the start of a new target")
+    assert_true(
+        status.get("status") == "last_drawable_target_mismatch",
+        f"Route7 should explain that the fallback route was hidden because its target is stale: {status}",
+    )
+
+
+def test_route7_draw_realtime_route_plan_keeps_matching_target_fallback(tmp_dir: Path) -> None:
+    harness = Route7MapRouteHarness(tmp_dir)
+    layer_record, layer_key, _layer_z, _manifest = harness.route7_selected_map_layer_record(harness.output_dir)
+    fallback_plan = {
+        "schema": "route7_realtime_route_plan_v1",
+        "status": "ok",
+        "stage": "NAV_TO_SCAN_POINT",
+        "target_id": "002_south_same",
+        "target_house_id": "002",
+        "route7_route_segments": [
+            {
+                "kind": "horizontal_route",
+                "layer_key": layer_key,
+                "from_pose": {"x": 50.0, "y": -50.0, "z": 300.0},
+                "to_pose": {"x": 450.0, "y": -450.0, "z": 300.0},
+            }
+        ],
+    }
+    harness.llm_route5_state["current_exploration_status"] = {
+        "stage": "NAV_TO_SCAN_POINT",
+        "target_id": "002_south_same",
+        "facade": "south",
+    }
+    harness.llm_route5_state["route7_realtime_route_plan"] = {
+        "status": "blocked",
+        "stage": "NAV_TO_SCAN_POINT",
+        "target_id": "002_south_same",
+        "target_house_id": "002",
+        "route7_route_segments": [],
+    }
+    harness.llm_route5_state["route7_last_drawable_route_plan"] = fallback_plan
+    image = Image.new("RGB", (21 * 8, 21 * 8), "white")
+    drawn = harness.route7_draw_realtime_route_plan(image, layer_record, selected_layer_key=layer_key, scale=8)
+    pixels = np.asarray(drawn)
+    nonwhite = int(np.sum(np.any(pixels != 255, axis=2)))
+    status = harness.llm_route5_state.get("route7_route_visualization_status", {})
+    assert_true(nonwhite > 0, "Route7 should keep a matching last path during transient empty replans")
+    assert_true(
+        status.get("status") == "using_matching_last_drawable_route_plan",
+        f"Route7 should label matching fallback drawing clearly: {status}",
+    )
+
+
+def test_route7_layered_route_points_do_not_draw_false_connector_lines(tmp_dir: Path) -> None:
+    harness = Route7MapRouteHarness(tmp_dir)
+    layer_record, layer_key, _layer_z, _manifest = harness.route7_selected_map_layer_record(harness.output_dir)
+    harness.llm_route5_state.update(
+        {
+            "target_house_id": "002",
+            "current_exploration_status": {
+                "stage": "NAV_TO_OBS",
+                "target_id": "002_south_obs_attempt_2_reset_1",
+                "facade": "south",
+                "target_pose": {"x": 450.0, "y": -450.0, "z": 300.0},
+            },
+            "current_navigation_plan": {
+                "stage": "NAV_TO_OBS",
+                "target_id": "002_south_obs_attempt_2_reset_1",
+                "plan": {
+                    "waypoints": [
+                        {"x": 450.0, "y": -450.0, "z": 300.0, "route_point_type": "navigation_waypoint"},
+                    ]
+                },
+            },
+            "last_target_reset": {
+                "stage": "NAV_TO_OBS",
+                "target_id": "002_south_obs_attempt_2_reset_1",
+                "reset_target_id": "002_south_obs_attempt_2_reset_1",
+                "original_target_pose": {"x": 50.0, "y": -50.0, "z": 300.0},
+                "reset_target_pose": {"x": 450.0, "y": -450.0, "z": 300.0},
+            },
+            "route7_realtime_route_plan": {"status": "blocked", "route7_route_segments": []},
+        }
+    )
+    image = Image.new("RGB", (21 * 8, 21 * 8), "white")
+    drawn = harness.route7_draw_layered_route_points(image, layer_record, selected_layer_key=layer_key, scale=8)
+    metadata = harness.route6_update_map_load_layer_metadata(layer_record)
+    midpoint = harness.route7_layer_point_to_pixel({"x": 250.0, "y": -250.0}, metadata, scale=8)
+    assert_true(midpoint is not None, "test midpoint should be inside the synthetic map")
+    pixels = np.asarray(drawn)
+    midpoint_rgb = pixels[int(midpoint[1]), int(midpoint[0])].tolist()
+    assert_true(
+        midpoint_rgb == [255, 255, 255],
+        f"Route7 should not draw a fake connector line between reset/original/navigation markers: {midpoint_rgb}",
+    )
+
+
 def test_route7_spatial_astar_visualization_is_written(tmp_dir: Path) -> None:
     harness = Route7EdgeObservationHarness(tmp_dir)
     start = {"x": 50.0, "y": -50.0, "z": 300.0, "yaw": 0.0}
@@ -1211,11 +1410,13 @@ def test_route7_frame_decision_log_and_trajectory_visualization(tmp_dir: Path) -
 def test_window7_source_contract() -> None:
     panel_source = (PROJECT_ROOT / "control" / "panel.py").read_text(encoding="utf-8")
     route5_source = (PROJECT_ROOT / "control" / "route5_fusion_control.py").read_text(encoding="utf-8")
+    avoidance_decision_path = PROJECT_ROOT / "control" / "route5_avoidance_decision.py"
+    avoidance_decision_source = avoidance_decision_path.read_text(encoding="utf-8") if avoidance_decision_path.is_file() else ""
     route7_planning_path = PROJECT_ROOT / "control" / "route5_route7_planning.py"
     route7_planning_source = route7_planning_path.read_text(encoding="utf-8") if route7_planning_path.is_file() else ""
     route7_map_window_path = PROJECT_ROOT / "control" / "route5_route7_map_window.py"
     route7_map_window_source = route7_map_window_path.read_text(encoding="utf-8") if route7_map_window_path.is_file() else ""
-    route7_combined_source = route5_source + "\n" + route7_planning_source + "\n" + route7_map_window_source
+    route7_combined_source = route5_source + "\n" + route7_planning_source + "\n" + route7_map_window_source + "\n" + avoidance_decision_source
     or3_demo_source = (PROJECT_ROOT / "obstacle_representation_3" / "demo.py").read_text(encoding="utf-8")
 
     assert_true("Open LLM Route Window 7" in panel_source, "main panel should expose Open LLM Route Window 7")
@@ -1329,6 +1530,8 @@ def test_window7_source_contract() -> None:
     assert_true("llm_route7_task_switch_text" in route7_combined_source, "Window 7 should maintain a task-switch visualization widget")
     assert_true("route7_subtask_switch_records" in route7_combined_source, "Window 7 should expose active-facade subtask visualization records")
     assert_true("route7_last_drawable_route_plan" in route7_combined_source, "Window 7 should preserve the last drawable path across transient empty route plans")
+    assert_true("route7_route_visualization_status" in route7_combined_source, "Window 7 should explain why the realtime route is drawn or hidden")
+    assert_true("route7_current_route_visualization_context" in route7_combined_source, "Window 7 should bind fallback route drawing to the active target context")
 
     stop_source = route7_map_window_source or route7_combined_source
     stop_block = stop_source[stop_source.find("def on_route7_stop"):]
@@ -1355,6 +1558,8 @@ def main() -> None:
         test_route7_edge_observation_minimal_points_use_lidar_formula(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_edge_observation_blocked_verify_") as raw:
         test_route7_edge_observation_replans_points_inside_obstacles(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_static_bbox_obs_verify_") as raw:
+        test_route7_edge_observation_prefers_static_house_base_bbox(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_spatial_astar_verify_") as raw:
         test_route7_observation_navigation_uses_spatial_astar(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_edge_rank_verify_") as raw:
@@ -1401,6 +1606,12 @@ def main() -> None:
         test_route7_map_refresh_keeps_last_preview_on_missing_frame(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_route_line_fallback_verify_") as raw:
         test_route7_draw_realtime_route_plan_uses_last_drawable_when_current_empty(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_route_stale_fallback_verify_") as raw:
+        test_route7_draw_realtime_route_plan_rejects_stale_target_fallback(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_route_matching_fallback_verify_") as raw:
+        test_route7_draw_realtime_route_plan_keeps_matching_target_fallback(Path(raw))
+    with tempfile.TemporaryDirectory(prefix="route7_false_connector_verify_") as raw:
+        test_route7_layered_route_points_do_not_draw_false_connector_lines(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_spatial_visual_verify_") as raw:
         test_route7_spatial_astar_visualization_is_written(Path(raw))
     with tempfile.TemporaryDirectory(prefix="route7_frame_log_verify_") as raw:
