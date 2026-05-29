@@ -54,18 +54,18 @@ def reset_summary(main_reset: Dict[str, Any], scan_resets: List[Dict[str, Any]])
             scan_index = int(point.get("scan_index", 0) or 0)
         except Exception:
             scan_index = 0
-        if status == "failed":
+        if status in {"failed", "micro_adjust_failed"}:
             failed_scan_indices.append(scan_index)
-        elif status == "ok":
+        elif status in {"ok", "micro_adjust_ok"}:
             changed_scan_indices.append(scan_index)
         elif status == "no_reset_needed":
             report_only_scan_indices.append(scan_index)
 
-    if main_status == "failed":
+    if main_status in {"failed", "micro_adjust_failed"}:
         final_status = "failed"
     elif failed_scan_indices:
         final_status = "scan_reset_failed"
-    elif main_status == "ok":
+    elif main_status in {"ok", "micro_adjust_ok"}:
         final_status = "ok"
     elif changed_scan_indices:
         final_status = "scan_reset_ok"

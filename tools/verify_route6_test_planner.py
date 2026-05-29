@@ -33,6 +33,30 @@ def assert_true(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
+class FakeRealtimePoseSession:
+    def __init__(self) -> None:
+        self.started = True
+        self.calls: List[Any] = []
+
+    def get_state(self) -> Dict[str, Any]:
+        self.calls.append(("get_state",))
+        return {
+            "status": "ok",
+            "started": True,
+            "movement_enabled": True,
+            "movement_mode": "physics",
+            "pose": {"x": 1234.5, "y": -678.0, "z": 321.0, "yaw": 42.0},
+        }
+
+    def move_relative(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self.calls.append(("move_relative", payload))
+        return {"status": "ok", "last_action": payload.get("action_name", "hold")}
+
+    def set_movement_enabled(self, enabled: bool) -> Dict[str, Any]:
+        self.calls.append(("set_movement_enabled", bool(enabled)))
+        return {"status": "ok", "movement_enabled": bool(enabled), "movement_mode": "physics"}
+
+
 def panel_source() -> str:
     return (PROJECT_ROOT / "control" / "panel.py").read_text(encoding="utf-8")
 
@@ -72,6 +96,8 @@ class PlannerHarness:
             ]
         }
         self.llm_route6_state: Dict[str, Any] = {}
+        self.session = None
+        self.movement_enabled_state = True
         self.llm_route6_status_var = ValueVar("LLM Route V6: idle")
         self.llm_route6_stage_var = ValueVar("Stage: idle")
         self.llm_route6_current_house_var = ValueVar("Current house: n/a")
@@ -113,6 +139,9 @@ class PlannerHarness:
         self.route6_test_planner_overlap_var = ValueVar("0.30")
         self.route6_test_planner_coverage_threshold_var = ValueVar("0.90")
         self.route6_test_planner_reset_step_cm_var = ValueVar("150")
+        self.route6_test_planner_pose_var = ValueVar("UAV x=n/a y=n/a z=n/a yaw=n/a")
+        self.route6_test_planner_los_monitor_var = ValueVar("LOS Monitor: idle")
+        self.route6_test_planner_point_status_var = ValueVar("Observation Points: n/a")
         self.route6_test_planner_status_var = ValueVar("Route 6 Test Planner: idle")
         self.route6_test_planner_house_listbox = None
         self.route6_test_planner_result_text = None
@@ -135,6 +164,21 @@ class PlannerHarness:
         return Path(self.llm_route6_output_root_override)
 
     def route6_current_pose(self) -> Dict[str, float]:
+        raw = self.latest_state.get("pose", {}) if isinstance(self.latest_state, dict) else {}
+        if isinstance(raw, dict):
+            return {
+                "x": float(raw.get("x", 0.0) or 0.0),
+                "y": float(raw.get("y", 0.0) or 0.0),
+                "z": float(raw.get("z", 0.0) or 0.0),
+                "yaw": float(raw.get("yaw", raw.get("task_yaw", 0.0)) or 0.0),
+            }
+        if isinstance(raw, (list, tuple)) and len(raw) >= 3:
+            return {
+                "x": float(raw[0] or 0.0),
+                "y": float(raw[1] or 0.0),
+                "z": float(raw[2] or 0.0),
+                "yaw": float(raw[3] if len(raw) > 3 else 0.0),
+            }
         return {"x": 0.0, "y": 0.0, "z": 450.0, "yaw": 0.0}
 
     def route6_known_house_polygon_records(self) -> List[Dict[str, Any]]:
@@ -145,6 +189,10 @@ class PlannerHarness:
 
     def route6_write_state_artifact(self) -> None:
         return None
+
+    def apply_state(self, state: Dict[str, Any]) -> None:
+        self.latest_state = state if isinstance(state, dict) else {}
+        self.movement_enabled_state = bool(self.latest_state.get("movement_enabled", False))
 
     def route6_json_safe(self, payload: Any) -> Any:
         module = load_route6_module()
@@ -238,8 +286,41 @@ def test_route6_test_planner_analysis_package_contract() -> None:
         assert_true(callable(getattr(analysis_module, function_name, None)), f"analysis package must export {function_name}()")
 
 
-def test_route6_test_planner_formula_button_and_payload() -> None:
+def test_route6_test_planner_control_module_contract() -> None:
     source = (PROJECT_ROOT / "control" / "route6_explore_control.py").read_text(encoding="utf-8")
+    assert_true(
+        "from .route6_test_planner_control import Route6TestPlannerControlMixin" in source,
+        "Route 6 explorer should import the split Test Planner control mixin",
+    )
+    assert_true(
+        "class Route6ExploreControlMixin(Route6TestPlannerControlMixin):" in source,
+        "Route 6 explorer mixin should inherit the split Test Planner control mixin",
+    )
+    module = importlib.import_module("control.route6_test_planner_control")
+    mixin = getattr(module, "Route6TestPlannerControlMixin", None)
+    assert_true(mixin is not None, "Route 6 Test Planner control module should define Route6TestPlannerControlMixin")
+    for method_name in (
+        "route6_build_offline_test_plan",
+        "route6_draw_offline_test_plan_overlay",
+        "open_route6_test_planner_window",
+        "on_route6_test_planner_analyze",
+        "route6_test_planner_check_los_monitor",
+        "on_route6_test_planner_start_los_monitor",
+        "on_route6_test_planner_stop_los_monitor",
+        "route6_test_planner_micro_adjust_single_point",
+        "route6_test_planner_point_status_lines",
+        "refresh_route6_test_planner_point_status",
+    ):
+        assert_true(callable(getattr(mixin, method_name, None)), f"split Test Planner mixin should expose {method_name}")
+
+
+def test_route6_test_planner_formula_button_and_payload() -> None:
+    source = "\n".join(
+        [
+            (PROJECT_ROOT / "control" / "route6_explore_control.py").read_text(encoding="utf-8"),
+            (PROJECT_ROOT / "control" / "route6_test_planner_control.py").read_text(encoding="utf-8"),
+        ]
+    )
     assert_true("Show Formula" in source, "Route 6 planner window should expose a Show Formula button")
     assert_true("route6_test_planner_edge_var" in source, "Route 6 planner should expose an edge selector variable")
     assert_true("auto nearest" in source and "south" in source and "west" in source, "edge selector should include auto/south/east/north/west")
@@ -251,8 +332,33 @@ def test_route6_test_planner_formula_button_and_payload() -> None:
     assert_true("route6_test_planner_scan_mode_var" in source, "Route 6 planner should expose a scan mode selector variable")
     assert_true("Scan Mode" in source and "FOV deg" in source and "Overlap" in source and "Coverage" in source, "scan coverage controls should be visible")
     assert_true("Reset Current Observation Point" in source, "Route 6 planner window should expose an observation reset button")
+    for text in (
+        "route6_test_planner_pose_var",
+        "Start Realtime Update",
+        "Stop Map + Lock Movement",
+        "on_route6_test_planner_start_realtime_map",
+        "on_route6_test_planner_stop_map_and_lock_movement",
+        "route6_stop_map_capture_and_lock_movement",
+        "Start LOS Monitor",
+        "Stop LOS Monitor",
+        "route6_test_planner_los_monitor_var",
+        "route6_test_planner_check_los_monitor",
+        "Observation Point Status",
+        "route6_test_planner_point_status_var",
+        "warning_zone_50cm",
+        "near_warning_50cm",
+    ):
+        assert_true(text in source, f"Route 6 planner should expose realtime pose/map stop control: {text}")
     assert_true("route6_test_planner_scroll_canvas" in source, "Route 6 planner window should be scrollable")
     assert_true("route6_test_planner_analysis" in source, "Route 6 planner analysis should live in a separate package")
+    for text in (
+        'text="Analyze Search Task", command=self.on_route6_test_planner_analyze).grid(row=3',
+        'text="Show Formula", command=self.on_route6_test_planner_show_formula).grid(row=3',
+        'text="Reset Current Observation Point", command=self.on_route6_test_planner_reset_current_observation_point).grid(row=3',
+        'text="Start Realtime Update", command=self.on_route6_test_planner_start_realtime_map).grid(row=3',
+        'text="Stop Map + Lock Movement", command=self.on_route6_test_planner_stop_map_and_lock_movement).grid(row=3',
+    ):
+        assert_true(text in source, f"Route 6 planner action button should be moved to the lower action row: {text}")
     assert_true(
         "command=self.on_route6_test_planner_show_formula" in source,
         "Show Formula button should render the observation-point formula payload",
@@ -260,6 +366,10 @@ def test_route6_test_planner_formula_button_and_payload() -> None:
     assert_true(
         "Route 6 Formula / Code Sources" in source,
         "Show Formula should open a dedicated formula/code-source window",
+    )
+    assert_true(
+        "control/route6_test_planner_control.py" in source,
+        "formula/code sources should point to the split Test Planner control file",
     )
     module = load_route6_module()
     with tempfile.TemporaryDirectory(prefix="route6_formula_") as raw:
@@ -384,6 +494,21 @@ def test_route6_offline_planner_generates_multi_point_scan_coverage(tmp_dir: Pat
     house_scan = plan["house_plans"][0]["scan_plan"]
     assert_true(house_scan["scan_satisfied"] is True, f"house scan plan should report satisfied coverage: {house_scan}")
     assert_true(len(house_scan["scan_observation_points"]) == len(selected_points), f"selected scan points should match house scan plan: {plan}")
+
+
+def test_route6_offline_planner_uses_live_uav_pose_from_session(tmp_dir: Path) -> None:
+    harness = PlannerHarness(tmp_dir)
+    output_dir = prepare_map(harness)
+    harness.ensure_route6_state()
+    harness.session = FakeRealtimePoseSession()
+
+    plan = harness.route6_build_offline_test_plan(output_dir=output_dir, selected_house_ids=["001"], radar_distance_cm=300.0)
+
+    pose = plan["current_pose"]
+    assert_true(float(pose["x"]) == 1234.5 and float(pose["y"]) == -678.0, f"plan should use realtime UAV pose from session: {plan}")
+    assert_true(plan["selected_layer_key"] == "z_300", f"layer selection should follow realtime UAV z=321cm: {plan}")
+    assert_true(("get_state",) in harness.session.calls, f"Analyze should refresh session state before planning: {harness.session.calls}")
+    assert_true("1234.5" in harness.route6_test_planner_pose_var.get(), f"pose display should show realtime UAV coordinates: {harness.route6_test_planner_pose_var.get()}")
 
 
 def test_route6_north_scan_points_are_centered_inside_edge_span(tmp_dir: Path) -> None:
@@ -613,6 +738,157 @@ def test_route6_reset_multiscan_treats_base_observation_as_reference(tmp_dir: Pa
     assert_true(updated["selected_scan_observation_points"] == before_scan_points, f"safe scan points should remain unchanged: {updated}")
 
 
+def test_route6_los_monitor_triggers_reset_when_scan_ray_blocked(tmp_dir: Path) -> None:
+    harness = PlannerHarness(tmp_dir)
+    harness.map_config["houses"][1]["bbox"] = {
+        "min_x": -250.0,
+        "max_x": 1680.0,
+        "min_y": 1450.0,
+        "max_y": 2200.0,
+    }
+    output_dir = prepare_map(harness)
+    harness.ensure_route6_state()
+    harness.route6_update_map_layer_var.set("z_300")
+    harness.route6_test_planner_edge_var.set("north")
+    harness.route6_test_planner_scan_mode_var.set("multi-point edge coverage")
+    harness.route6_test_planner_fov_deg_var.set("60")
+    harness.route6_test_planner_overlap_var.set("0.30")
+    harness.route6_test_planner_coverage_threshold_var.set("0.90")
+    harness.route6_test_planner_reset_step_cm_var.set("150")
+    plan = harness.route6_build_offline_test_plan(output_dir=output_dir, selected_house_ids=["002"], radar_distance_cm=850.0)
+    s2 = next(item for item in plan["selected_scan_observation_points"] if int(item.get("scan_index", 0) or 0) == 2)
+    add_layer_blocking_column(
+        harness,
+        output_dir,
+        "z_300",
+        float(s2["anchor_point_cm"]["x"]),
+        float(s2["y"]) - 100.0,
+        float(s2["y"]) - 50.0,
+    )
+
+    report = harness.route6_test_planner_check_los_monitor(output_dir=output_dir)
+
+    assert_true(report["status"] == "reset_triggered", f"LOS monitor should trigger reset when S/A ray is blocked: {report}")
+    assert_true(report["blocked_records"], f"LOS monitor should report the blocked scan ray: {report}")
+    assert_true(int(report["blocked_records"][0]["scan_index"]) == 2, f"test setup should block S2: {report}")
+    reset_result = report.get("reset_result", {})
+    assert_true(
+        str(reset_result.get("reset_status", "")) in {"scan_reset_ok", "ok"},
+        f"LOS-triggered reset should move the blocked scan point when a clear candidate exists: {report}",
+    )
+    assert_true(
+        2 in [int(value) for value in reset_result.get("scan_reset_summary", {}).get("changed_scan_indices", [])],
+        f"LOS-triggered reset should identify S2 as changed: {report}",
+    )
+
+
+def test_route6_warning_zone_micro_adjusts_nearby_obstacle(tmp_dir: Path) -> None:
+    harness = PlannerHarness(tmp_dir)
+    harness.map_config["houses"][1]["bbox"] = {
+        "min_x": -250.0,
+        "max_x": 1680.0,
+        "min_y": 1450.0,
+        "max_y": 2200.0,
+    }
+    output_dir = prepare_map(harness)
+    harness.ensure_route6_state()
+    harness.route6_update_map_layer_var.set("z_300")
+    harness.route6_test_planner_edge_var.set("north")
+    harness.route6_test_planner_scan_mode_var.set("multi-point edge coverage")
+    harness.route6_test_planner_fov_deg_var.set("60")
+    harness.route6_test_planner_overlap_var.set("0.30")
+    harness.route6_test_planner_coverage_threshold_var.set("0.90")
+    plan = harness.route6_build_offline_test_plan(output_dir=output_dir, selected_house_ids=["002"], radar_distance_cm=850.0)
+    before_points = json.loads(json.dumps(plan["selected_scan_observation_points"]))
+    s2 = next(item for item in before_points if int(item.get("scan_index", 0) or 0) == 2)
+    add_layer_blocking_column(
+        harness,
+        output_dir,
+        "z_300",
+        float(s2["x"]),
+        float(s2["y"]) - 5.0,
+        float(s2["y"]) + 5.0,
+    )
+
+    reset = harness.route6_reset_current_observation_point(output_dir=output_dir)
+
+    s2_reset = next(item for item in reset["scan_point_resets"] if int(item["old_point"].get("scan_index", 0) or 0) == 2)
+    assert_true(s2_reset["reset_status"] == "micro_adjust_ok", f"50cm warning zone should micro-adjust S2: {reset}")
+    assert_true("near_warning_50cm" in s2_reset["problems"], f"micro-adjust should be caused by the 50cm warning circle: {s2_reset}")
+    new_point = s2_reset["new_point"]
+    assert_true(
+        float(new_point["x"]) != float(s2["x"]) or float(new_point["y"]) != float(s2["y"]),
+        f"micro-adjust should change S2 coordinates: old={s2} new={new_point}",
+    )
+    final_warning = s2_reset["final_safety_report"]["details"]["warning_zone_50cm"]
+    assert_true(final_warning["problem"] is False, f"micro-adjusted point should clear the 50cm warning circle: {s2_reset}")
+    updated_plan = harness.llm_route6_state["route6_offline_test_plan"]
+    updated_s2 = next(item for item in updated_plan["selected_scan_observation_points"] if int(item.get("scan_index", 0) or 0) == 2)
+    assert_true(
+        float(updated_s2["x"]) == float(new_point["x"]) and float(updated_s2["y"]) == float(new_point["y"]),
+        f"micro-adjusted S2 should be written back to the active plan/map records: old={s2} new={new_point} updated={updated_s2}",
+    )
+    status_text = harness.route6_test_planner_point_status_var.get()
+    assert_true("S2" in status_text and "micro_adjust_ok" in status_text, f"status panel should show S2 reset state: {status_text}")
+
+
+def test_route6_los_monitor_triggers_reset_when_warning_zone_blocked(tmp_dir: Path) -> None:
+    harness = PlannerHarness(tmp_dir)
+    harness.map_config["houses"][1]["bbox"] = {
+        "min_x": -250.0,
+        "max_x": 1680.0,
+        "min_y": 1450.0,
+        "max_y": 2200.0,
+    }
+    output_dir = prepare_map(harness)
+    harness.ensure_route6_state()
+    harness.route6_update_map_layer_var.set("z_300")
+    harness.route6_test_planner_edge_var.set("north")
+    harness.route6_test_planner_scan_mode_var.set("multi-point edge coverage")
+    harness.route6_test_planner_fov_deg_var.set("60")
+    harness.route6_test_planner_overlap_var.set("0.30")
+    harness.route6_test_planner_coverage_threshold_var.set("0.90")
+    plan = harness.route6_build_offline_test_plan(output_dir=output_dir, selected_house_ids=["002"], radar_distance_cm=850.0)
+    s2 = next(item for item in plan["selected_scan_observation_points"] if int(item.get("scan_index", 0) or 0) == 2)
+    add_layer_blocking_column(
+        harness,
+        output_dir,
+        "z_300",
+        float(s2["x"]),
+        float(s2["y"]) - 5.0,
+        float(s2["y"]) + 5.0,
+    )
+
+    report = harness.route6_test_planner_check_los_monitor(output_dir=output_dir)
+
+    assert_true(report["status"] == "reset_triggered", f"LOS monitor should reset on 50cm warning-zone obstacle: {report}")
+    assert_true(report.get("trigger_reason") == "near_warning_50cm", f"LOS monitor should identify the warning-zone trigger: {report}")
+    assert_true(report.get("warning_records"), f"LOS monitor should include the warning-zone record: {report}")
+    reset_result = report.get("reset_result", {})
+    assert_true(
+        2 in [int(value) for value in reset_result.get("scan_reset_summary", {}).get("changed_scan_indices", [])],
+        f"LOS-triggered warning reset should micro-adjust S2: {report}",
+    )
+
+
+def test_route6_stop_map_capture_and_lock_movement(tmp_dir: Path) -> None:
+    harness = PlannerHarness(tmp_dir)
+    harness.ensure_route6_state()
+    harness.session = FakeRealtimePoseSession()
+    harness.route6_update_map_capture_stop_event.clear()
+    harness.route6_update_map_realtime_stop_event.clear()
+
+    result = harness.route6_stop_map_capture_and_lock_movement()
+
+    assert_true(result["status"] == "stopped_and_locked", f"stop-lock should report status: {result}")
+    assert_true(harness.route6_update_map_capture_stop_event.is_set(), "stop-lock should stop map frame capture")
+    assert_true(harness.route6_update_map_realtime_stop_event.is_set(), "stop-lock should stop realtime map worker")
+    assert_true(any(call[0] == "move_relative" for call in harness.session.calls), f"stop-lock should send hold: {harness.session.calls}")
+    assert_true(("set_movement_enabled", False) in harness.session.calls, f"stop-lock should disable movement: {harness.session.calls}")
+    assert_true(harness.movement_enabled_state is False, "stop-lock should update local movement state")
+    assert_true(harness.route6_movement_allowed() is False, "stop-lock should block Route 6 movement until cleared")
+
+
 def test_route6_offline_planner_sorts_multi_house_by_nearest_edge(tmp_dir: Path) -> None:
     harness = PlannerHarness(tmp_dir)
     output_dir = prepare_map(harness)
@@ -667,12 +943,14 @@ def main() -> None:
         test_panel_route6_test_planner_button_wiring,
         test_route6_test_planner_mixin_contract,
         test_route6_test_planner_analysis_package_contract,
+        test_route6_test_planner_control_module_contract,
         test_route6_test_planner_formula_button_and_payload,
         lambda: run_with_tmp(test_route6_offline_planner_selects_nearest_edge_and_writes_artifact),
         lambda: run_with_tmp(test_route6_offline_planner_uses_operator_selected_edge),
         lambda: run_with_tmp(test_route6_offline_planner_uses_surface_edge_explorer_center_anchor),
         lambda: run_with_tmp(test_route6_offline_planner_reports_nbv_information_gain_components),
         lambda: run_with_tmp(test_route6_offline_planner_generates_multi_point_scan_coverage),
+        lambda: run_with_tmp(test_route6_offline_planner_uses_live_uav_pose_from_session),
         lambda: run_with_tmp(test_route6_north_scan_points_are_centered_inside_edge_span),
         lambda: run_with_tmp(test_route6_reset_reports_non_blocking_problem_without_moving_point),
         lambda: run_with_tmp(test_route6_reset_distance_candidates_move_toward_edge_when_front_blocked),
@@ -680,6 +958,10 @@ def main() -> None:
         lambda: run_with_tmp(test_route6_reset_ignores_target_edge_adjacent_scan_samples),
         lambda: run_with_tmp(test_route6_visual_calculation_records_use_actual_anchor),
         lambda: run_with_tmp(test_route6_reset_multiscan_treats_base_observation_as_reference),
+        lambda: run_with_tmp(test_route6_los_monitor_triggers_reset_when_scan_ray_blocked),
+        lambda: run_with_tmp(test_route6_warning_zone_micro_adjusts_nearby_obstacle),
+        lambda: run_with_tmp(test_route6_los_monitor_triggers_reset_when_warning_zone_blocked),
+        lambda: run_with_tmp(test_route6_stop_map_capture_and_lock_movement),
         lambda: run_with_tmp(test_route6_offline_planner_sorts_multi_house_by_nearest_edge),
         lambda: run_with_tmp(test_route6_offline_planner_loads_manifest_without_rebuilding),
         lambda: run_with_tmp(test_route6_offline_planner_overlay_draws_result),
